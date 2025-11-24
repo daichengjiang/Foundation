@@ -1,0 +1,80 @@
+# Python-specific
+*.pyc
+__pycache__/
+*.egg
+*.egg-info
+.eggs/
+dist/
+build/
+install/
+pip-wheel-metadata
+pip-log.txt
+pip-delete-this-directory.txt
+*.so
+*.dll
+*.pyd
+*.pyo
+*.pyi
+*.pyd
+*.whl
+*.egg-info
+*.egg
+.Python
+*.log
+
+# IDEs and editors
+# PyCharm
+.idea/
+*.iml
+# VS Code
+.vscode/
+.vscode-test/
+# Sublime Text
+.sublime-project
+.sublime-workspace
+# Emacs
+*.elc
+# Vim
+*.swp
+*.swo
+*.swn
+.viminfo
+# Others
+*.code-workspace
+*.entitlements
+*.entitlements.plist
+
+# System files
+.DS_Store
+Thumbs.db
+desktop.ini
+ehthumbs.db
+
+# Other temporary files
+*.tmp
+*.bak
+*.swp
+*.~
+*.#
+output
+logs
+wandb
+
+# GitHub Runner workspaces
+.github/runner/run_*
+.github/runner/downloads
+
+# Onboard
+cpp
+*.rknn
+dataset.txt
+quantization_analysis
+*.cvimodel__pycache__/
+.env
+
+# outputs
+outputs/
+USD/
+RASTER/
+model/
+pyrightconfig.json
