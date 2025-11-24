@@ -44,12 +44,12 @@ import time
 import os
 import csv
 
-from e2e_drone.utils.simple_controller import SimpleQuadrotorController
-from e2e_drone.utils.death_replay import DeathReplay
-from e2e_drone.utils.wind_gen import WindGustGenerator
-from e2e_drone.utils.player import DepthViewerProcess, TerrainVisualizer
-from e2e_drone.utils.rrg import TerrainRRGMap
-from e2e_drone.utils.raster import TerrainRasterMap, trilinear_interpolate, check_positions_occupancy
+from foundation.utils.simple_controller import SimpleQuadrotorController
+from foundation.utils.death_replay import DeathReplay
+from foundation.utils.wind_gen import WindGustGenerator
+from foundation.utils.player import DepthViewerProcess, TerrainVisualizer
+from foundation.utils.rrg import TerrainRRGMap
+from foundation.utils.raster import TerrainRasterMap, trilinear_interpolate, check_positions_occupancy
 from enum import IntEnum
 import collections
 import itertools
@@ -884,10 +884,10 @@ class QuadcopterEnv(DirectRLEnv):
 
         # Initialize the map generator and other components
         if self.cfg.train:
-            from e2e_drone.utils.train_terrain import MapGenerator
+            from foundation.utils.train_terrain import MapGenerator
             self._map_generator = MapGenerator(sim=self.sim, device=self.device)
         else:
-            from e2e_drone.utils.eval_terrain import MapGenerator
+            from foundation.utils.eval_terrain import MapGenerator
             self._map_generator = MapGenerator(sim=self.sim, device=self.device)
 
         # Clone the scene
