@@ -13,7 +13,7 @@ from isaaclab.utils import configclass
 
 @configclass
 class QuadcopterPPORunnerCfg(RslRlOnPolicyRunnerCfg):
-    num_steps_per_env = 128
+    num_steps_per_env = 96
     max_iterations = 5000
     save_interval = 25
     experiment_name = "point_ctrl_direct"
