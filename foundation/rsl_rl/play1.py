@@ -339,7 +339,7 @@ from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper, expor
 import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.utils import get_checkpoint_path, parse_env_cfg
 from isaaclab_tasks.utils.hydra import hydra_task_config
-from e2e_drone import tasks
+from foundation import tasks
 import copy
 # PLACEHOLDER: Extension template (do not remove this comment)
 
