@@ -709,6 +709,67 @@ class SimpleQuadrotorController:
         """Normalize angle to [-pi, pi]."""
         return torch.atan2(torch.sin(angle), torch.cos(angle))
 
+    def motor_speeds_to_wrench(self, motor_speeds: torch.Tensor, normalized: bool = False) -> tuple:
+        """
+        Convert motor angular velocities to body-frame force and torque.
+        
+        This function performs the forward calculation from motor speeds to wrench:
+        1. Denormalize motor speeds if they are normalized (optional)
+        2. Convert motor speeds to individual motor thrusts using thrust map
+        3. Apply allocation matrix to get total force and torque
+        
+        Args:
+            motor_speeds: (num_envs, 4) motor angular velocities [rad/s] or normalized [0, 1]
+                         Motors in X-configuration order: [M1, M2, M3, M4]
+            normalized: If True, input motor_speeds are normalized in [0, 1] range
+                       and will be denormalized to [motor_omega_min, motor_omega_max]
+        
+        Returns:
+            force: (num_envs, 3) body frame force [Fx, Fy, Fz] in Newtons
+                   For quadrotors, typically Fx=Fy=0, Fz=total_thrust
+            torque: (num_envs, 3) body frame torque [τ_roll, τ_pitch, τ_yaw] in Nm
+        
+        Example:
+            >>> controller = SimpleQuadrotorController(num_envs=2)
+            >>> # Using absolute motor speeds (rad/s)
+            >>> motor_speeds = torch.tensor([[2000, 2000, 2000, 2000],
+            ...                               [2500, 2400, 2500, 2400]], device=controller.device)
+            >>> force, torque = controller.motor_speeds_to_wrench(motor_speeds)
+            >>> 
+            >>> # Using normalized motor speeds [0, 1]
+            >>> motor_speeds_norm = torch.tensor([[0.5, 0.5, 0.5, 0.5],
+            ...                                    [0.7, 0.6, 0.7, 0.6]], device=controller.device)
+            >>> force, torque = controller.motor_speeds_to_wrench(motor_speeds_norm, normalized=True)
+        """
+        batch = motor_speeds.shape[0]
+        
+        # Step 0: Denormalize motor speeds if necessary
+        if normalized:
+            # Denormalize from [0, 1] to [motor_omega_min, motor_omega_max]
+            omega_min = self.dynamics.motor_omega_min_.unsqueeze(1)  # (num_envs, 1)
+            omega_max = self.dynamics.motor_omega_max_.unsqueeze(1)  # (num_envs, 1)
+            motor_speeds = omega_min + motor_speeds * (omega_max - omega_min)
+        
+        # Step 1: Convert motor speeds to thrusts using quadratic thrust map
+        # T = a*omega^2 + b*omega + c
+        motor_thrusts = self.dynamics.motorOmegaToThrust(motor_speeds)
+        
+        # Step 2: Apply allocation matrix to get wrench
+        # wrench = [total_thrust, roll_torque, pitch_torque, yaw_torque]
+        # alloc_matrix shape: (num_envs, 4, 4)
+        # motor_thrusts shape: (num_envs, 4)
+        alloc = torch.bmm(self.alloc_matrix_, motor_thrusts.unsqueeze(-1)).squeeze(-1)
+        
+        # Step 3: Extract force and torque
+        # Force: only vertical thrust in body z-direction
+        force = torch.zeros((batch, 3), device=self.device)
+        force[:, 2] = alloc[:, 0]  # Total thrust in z-direction
+        
+        # Torque: [roll, pitch, yaw] moments
+        torque = alloc[:, 1:4]  # [τ_roll, τ_pitch, τ_yaw]
+        
+        return force, torque
+
     def reset(self, env_ids: torch.Tensor = None):
         """
         Reset controller states for specified environments.
