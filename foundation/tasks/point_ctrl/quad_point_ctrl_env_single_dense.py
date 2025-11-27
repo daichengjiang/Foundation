@@ -18,7 +18,6 @@ from isaaclab.assets import Articulation, ArticulationCfg
 from isaaclab.envs import DirectRLEnv, DirectRLEnvCfg
 from isaaclab.envs.ui import BaseEnvWindow
 from isaaclab.scene import InteractiveSceneCfg
-from isaaclab.sensors import TiledCamera, TiledCameraCfg
 from isaaclab.sim import SimulationCfg, SimulationContext, RenderCfg
 from isaaclab.terrains import TerrainImporterCfg, TerrainGeneratorCfg
 from isaaclab.utils import configclass
@@ -31,7 +30,7 @@ from isaaclab_assets import CRAZYFLIE_CFG
 from isaaclab.assets import ArticulationCfg
 import isaacsim.core.utils.prims as prims_utils
 from pxr import PhysxSchema, Sdf, UsdGeom, UsdPhysics, Gf
-import open3d as o3d
+from isaaclab.utils.math import quat_from_euler_xyz
 from collections import deque
 import numpy as np
 import random
@@ -41,137 +40,14 @@ import os
 import csv
 
 from foundation.utils.simple_controller import SimpleQuadrotorController
-from foundation.utils.death_replay import DeathReplay
+
 from foundation.utils.wind_gen import WindGustGenerator
-from foundation.utils.player import DepthViewerProcess, TerrainVisualizer
+
 from enum import IntEnum
 import collections
 import itertools
-import matplotlib.pyplot as plt
 
-def add_rounding_noise_torch(depth_map: torch.Tensor, levels: int = 128) -> torch.Tensor:
-    """
-    模拟传感器的量化效应 (PyTorch GPU版本)。
-    将连续的深度值舍入到有限的离散级别。
-    """
-    # 找到深度图的范围，忽略无效的0值
-    # 使用一个小的epsilon来防止在所有值都相同时出现问题
-    min_depth = torch.min(depth_map[depth_map > 1e-6])
-    max_depth = torch.max(depth_map)
 
-    if max_depth <= min_depth:
-        return depth_map
-
-    # 计算每个量化步长
-    step_size = (max_depth - min_depth) / levels
-    if step_size <= 1e-6: # 避免除以一个极小的值
-        return depth_map
-        
-    # 进行量化
-    quantized_map = torch.round(depth_map / step_size) * step_size
-    return quantized_map
-
-def add_edge_noise_torch(depth_map: torch.Tensor, edge_threshold: float = 0.1, noise_magnitude: float = 0.3) -> torch.Tensor:
-    """
-    在深度图的边缘添加噪声 (PyTorch GPU版本)。
-    """
-    # PyTorch的卷积需要 (N, C, H, W) 格式，所以我们添加一个通道维度
-    depth_map_nchw = depth_map.unsqueeze(1)
-
-    # 定义Sobel算子核，并确保它在正确的设备上
-    sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32, device=depth_map.device).view(1, 1, 3, 3)
-    sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32, device=depth_map.device).view(1, 1, 3, 3)
-
-    # 使用卷积计算梯度
-    grad_x = F.conv2d(depth_map_nchw, sobel_x, padding=1)
-    grad_y = F.conv2d(depth_map_nchw, sobel_y, padding=1)
-    
-    # 计算梯度幅值并移除通道维度
-    gradient_magnitude = torch.sqrt(grad_x**2 + grad_y**2).squeeze(1)
-    
-    # 创建边缘掩码
-    edge_mask = gradient_magnitude > edge_threshold
-    
-    # 在边缘区域添加高斯噪声
-    noise = torch.randn_like(depth_map) * noise_magnitude
-    noisy_map = depth_map.clone()
-    noisy_map[edge_mask] += noise[edge_mask]
-    
-    # 确保没有负深度值
-    noisy_map.clamp_(min=0.0)
-    
-    return noisy_map
-
-def add_filling_noise_torch(depth_map: torch.Tensor, dropout_rate: float = 0.03, kernel_size: int = 5) -> torch.Tensor:
-    """
-    模拟因无纹理区域导致的空洞和后续填充伪影 (PyTorch GPU版本)。
-    """
-    # 1. 随机制造空洞
-    dropout_mask = torch.rand_like(depth_map) < dropout_rate
-    holed_map = depth_map.clone()
-    holed_map[dropout_mask] = 0.0 # 使用0作为无效值的标记
-
-    # 2. 填充空洞
-    # 使用平均池化（一种简单的模糊/插值方法）来模拟填充
-    # 需要 (N, C, H, W) 格式
-    filled_map = F.avg_pool2d(holed_map.unsqueeze(1), kernel_size=kernel_size, stride=1, padding=kernel_size//2).squeeze(1)
-
-    # 3. 只在有空洞的地方应用填充结果，以保留原始的清晰部分
-    final_map = depth_map.clone()
-    final_map[dropout_mask] = filled_map[dropout_mask]
-
-    return final_map
-
-def add_edge_filling_noise_torch(depth_map: torch.Tensor, edge_threshold: float = 0.1, dropout_rate_on_edges: float = 0.5, kernel_size: int = 5) -> torch.Tensor:
-    """
-    在深度图的边缘处制造空洞，然后通过插值进行补全，以模拟边缘伪影。
-    
-    Args:
-        depth_map (torch.Tensor): 输入的原始深度图。
-        edge_threshold (float): 边缘检测的灵敏度阈值。值越小，越敏感。
-        dropout_rate_on_edges (float): 在检测到的边缘上制造空洞的概率。
-        kernel_size (int): 用于插值补全的邻域窗口大小。
-
-    Returns:
-        torch.Tensor: 处理后带有边缘填充伪影的深度图。
-    """
-    # --- 步骤 1: 检测边缘 (逻辑来自 add_edge_noise_torch) ---
-    # PyTorch的卷积需要 (N, C, H, W) 格式
-    depth_map_nchw = depth_map.unsqueeze(1)
-
-    # 定义Sobel算子核
-    sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32, device=depth_map.device).view(1, 1, 3, 3)
-    sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32, device=depth_map.device).view(1, 1, 3, 3)
-
-    # 计算梯度
-    grad_x = F.conv2d(depth_map_nchw, sobel_x, padding=1)
-    grad_y = F.conv2d(depth_map_nchw, sobel_y, padding=1)
-    
-    # 计算梯度幅值并移除通道维度
-    gradient_magnitude = torch.sqrt(grad_x**2 + grad_y**2).squeeze(1)
-    
-    # 创建边缘掩码
-    edge_mask = gradient_magnitude > edge_threshold
-    
-    # --- 步骤 2: 在边缘处制造空洞 ---
-    # 创建一个随机掩码，用于决定哪些边缘像素将被丢弃
-    random_mask = torch.rand_like(depth_map) < dropout_rate_on_edges
-    
-    # 最终的空洞掩码是“既是边缘” AND “又被随机选中”的像素
-    final_dropout_mask = edge_mask & random_mask
-    
-    holed_map = depth_map.clone()
-    holed_map[final_dropout_mask] = 0.0  # 将选中的边缘像素设为0，制造空洞
-
-    # --- 步骤 3: 插值补全 (逻辑来自 add_filling_noise_torch) ---
-    # 使用平均池化来模拟插值填充
-    filled_map = F.avg_pool2d(holed_map.unsqueeze(1), kernel_size=kernel_size, stride=1, padding=kernel_size//2).squeeze(1)
-
-    # 只在有空洞的地方应用填充结果，以保留原始的清晰部分
-    final_map = depth_map.clone()
-    final_map[final_dropout_mask] = filled_map[final_dropout_mask]
-
-    return final_map
 # [0, 2pi] -> [-pi, pi]
 def normallize_angle(angle: torch.Tensor):
     return torch.fmod(angle + math.pi, 2 * math.pi) - math.pi
@@ -211,9 +87,15 @@ class QuadcopterSceneCfg(InteractiveSceneCfg):
 @configclass
 class QuadcopterEnvCfg(DirectRLEnvCfg):
     # custom config for the quadcopter environment
-    history_obs = 10
+    history_obs = 1
     # Updated observation space: pos_error(3) + rot_matrix(9) + vel_error(3) + ang_vel(3) + last_actions(4) + motor_speeds(4)
     frame_observation_space = 3 + 9 + 3 + 3 + 4 + 4  # 26
+
+    # Calculate total observation space (without depth history, only current frame)
+    observation_space = frame_observation_space  # 26D: pos_error(3) + rot_matrix(9) + vel_error(3) + ang_vel(3) + last_actions(4) + motor_speeds(4)
+
+    # 轨迹采样配置
+    prob_null_trajectory = 0.5  # 50% 概率做定点控制
 
     # gamma in ppo, only for logging
     gamma = 0.99
@@ -221,7 +103,7 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     # env
     episode_length_s = 96
     decimation = 1
-    action_space = 4 # [roll, pitch, yaw,_rate thrust]
+    action_space = 4 
     state_space = 0
     debug_vis = True
 
@@ -235,7 +117,6 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     train = True
     robot_vis = False
     marker_size = 0.05  # Size of the markers in meters
-    enable_video_player = False  # Enable video player for depth visualization
 
     # Maximum velocity for Langevin trajectory generation
     max_vel = 2.0
@@ -275,9 +156,6 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     # robot
     robot: ArticulationCfg = CRAZYFLIE_CFG.replace(prim_path="/World/envs/env_.*/Robot")
 
-    # Calculate total observation space (without depth history, only current frame)
-    observation_space = frame_observation_space  # 26D: pos_error(3) + rot_matrix(9) + vel_error(3) + ang_vel(3) + last_actions(4) + motor_speeds(4)
-
     # thresholds
     too_low = 0.3
     too_high = 1.7
@@ -296,14 +174,6 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     reward_coef_d_action_cost = 1.0
     reward_coef_termination_penalty = 100.0
     reward_constant = 1.5
-
-    # DeathReplay configuration
-    enable_death_replay = False
-    death_replay_dir = os.path.abspath(os.path.join("logs", "death_replay"))
-    death_replay_history_capacity = 5000
-    death_replay_visualization_num = 10  # Number of environments to track and visualize
-    death_replay_trajectory_spacing = 5.0
-    death_replay_tof_frame_interval = 15
 
     enable_wind_generator = False
 
@@ -339,11 +209,6 @@ class QuadcopterEnv(DirectRLEnv):
         dx, dy, dz = self.cfg.drag_coeffs
         self._drag_D = torch.tensor([dx, dy, dz], device=self.device).repeat(self.num_envs, 1)
 
-        # 域随机化：每个环境独立在 ±drag_rand_scale 内扰动
-        if self.cfg.enable_aero_drag and self.cfg.train:
-            rand = (2.0 * torch.rand_like(self._drag_D) - 1.0) * self.cfg.drag_rand_scale
-            self._drag_D = self._drag_D * (1.0 + rand)
-
         self._controller = SimpleQuadrotorController(
             num_envs=self.num_envs,
             device=self.device,
@@ -351,6 +216,8 @@ class QuadcopterEnv(DirectRLEnv):
             attitude_d_gain=torch.tensor(self.cfg.controller_Kdang, device=self.device, dtype=torch.float32),
             rate_p_gain=torch.tensor(self.cfg.controller_Kang_vel, device=self.device, dtype=torch.float32),
         )
+
+        self._is_langevin_task = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
         # Quadcopter references
         self._actions = torch.zeros(self.num_envs, gym.spaces.flatdim(self.single_action_space), device=self.device)
@@ -391,9 +258,6 @@ class QuadcopterEnv(DirectRLEnv):
         # Robot references
         self._body_id = self._robot.find_bodies("body")[0]
 
-        # Observations
-        self._obs_history = torch.zeros(self.num_envs, self.cfg.history_obs, self.cfg.frame_observation_space, device=self.device)
-
         self._last_actions = torch.zeros(self.num_envs, 4, device=self.device) # [roll_rate, pitch_rate, yaw_rate, thrust]
         self._numerical_is_unstable = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self._spawn_pos_w = torch.zeros(self.num_envs, 3, device=self.device)  # Store spawn/respawn positions
@@ -409,71 +273,8 @@ class QuadcopterEnv(DirectRLEnv):
 
         self.set_debug_vis(self.cfg.debug_vis)
 
-        # Initialize DeathReplay
-        if self.cfg.enable_death_replay:
-            self._death_replay = DeathReplay(
-                num_envs=self.num_envs,
-                tof_width=self.cfg.tiled_camera.width,
-                tof_height=self.cfg.tiled_camera.height,
-                history_capacity=self.cfg.death_replay_history_capacity,
-                save_dir=self.cfg.death_replay_dir,
-                drone_size=0.15,
-                camera_fov=45,
-                trajectory_spacing=self.cfg.death_replay_trajectory_spacing,
-                tof_frame_interval=self.cfg.death_replay_tof_frame_interval,
-                visualization_num=self.cfg.death_replay_visualization_num, 
-                device=self.device
-            )
-        else:
-            self._death_replay = None
-
-        if self.cfg.enable_video_player:
-            # img_shape = (self.cfg.tiled_camera.height, self.cfg.tiled_camera.width)
-            # --- 修改部分：调整可视化窗口以支持并排显示 ---
-            # 获取原始图像尺寸
-            h, w = self.cfg.tiled_camera.height, self.cfg.tiled_camera.width
-            # 新的图像形状是原始宽度的两倍，用于并排显示 (左:原始, 右:噪声)
-            img_shape = (h, w * 2) 
-            # 使用新的形状初始化共享内存和可视化进程
-            self.shared_imgs = np.zeros((self.num_envs, *img_shape), dtype=np.float32)
-            self.viewer = DepthViewerProcess(img_shape, self.num_envs)
-            self.viewer.start()
 
         self._calc_env_origins()
-
-    def _print_depth_info(self, env_id=0, show_image=True):
-        """Print real-time depth information from the center pixel of the forward camera with elapsed time."""
-        depth_image = self._tiled_camera.data.output["depth"]  # Shape: (num_envs, height, width)
-        h, w = self.cfg.tiled_camera.height, self.cfg.tiled_camera.width
-        center_h = h // 2
-        center_w = w // 2
-        
-        pos_w = self._robot.data.root_pos_w  # Shape: (num_envs, 3)
-        
-        # Calculate elapsed time since training start
-        elapsed_time = time.time() - self.start_time
-        minutes = int(elapsed_time // 60)
-        seconds = int(elapsed_time % 60)
-        milliseconds = int((elapsed_time % 1) * 1000)
-        time_str = f"{minutes:02d}:{seconds:02d}.{milliseconds:03d}"
-        
-        center_depth = depth_image[env_id, center_h, center_w].item()
-        position = pos_w[env_id].cpu().numpy()
-        print(
-            f"[{time_str}] Env {env_id} - "
-            f"Position: [{position[0]:.2f}, {position[1]:.2f}, {position[2]:.2f}] | "
-            f"Center Depth: {center_depth:.3f}m"
-        )
-
-        if show_image:
-            plt.figure(figsize=(6, 4))
-            plt.imshow(depth_image[env_id].cpu().numpy(), cmap='plasma')
-            plt.scatter([center_w], [center_h], c='red', s=30, label='Center')
-            plt.colorbar(label='Depth (m)')
-            plt.title(f"Env {env_id} Depth Image")
-            plt.legend()
-            plt.show()
-            
 
 
     def CHECK_NAN(self, tensor, name):
@@ -657,19 +458,6 @@ class QuadcopterEnv(DirectRLEnv):
             else:
                 prims_utils.set_prim_property(prim_path, "visibility", "invisible")
 
-        # Always create the main camera
-        # self._tiled_camera = TiledCamera(self.cfg.tiled_camera)
-
-
-
-        # Initialize the map generator and other components
-        if self.cfg.train:
-            from foundation.utils.train_terrain import MapGenerator
-            self._map_generator = MapGenerator(sim=self.sim, device=self.device)
-        else:
-            from foundation.utils.eval_terrain import MapGenerator
-            self._map_generator = MapGenerator(sim=self.sim, device=self.device)
-
         # Clone the scene
         self.scene.clone_environments(copy_from_source=False)
 
@@ -680,193 +468,86 @@ class QuadcopterEnv(DirectRLEnv):
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
 
-        # Counters
-        self._episode_counter = 0
         self._map_generation_timer = 0
 
-    def _regenerate_terrain(self):
-        """Regenerate terrain - simplified for open space trajectory tracking."""
-        self.sim.pause()
-        print("Regenerating terrain (flat plane for trajectory tracking).")
-        prims_utils.delete_prim("/World/ground")
-        self._terrain = self.cfg.scene.terrain.class_type(self.cfg.scene.terrain)
-        
-        # Create simple environment (no obstacles for trajectory tracking)
-        env_data = self._map_generator.create_environment(
-            self.cfg.scene,
-            self._terrain,
-            num_obstacles=0,  # No obstacles for trajectory tracking
-            num_floaters=0,
-            min_distance=0.3,
-            obstacle_size_range=(0.4, 0.8),
-            obstacle_height_range=(3.0, 4.0),
-            floaters_size_range=(0.2, 0.6),
-            floaters_height_range=(0.2, 4.0),
-            terrain_length=self.cfg.terrain_length,
-            terrain_width=self.cfg.terrain_width,
-            grid_rows=self.cfg.grid_rows,
-            grid_cols=self.cfg.grid_cols,
-            plane_size = (self.cfg.terrain_length * (self.cfg.grid_cols + 2), self.cfg.terrain_width * (self.cfg.grid_rows + 2)),
-            plane_translation = (self.cfg.terrain_length * self.cfg.grid_cols / 2, self.cfg.terrain_width * self.cfg.grid_rows / 2, 0.0),
-            terrain_path = "",  # No terrain path needed
-        )
-        
-        self.sim.play()
-
-        # Update DeathReplay if enabled
-        if self._death_replay is not None:
-            self._death_replay.set_global_map(env_data.get("points", []), None)
-
     def _pre_physics_step(self, actions: torch.Tensor):
-        """Convert actions to forces and torques before the physics step."""
-        
-        # Update Langevin trajectory at the beginning of each step
-        # This ensures rewards, dones, and observations all use the same desired trajectory
-        self._generate_desired_trajectory_langevin()
+        # 1. 更新轨迹 (仅针对 Langevin 任务)
+        if torch.any(self._is_langevin_task):
+            self._generate_desired_trajectory_langevin(env_ids=torch.where(self._is_langevin_task)[0])
 
         actions = (actions + 1.0) * 0.5
-
         self._actions = actions.clone()
 
+        # 1. 计算机体系下的 Wrench
+        force_b, torque_b, px4info = self._controller.motor_speeds_to_wrench(self._actions, normalized=True)
 
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        force, torque, px4info = self._controller.motor_speeds_to_wrench(self._actions, normalized = True)
+        # 2. 获取姿态
+        quat_w = self._robot.data.root_quat_w
+        rot_b2w = matrix_from_quat(quat_w) # (num_envs, 3, 3)
+
+        # 3. 准备机体坐标系下的力和力矩向量
+        # Force: only Z component usually has value, but let's be generic
+        force_vec_b = torch.zeros_like(self._forces[:, 0, :])
+        force_vec_b[:, 2] = force_b[:, 2] # Thrust in Body Z
+
+        # Torque
+        torque_vec_b = torque_b # Torques are in body frame
+
         self.px4info = px4info
-        # force, torque = self._controller.compute_control(cur_state, mean_action, self.step_dt)
-        end.record()
-        torch.cuda.synchronize()
 
-        # Reset forces and torques to zero
+        # 4. 填充力矩 Buffer
         self._forces.zero_()
         self._torques.zero_()
-        self._forces[:, 0, 2] = force[:, 2]
-        self._torques[:, 0, :] = torque
+        # 5. [关键] 将总力与力矩旋转到世界坐标系
+        force_w = torch.bmm(rot_b2w, force_vec_b.unsqueeze(-1)).squeeze(-1)
+        torque_w = torch.bmm(rot_b2w, torque_vec_b.unsqueeze(-1)).squeeze(-1)
 
-        if self._wind_gen is not None:
-            # Apply wind disturbances
-            wind_acc = self._wind_gen.step()                       # (num_envs,3) m/s²
-            wind_force_world = wind_acc * self._robot_mass.unsqueeze(1)  # (num_envs,3) N
-            quat_w = self._robot.data.root_quat_w  # quaternion representing rotation from body to world
-            rot_matrices_w2b = matrix_from_quat(quat_w).transpose(1, 2)  # shape: (num_envs, 3, 3)
-            wind_force_body = torch.bmm(rot_matrices_w2b, wind_force_world.unsqueeze(2)).squeeze(2)
-            # For trajectory tracking, apply constant wind weight (no curriculum)
-            wind_weight = 1.0
-            self._forces[:, 0, :] += wind_force_body * wind_weight
-            # print(f"original force: {self._forces[0, 0, :]}")
-            # print(f"Wind force: {wind_force_body[0]}")
-
-        # --- Aerodynamic drag (paper model) ---
-        if self.cfg.enable_aero_drag:
-            # 机体系线速度，形状 (num_envs, 3)
-            v_b = self._robot.data.root_lin_vel_b
-
-            # 可选：防数值爆，限速范数（只影响阻力，不改状态）
-            if self.cfg.drag_v_clip is not None and self.cfg.drag_v_clip > 0:
-                v_norm = torch.norm(v_b, dim=1, keepdim=True).clamp(max=self.cfg.drag_v_clip)
-                v_dir = torch.where(v_norm > 0, v_b / (v_norm + 1e-6), torch.zeros_like(v_b))
-                v_b_eff = v_dir * v_norm  # 裁剪后的 v_b
-            else:
-                v_b_eff = v_b
-                v_norm = torch.norm(v_b_eff, dim=1, keepdim=True)
-
-            # 机体系空气阻力：F_drag_b = - m * D * ||v_b|| * v_b
-            # self._robot_mass: (num_envs,), 扩展到 (num_envs,1)
-
-            px,py,pz = self.cfg.drag_coeffs
-            env_ids = torch.arange(self.num_envs,device=self.device)
-            base = torch.tensor([px,py,pz],device=self.device).repeat(len(env_ids),1)
-            scale = self.cfg.drag_rand_scale
-            factors = 1.0 + (2.0 * torch.rand_like(base) - 1.0) * scale
-            self._drag_D = torch.clamp(base * factors,min =0.0)
-
-
-            m = self._robot_mass.unsqueeze(1)
-            F_drag_b = - m * self._drag_D * v_norm * v_b_eff  # 逐轴二次阻力
-
-            a_drag_b = F_drag_b / m 
-            for env_id in range(min(1, v_b_eff.shape[0])):
-                vx, vy, vz = v_b_eff[env_id].tolist()
-                ax, ay, az = a_drag_b[env_id].tolist()
-                dx, dy, dz = self._drag_D[env_id].tolist()
-                print(f"[Env {env_id}] v_b = ({vx:.3f}, {vy:.3f}, {vz:.3f}) m/s | " f"a_drag = ({ax:.5f}, {ay:.5f}, {az:.5f}) m/s^2 | " f"D = ({dx:.5f}, {dy:.5f}, {dz:.5f})")
-
-            # 写入到你的外力缓存（机体系，和控制力同一坐标系/通道）
-            self._forces[:, 0, :] += F_drag_b
+        # 6. 赋值给 buffer
+        self._forces[:, 0, :] = force_w
+        self._torques[:, 0, :] = torque_w
 
     def _apply_action(self):
         """Apply thrust/moment to the quadcopter."""
         self._robot.set_external_force_and_torque(self._forces, self._torques, body_ids=self._body_id)
 
     def _get_observations(self) -> dict:
-        """
-        Return the observations for the agent in a dictionary.
+        # 1. 获取物理状态
+        pos_w = self._robot.data.root_pos_w
+        quat_w = self._robot.data.root_quat_w
+        vel_w = self._robot.data.root_lin_vel_w
+        ang_vel_b = self._robot.data.root_ang_vel_b
         
-        Observation components:
-        - Position error: current_pos - pos_des (3D)
-        - Rotation matrix: flattened 3x3 matrix (9D)
-        - Velocity error: current_vel - vel_des (3D)
-        - Angular velocity: body frame (3D)
-        - Last actions (normalized): [0, 1] (4D)
-        - Motor speeds (ground truth): [rad/s] (4D)
-        
-        Total: 3 + 9 + 3 + 3 + 4 + 4 = 26D per frame
-        """
-        # Note: Langevin trajectory is now updated in _pre_physics_step()
-        # This ensures consistency across rewards, dones, and observations
-        
-        # Get current robot states
-        pos_w = self._robot.data.root_pos_w  # (num_envs, 3)
-        quat_w = self._robot.data.root_quat_w  # (num_envs, 4)
-        vel_w = self._robot.data.root_lin_vel_w  # (num_envs, 3)
-        ang_vel_b = self._robot.data.root_ang_vel_b  # (num_envs, 3)
-        
-        # Get rotation matrix (body to world)
-        rot_matrix_b2w = matrix_from_quat(quat_w)  # (num_envs, 3, 3)
+        # 2. 计算旋转矩阵
+        rot_matrix_b2w = matrix_from_quat(quat_w)  # R_b->w
         rotation_matrix_flat = rot_matrix_b2w.reshape(self.num_envs, 9)
         
-        # Compute position error: current - desired
-        pos_error = pos_w - self.pos_des  # (num_envs, 3)
-        
-        # Compute velocity error: current - desired
-        vel_error = vel_w - self.vel_des  # (num_envs, 3)
-        
-        # Get last actions (normalized)
-        last_actions = self._last_actions  # (num_envs, 4), normalized [0, 1]
-        
-        # Get current motor speeds from simulator (ground truth)
-        motor_speeds = self._robot.data.joint_vel  # (num_envs, 4), [rad/s]
-        
-        # Concatenate all observation components
-        obs_frame = torch.cat([
-            pos_error,              # 3D
-            rotation_matrix_flat,   # 9D
-            vel_error,              # 3D
-            ang_vel_b,              # 3D
-            last_actions,           # 4D
-            motor_speeds,           # 4D
-        ], dim=-1)  # Total: 26D
-        
-        # Update observation history
-        self._obs_history = torch.cat(
-            [self._obs_history[:, 1:], obs_frame.unsqueeze(dim=1)],
-            dim=1
-        )
-        
-        # Create final observation (current frame + history)
+        # --- [关键修改] 坐标系转换开始 ---
+        # 计算世界系误差
+        pos_error_w = pos_w - self.pos_des
+        vel_error_w = vel_w - self.vel_des
+
+        # 计算 R_w->b (即 R_b->w 的转置)
+        rot_matrix_w2b = rot_matrix_b2w.transpose(1, 2) 
+
+        # 投影到机体坐标系: error_body = R_w->b @ error_world
+        # 使用 bmm (Batch Matrix Multiplication)
+        pos_error_b = torch.bmm(rot_matrix_w2b, pos_error_w.unsqueeze(-1)).squeeze(-1)
+        vel_error_b = torch.bmm(rot_matrix_w2b, vel_error_w.unsqueeze(-1)).squeeze(-1)
+        # --- [关键修改] 坐标系转换结束 ---
+
+        # 3. 拼接 Observation (使用转换后的 _b 变量)
         obs = torch.cat([
-            self._obs_history[:, -1].view(self.num_envs, -1),  # Current observation
-            # self._obs_history.view(self.num_envs, -1),  # Full history (optional)
-        ], dim=-1)
+            pos_error_b,            # 3维 (Body Frame)
+            rotation_matrix_flat,   # 9维
+            vel_error_b,            # 3维 (Body Frame)
+            ang_vel_b,              # 3维
+            self._last_actions,     # 4维
+            self._robot.data.joint_vel # 4维
+        ], dim=-1)  # 总共 26维
         
-        critic_obs = obs.clone()
-        
-        # Check for NaN values
+        # 4. 去除冗余历史堆叠，直接返回当前帧
         obs = self.CHECK_NAN(obs, "Observation")
-        critic_obs = self.CHECK_NAN(critic_obs, "Privileged Observation")
-        
-        return {"policy": obs, "critic": critic_obs, "rnd_state": obs}
+        return {"policy": obs, "critic": obs, "rnd_state": obs}
 
     def _get_rewards(self) -> torch.Tensor:
         """
@@ -1013,22 +694,6 @@ class QuadcopterEnv(DirectRLEnv):
         died_mask = self.reset_terminated[env_ids]
         timed_out_mask = self.reset_time_outs[env_ids]
 
-        # Create environment masks for DeathReplay
-        if self._death_replay is not None:
-            # Create full-sized masks for all environments
-            completed_mask = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-            completed_mask[env_ids] = True
-
-            # For trajectory tracking, no episodes are considered "successful"
-            # All completed episodes are either died or timed out
-            success_mask_full = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-
-            # Update DeathReplay with episode outcomes
-            self._death_replay.end_episodes(completed_mask, success_mask_full)
-
-            # Reset DeathReplay for new episodes
-            self._death_replay.reset_episode(env_ids)
-
         # Update episode outcomes and metrics (if this method exists)
         # For trajectory tracking: died_mask = terminated, no success_mask needed
         if hasattr(self, '_update_episode_outcomes_and_metrics'):
@@ -1071,6 +736,31 @@ class QuadcopterEnv(DirectRLEnv):
         default_root_state[:, 1] +=  self.cfg.terrain_width / 2.0
         default_root_state[:, 2] +=  (self.cfg.too_low + self.cfg.too_high) / 2.0
 
+
+        # 处理 Null Trajectory 任务 (Position Control) 的初始状态随机化
+        # 论文: "random state (e.g., up to 90 deg tilt)"
+        
+        # 1. 随机姿态 (Roll/Pitch up to 90 deg, Yaw random)
+        # 这里使用简单的欧拉角转四元数采样
+        r = (torch.rand(len(env_ids), device=self.device) * 2 - 1) * (math.pi / 2) # +/- 90 deg
+        p = (torch.rand(len(env_ids), device=self.device) * 2 - 1) * (math.pi / 2)
+        y = (torch.rand(len(env_ids), device=self.device) * 2 - 1) * math.pi      # Full yaw
+        
+        # 注意：IsaacLab utils 可能需要特定的转换函数，这里示意逻辑
+        # 实际上可以使用 isaaclab.utils.math.quat_from_euler_xyz(r, p, y)
+
+        random_quat = quat_from_euler_xyz(r, p, y)
+        
+        # 2. 随机线速度 (e.g., +/- 2 m/s) 和角速度
+        random_lin_vel = (torch.rand(len(env_ids), 3, device=self.device) * 2 - 1) * 2.0
+        random_ang_vel = (torch.rand(len(env_ids), 3, device=self.device) * 2 - 1) * 5.0
+
+        # 应用随机化 (仅对 Null Trajectory 任务更重要，Langevin 任务通常从平稳开始或者也随机)
+        # 简单起见，对所有重置环境应用：
+        default_root_state[:, 3:7] = random_quat
+        default_root_state[:, 7:10] = random_lin_vel
+        default_root_state[:, 10:13] = random_ang_vel
+
         self._robot.write_root_pose_to_sim(default_root_state[:, :7], env_ids)
         self._robot.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
         self._robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
@@ -1081,9 +771,7 @@ class QuadcopterEnv(DirectRLEnv):
         # Reset trajectory tracking state flags
         self._numerical_is_unstable[env_ids] = False
 
-        # Reset observation histories
-        self._obs_history[env_ids] = torch.zeros(self.cfg.history_obs, self.cfg.frame_observation_space, device=self.device)
-        
+
         # Reset episode outcome tracking for the reset environments
         self._episode_outcomes[env_ids] = 0
         self.first_reach_stamp[env_ids] = torch.inf
@@ -1096,10 +784,39 @@ class QuadcopterEnv(DirectRLEnv):
         self.pos_des_raw[env_ids] = default_root_state[:, :3].clone()
         self.vel_des_raw[env_ids] = default_root_state[:, 7:10].clone()  # Start with actual initial velocity
 
-        if (time.time() - self._map_generation_timer) > 3600 * 24 * 10:
-            self._calc_env_origins()
-            self._regenerate_terrain()
-            self._map_generation_timer = time.time()
+
+        # 4. 关键：在重置时决定任务类型 (50% 概率)
+        random_probs = torch.rand(len(env_ids), device=self.device)
+        is_langevin = random_probs > self.cfg.prob_null_trajectory
+        self._is_langevin_task[env_ids] = is_langevin
+
+        # 初始化目标状态
+        # 获取重置后的初始位置
+        curr_pos = self._robot.data.root_pos_w[env_ids]
+        curr_vel = self._robot.data.root_lin_vel_w[env_ids]
+
+        # 初始化 Langevin 状态变量
+        self.pos_des_raw[env_ids] = curr_pos.clone()
+        self.vel_des_raw[env_ids] = curr_vel.clone()
+        self.pos_des[env_ids] = curr_pos.clone()
+        self.vel_des[env_ids] = curr_vel.clone()
+
+        # 如果是 Null Trajectory 任务，我们需要强制设定一个固定的目标（比如悬停在原点上方）
+        # 论文: "position control, going back to the origin from any initial state"
+        # 这意味着：初始位置是随机的（上面super()._reset_idx已经做了），但 pos_des 应该固定在原点
+        
+        null_task_ids = env_ids[~is_langevin]
+        if len(null_task_ids) > 0:
+            # 目标位置：环境原点 + 高度偏移 (例如 1.0m)
+            target_pos = self.env_origins[null_task_ids].clone()
+            target_pos[:, 2] += 1.0 # 目标高度
+            
+            self.pos_des[null_task_ids] = target_pos
+            self.vel_des[null_task_ids] = 0.0
+            
+            # 也要重置 raw 变量，防止下次切换任务时跳变
+            self.pos_des_raw[null_task_ids] = target_pos
+            self.vel_des_raw[null_task_ids] = 0.0
 
     def _set_debug_vis_impl(self, debug_vis: bool):
         """Show debug markers if debug_vis is True."""
