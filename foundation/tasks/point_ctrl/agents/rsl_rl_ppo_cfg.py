@@ -13,17 +13,17 @@ from isaaclab.utils import configclass
 
 @configclass
 class QuadcopterPPORunnerCfg(RslRlOnPolicyRunnerCfg):
-    num_steps_per_env = 96
+    num_steps_per_env = 128
     max_iterations = 5000
     save_interval = 25
     experiment_name = "point_ctrl_direct"
     empirical_normalization = True
     policy = RslRlPpoActorCriticCfg(
         init_noise_std=1.0,
-        actor_hidden_dims=[256, 256, 128],
-        critic_hidden_dims=[256, 256, 128],
+        actor_hidden_dims=[64, 64, 64],
+        critic_hidden_dims=[64, 64, 64],
         activation="elu",
-        class_name="ActorCriticRNN",  # "ActorCriticRNN" or "ActorCriticAtten" or "ActorCriticMLP"
+        class_name="ActorCritic",  # "ActorCriticRNN" or "ActorCriticAtten" or "ActorCriticMLP"
     )
     algorithm = RslRlPpoAlgorithmCfg(
         value_loss_coef=1.0,
