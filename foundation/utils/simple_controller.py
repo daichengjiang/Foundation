@@ -768,7 +768,13 @@ class SimpleQuadrotorController:
         # Torque: [roll, pitch, yaw] moments
         torque = alloc[:, 1:4]  # [τ_roll, τ_pitch, τ_yaw]
         
-        return force, torque
+        info = {
+            'motor_thrusts': motor_thrusts,
+            'force_z': force[:, 2],
+            'torque': torque
+        }
+        
+        return force, torque ,info
 
     def reset(self, env_ids: torch.Tensor = None):
         """

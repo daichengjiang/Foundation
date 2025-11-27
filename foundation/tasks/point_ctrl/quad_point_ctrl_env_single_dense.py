@@ -230,7 +230,7 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     history_depth = 2
     history_obs = 10
     # Updated observation space: replaced 3D euler angles with 9D rotation matrix + 3D delta pose
-    frame_observation_space = 3 + 9 + 2 + 1 + 1 + 4
+    frame_observation_space = 3 + 9 + 3 + 3 + 4  # 22
 
     # Enable/disable omnidirectional TOF sensors
     enable_omni_tof = False
@@ -245,26 +245,26 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     state_space = 0
     debug_vis = True
 
-    grid_rows = 16 # 12
-    grid_cols = 1 # 1
-    terrain_width = 32
-    terrain_length = 89
-    robots_per_env = 10
-    success_threshold = 69.0
-    distance_upper_bound = 4.0 # for kdtree query
-    collision_threshold = 0.25 # for collision detection
-    reaching_goal_threshold = 0.5
-    success_radius = 5.0
-    success_hold_time_steps = 500
+    grid_rows = 20 # 12
+    grid_cols = 20 # 1
+    terrain_width = 40
+    terrain_length = 40
+    robots_per_env = 1
+    # success_threshold = 69.0
+    # distance_upper_bound = 4.0 # for kdtree query
+    # collision_threshold = 0.25 # for collision detection
+    # reaching_goal_threshold = 0.5
+    # success_radius = 5.0
+    # success_hold_time_steps = 500
 
-    # stucking penalty
-    stucking_timesteps = 1000
-    stucking_displacement_threshold = 0.1
-    reward_coef_stucking_penalty = 0.0 # 0.2
+    # stucking penalty (not used for trajectory tracking, but needed for initialization)
+    # stucking_timesteps = 1000
+    # stucking_displacement_threshold = 0.1
+    # reward_coef_stucking_penalty = 0.0 # 0.2
 
     # path penalty
-    reward_coef_path_penalty = 0.0 # 1
-    path_penalty_threshold = 0.5
+    # reward_coef_path_penalty = 0.0 # 1
+    # path_penalty_threshold = 0.5
 
     connectivity_vis = False  # Visualize connectivity of the raster map
     enable_dijkstra = True  # Enable Dijkstra's algorithm for pathfinding
@@ -279,7 +279,7 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     dilation_kernel_size = 2
     dijkstra_vis = False  # Visualize connectivity of the raster map
     if_raster = True
-    reward_coef_dijkstra = 10.0  # 10.0
+    # reward_coef_dijkstra = 10.0  # 10.0
     start_x = 2.5
     load_raster_from_files = True
     distance_for_invalid = 200.0
@@ -294,16 +294,17 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     enable_video_player = False  # Enable video player for depth visualization
 
     # task reward parameters
-    reward_coef_task = 0.0 # 20.0
-    task_spatial_scaling = 1.0
-    task_reward_time = 2.0
-    task_max_time = 60.0
-    task_delta_check = 0.3  # 0.1
+    # reward_coef_task = 0.0 # 20.0
+    # task_spatial_scaling = 1.0
+    # task_reward_time = 2.0
+    # task_max_time = 60.0
+    # task_delta_check = 0.3  # 0.1
 
-    cbf_safe_bound = 0.15
-    cbf_eta = 0.1
+    # cbf_safe_bound = 0.15
+    # cbf_eta = 0.1
 
-    max_vel = 3.0
+    # Maximum velocity for Langevin trajectory generation
+    max_vel = 2.0
 
     ui_window_class_type = QuadcopterEnvWindow
 
@@ -458,8 +459,8 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
         )
 
     depth_size = tiled_camera.width * tiled_camera.height
-    # Calculate total observation space with history
-    observation_space = frame_observation_space + history_obs * frame_observation_space + history_depth * depth_size
+    # Calculate total observation space (without depth history, only current frame)
+    observation_space = frame_observation_space  # 22D: pos_error(3) + rot_matrix(9) + vel_error(3) + ang_vel(3) + motor_speeds(4)
 
     # thresholds
     too_low = 0.3
@@ -467,46 +468,40 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     desired_low = 0.5  
     desired_high = 1.0
     
-    # Reward coefficients
-    reward_coef_distance_reward: float = 0.0  # 7.0           # 10, 80
-    reward_coef_direction_penalty: float = 0.0 # 0.01     # [-2, 0] -> [-0.02, 0]
-    reward_coef_action_magnitude_penalty: float = 0.8   #0.8 # 0.2   # 600, 18.0
-    reward_coef_action_change_penalty: float = 1.0   #1.5  #2.0 #0.5      # 400, 12.0
-    reward_coef_vel_direction_alignment_penalty: float = 0.0 # 0.1  # 500, 50.0
-    reward_coef_vel_speed_excess_penalty: float = 1.0 # 0.3    # 500, 25.0
-    reward_coef_vel_speed_match_reward: float = 0.0 # 0.02      # [0, 2] -> [0, 0.04]
-    reward_coef_z_position_penalty: float = 0.3          # 1000, 50.0
-    reward_coef_obstacle_collision_penalty: float = 100.0  # 1 , 80
-    reward_coef_esdf_reward: float = 0.0 #0.02                  # 48, 0.48
-    reward_coef_succeed_reward: float = 100.0 # 0.1               # 100, 10.0
-    reward_coef_max_ang_vel_penalty: float = 0.0          # [-30, 0] -> [-0.03, 0]
-    reward_coef_max_angle_penalty: float = 0.0            # [-30, 0] -> [-0.03, 0]
-    reward_coef_alive_reward: float = 0.0 # 0.1 #0.1                 # 100, 10.0    must
-    reward_coef_z_vel_penalty: float = 0.0                # [-1, 0] -> [-0, 0]
-
-    reward_coef_angular_velocity_change_penalty: float = 0.0  # 0.0001
-    reward_coef_cbf = 10.0
-    reward_coef_hover_reward = 1.0
-    # # Reward coefficients
-    # reward_coef_distance_reward: float = 10.0           # 10, 80
+    # State check thresholds (for any dimension x, y, z)
+    position_threshold = 5  # meters
+    linear_velocity_threshold = 2  # m/s
+    angular_velocity_threshold = 35  # rad/s
+    
+    # # Reward coefficients  now
+    # reward_coef_distance_reward: float = 0.0  # 7.0           # 10, 80
     # reward_coef_direction_penalty: float = 0.0 # 0.01     # [-2, 0] -> [-0.02, 0]
-    # reward_coef_action_magnitude_penalty: float = 0.15    # 600, 18.0
-    # reward_coef_action_change_penalty: float = 0.3       # 400, 12.0
+    # reward_coef_action_magnitude_penalty: float = 0.8   #0.8 # 0.2   # 600, 18.0
+    # reward_coef_action_change_penalty: float = 1.0   #1.5  #2.0 #0.5      # 400, 12.0
     # reward_coef_vel_direction_alignment_penalty: float = 0.0 # 0.1  # 500, 50.0
-    # reward_coef_vel_speed_excess_penalty: float = 0.05    # 500, 25.0
+    # reward_coef_vel_speed_excess_penalty: float = 1.0 # 0.3    # 500, 25.0
     # reward_coef_vel_speed_match_reward: float = 0.0 # 0.02      # [0, 2] -> [0, 0.04]
-    # reward_coef_z_position_penalty: float = 0.05          # 1000, 50.0
-    # reward_coef_obstacle_collision_penalty: float = 80.0  # 1 , 80
-    # reward_coef_esdf_reward: float = 0.01                  # 48, 0.48
-    # reward_coef_succeed_reward: float = 50.0 # 0.1               # 100, 10.0
+    # reward_coef_z_position_penalty: float = 0.3          # 1000, 50.0
+    # reward_coef_obstacle_collision_penalty: float = 100.0  # 1 , 80
+    # reward_coef_esdf_reward: float = 0.0 #0.02                  # 48, 0.48
+    # reward_coef_succeed_reward: float = 100.0 # 0.1               # 100, 10.0
     # reward_coef_max_ang_vel_penalty: float = 0.0          # [-30, 0] -> [-0.03, 0]
     # reward_coef_max_angle_penalty: float = 0.0            # [-30, 0] -> [-0.03, 0]
-    # reward_coef_alive_reward: float = 0.1                 # 100, 10.0
-    # reward_coef_z_vel_penalty: float = 0.0                # [-1, 0] -> [-0, 0]
-    # Position control
-    reward_coef_lin_vel_reward_scale: float = 0 #-0.05
-    reward_coef_ang_vel_reward_scale: float = 0 #-0.01
-    reward_coef_distance_to_goal_reward_scale: float = 0 # 15.0
+    # reward_coef_alive_reward: float = 0.0 # 0.1 #0.1                 # 100, 10.0    must
+    # reward_coef_z_vel_penalty: float = 0.0                # [-1, 0] -> [-0, 0
+
+
+    # reward_coef_angular_velocity_change_penalty: float = 0.0  # 0.0001
+    # reward_coef_cbf = 10.0
+    # reward_coef_hover_reward = 1.0
+
+
+    reward_coef_position_cost = 1.0
+    reward_coef_orientation_cost = 0.2
+    reward_coef_d_action_cost = 1.0
+    reward_coef_termination_penalty = 100.0
+    reward_constant = 1.5
+
 
     # DeathReplay configuration
     enable_death_replay = False
@@ -601,39 +596,29 @@ class QuadcopterEnv(DirectRLEnv):
         self._desired_yaw_quat = torch.zeros(self.num_envs, 4, device=self.device)
         self._desired_vel = torch.zeros(self.num_envs, 1, device=self.device)
         self._threshold_vel_b = torch.full((self.num_envs, 1), 0.5, device=self.device)
+        
+        # Desired states for observation and reward (maintained across steps)
+        self.pos_des = torch.zeros(self.num_envs, 3, device=self.device)  # Desired position
+        self.vel_des = torch.zeros(self.num_envs, 3, device=self.device)  # Desired velocity
+        
+        # Langevin trajectory generation parameters
+        self._langevin_dt = 0.1  # Time step for Langevin dynamics
+        self._langevin_temperature = 0.5  # Temperature parameter controlling randomness
+        self._langevin_friction = 2.0  # Friction coefficient
 
         # Logging
         self._episode_sums = {
             key: torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
             for key in [
-                "distance_reward",
-                "direction_penalty",
-                "action_magnitude_penalty",
-                "action_change_penalty",
-                "vel_direction_alignment_penalty",
-                "vel_speed_excess_penalty",
-                "vel_speed_match_reward",
-                "z_position_penalty",
-                "obstacle_collision_penalty",
-                "esdf_reward",
-                "succeed_reward",
-                "max_ang_vel_penalty",
-                "max_angle_penalty",
-                "alive_reward",
-                "z_vel_penalty",
-                "lin_vel_reward",
-                "ang_vel_reward",
-                "distance_to_goal_reward",
-                # "stucking_penalty",
-                # "path_penalty",
-                # "task_reward",
-                "dijkstra_reward",
-                "angular_velocity_change_penalty",
-                "cbf_reward",
-                "hover_reward",
+                "position_penalty",
+                "orientation_penalty",
+                "action_smoothness_penalty",
+                "base_reward",
+                "terminal_penalty",
             ]
         }
         
+
         # Environment origins
         self.env_origins = torch.zeros(self.num_envs, 3, device=self.device)
         self.grid_idx = None
@@ -643,13 +628,13 @@ class QuadcopterEnv(DirectRLEnv):
 
         # Observations
         self._obs_history = torch.zeros(self.num_envs, self.cfg.history_obs, self.cfg.frame_observation_space, device=self.device)
-        self._depth_history = torch.zeros(self.num_envs, self.cfg.history_depth, self.cfg.depth_size, device=self.device)
+        # self._depth_history = torch.zeros(self.num_envs, self.cfg.history_depth, self.cfg.depth_size, device=self.device)
 
-        self._action_history_length = 8
-        self._action_history = torch.zeros(self.num_envs, self._action_history_length, self.cfg.action_space, device=self.device)
-        self._valid_mask = torch.zeros(                  # 标记哪些历史槽位已经被真实动作填过
-        self.num_envs, self._action_history_length, dtype=torch.bool, device=self.device
-        )
+        # self._action_history_length = 8
+        # self._action_history = torch.zeros(self.num_envs, self._action_history_length, self.cfg.action_space, device=self.device)
+        # self._valid_mask = torch.zeros(                  # 标记哪些历史槽位已经被真实动作填过
+        # self.num_envs, self._action_history_length, dtype=torch.bool, device=self.device
+        # )
 
 
 
@@ -660,7 +645,7 @@ class QuadcopterEnv(DirectRLEnv):
         self._numerical_is_unstable = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self._is_success = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self.occ_kdtree = None
-        self._displacement_history = torch.zeros(self.num_envs, self.cfg.stucking_timesteps, 3, device=self.device)
+        # self._displacement_history = torch.zeros(self.num_envs, self.cfg.stucking_timesteps, 3, device=self.device)
         self._is_stucking = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self._history_distance = torch.full((self.num_envs,), float('inf'), device=self.device)
         self._dilated_positions = torch.zeros(1, 3, device=self.device)
@@ -809,18 +794,119 @@ class QuadcopterEnv(DirectRLEnv):
         else:
             return tensor
 
+    # def CHECK_state(self):
+    #         # Limit
+    #         max_angular_velocity = 3.14 * 2.0 * 20.0 # rad/s
+
+    #         # State
+    #         ang_vel_b = self._robot.data.root_ang_vel_b
+    #         rot_w = torch.stack(euler_xyz_from_quat(self._robot.data.root_quat_w), dim=1) # (num_envs, 3) roll, pitch, yaw
+    #         rot_w = torch.stack([normallize_angle(rot_w[:, 0]), normallize_angle(rot_w[:, 1]), normallize_angle(rot_w[:, 2])], dim=1)
+
+    #         state_is_unstable = torch.any(torch.abs(ang_vel_b) > max_angular_velocity, dim=1)
+
+    #         self._numerical_is_unstable = torch.logical_or(self._numerical_is_unstable, state_is_unstable)
+
     def CHECK_state(self):
-        # Limit
-        max_angular_velocity = 3.14 * 2.0 * 20.0 # rad/s
-
-        # State
-        ang_vel_b = self._robot.data.root_ang_vel_b
-        rot_w = torch.stack(euler_xyz_from_quat(self._robot.data.root_quat_w), dim=1) # (num_envs, 3) roll, pitch, yaw
-        rot_w = torch.stack([normallize_angle(rot_w[:, 0]), normallize_angle(rot_w[:, 1]), normallize_angle(rot_w[:, 2])], dim=1)
-
-        state_is_unstable = torch.any(torch.abs(ang_vel_b) > max_angular_velocity, dim=1)
-
+        """
+        Check if any environment should terminate based on state thresholds.
+        
+        Episode terminates if ANY dimension (x, y, z) satisfies ANY of:
+        - |position[i]| > position_threshold
+        - |linear_velocity[i]| > linear_velocity_threshold
+        - |angular_velocity[i]| > angular_velocity_threshold
+        
+        This function updates self._numerical_is_unstable flag.
+        """
+        # Get robot states
+        pos_w = self._robot.data.root_pos_w  # (num_envs, 3) - world position [x, y, z]
+        lin_vel_w = self._robot.data.root_lin_vel_w  # (num_envs, 3) - world linear velocity
+        ang_vel_b = self._robot.data.root_ang_vel_b  # (num_envs, 3) - body angular velocity
+        
+        # Check position threshold for any dimension
+        position_exceeded = torch.any(torch.abs(pos_w) > self.cfg.position_threshold, dim=1)
+        
+        # Check linear velocity threshold for any dimension
+        linear_velocity_exceeded = torch.any(torch.abs(lin_vel_w) > self.cfg.linear_velocity_threshold, dim=1)
+        
+        # Check angular velocity threshold for any dimension
+        angular_velocity_exceeded = torch.any(torch.abs(ang_vel_b) > self.cfg.angular_velocity_threshold, dim=1)
+        
+        # Combine all conditions: terminate if ANY condition is met
+        state_is_unstable = position_exceeded | linear_velocity_exceeded | angular_velocity_exceeded
+        
+        # Update the numerical instability flag
         self._numerical_is_unstable = torch.logical_or(self._numerical_is_unstable, state_is_unstable)
+
+    def _generate_desired_trajectory_langevin(self, env_ids: torch.Tensor = None):
+        """
+        Generate desired position and velocity using Langevin dynamics.
+        
+        Langevin equation: dv = -γv dt + √(2γkT) dW
+        where:
+        - γ: friction coefficient
+        - k: Boltzmann constant (set to 1 for simplicity)
+        - T: temperature (controls randomness)
+        - dW: Wiener process (Gaussian noise)
+        
+        Args:
+            env_ids: Environments to update. If None, updates all environments.
+        """
+        if env_ids is None:
+            env_ids = torch.arange(self.num_envs, device=self.device)
+        
+        n_envs = len(env_ids)
+        
+        # Current robot position and velocity
+        current_pos = self._robot.data.root_pos_w[env_ids]  # (n_envs, 3)
+        current_vel = self._robot.data.root_lin_vel_w[env_ids]  # (n_envs, 3)
+        
+        # Get goal position
+        goal_pos = self._desired_pos_w[env_ids]  # (n_envs, 3)
+        
+        # Compute attractive force towards goal
+        to_goal = goal_pos - current_pos  # (n_envs, 3)
+        distance_to_goal = torch.norm(to_goal, dim=1, keepdim=True).clamp(min=1e-6)
+        direction_to_goal = to_goal / distance_to_goal
+        
+        # Attractive potential gradient (spring-like force)
+        k_spring = 1.0  # Spring constant
+        attractive_force = k_spring * to_goal
+        
+        # Langevin dynamics for velocity update
+        dt = self._langevin_dt
+        gamma = self._langevin_friction
+        T = self._langevin_temperature
+        
+        # Friction term: -γv
+        friction_term = -gamma * self.vel_des[env_ids]
+        
+        # Noise term: √(2γkT) * dW, where dW ~ N(0, dt)
+        noise_magnitude = torch.sqrt(torch.tensor(2.0 * gamma * T / dt, device=self.device))
+        noise = noise_magnitude * torch.randn(n_envs, 3, device=self.device) * torch.sqrt(torch.tensor(dt, device=self.device))
+        
+        # External force (attractive force towards goal)
+        external_force = attractive_force
+        
+        # Update velocity using Langevin equation
+        # dv = (F_ext - γv) dt + √(2γT) dW
+        self.vel_des[env_ids] = self.vel_des[env_ids] + (external_force + friction_term) * dt + noise
+        
+        # Limit maximum desired velocity
+        max_vel = self.cfg.max_vel  # e.g., 3.0 m/s
+        vel_norm = torch.norm(self.vel_des[env_ids], dim=1, keepdim=True).clamp(min=1e-6)
+        vel_scale = torch.clamp(max_vel / vel_norm, max=1.0)
+        self.vel_des[env_ids] = self.vel_des[env_ids] * vel_scale
+        
+        # Update desired position using velocity
+        self.pos_des[env_ids] = current_pos + self.vel_des[env_ids] * dt
+        
+        # Keep z-coordinate within reasonable bounds
+        self.pos_des[env_ids, 2] = torch.clamp(
+            self.pos_des[env_ids, 2],
+            self.cfg.desired_low,
+            self.cfg.desired_high
+        )
 
     def _calc_env_origins(self):
         # Generate group origins in a grid that ascends in rows and columns
@@ -873,7 +959,7 @@ class QuadcopterEnv(DirectRLEnv):
                 prims_utils.set_prim_property(prim_path, "visibility", "invisible")
 
         # Always create the main camera
-        self._tiled_camera = TiledCamera(self.cfg.tiled_camera)
+        # self._tiled_camera = TiledCamera(self.cfg.tiled_camera)
 
         # Only create omnidirectional TOF sensors if enabled
         if self.cfg.enable_omni_tof:
@@ -895,7 +981,7 @@ class QuadcopterEnv(DirectRLEnv):
 
         # Add the robot and main camera to the scene
         self.scene.articulations["robot"] = self._robot
-        self.scene.sensors["tiled_camera"] = self._tiled_camera
+        # self.scene.sensors["tiled_camera"] = self._tiled_camera
 
         # Only add omnidirectional TOF sensors to the scene if enabled
         if self.cfg.enable_omni_tof:
@@ -1036,36 +1122,36 @@ class QuadcopterEnv(DirectRLEnv):
         # --- ADDED: Print actions AFTER processing ---
         
         # actions = actions.tanh()
-        actions = actions.clamp(-1.0, 1.0)
-        actions[3] = (actions[3] + 1.0) * 0.5
+        # actions = actions.clamp(-1.0, 1.0)
+        # actions[3] = (actions[3] + 1.0) * 0.5
         self._actions = actions.clone()
         
-        # --- 新增：维护 action 历史 ---
-        if not hasattr(self, "_action_history"):
-            self._action_history_length = 8
-            self._action_history = torch.zeros(
-                self.num_envs, self._action_history_length, self.cfg.action_space, device=self.device
-            )
+        # # --- 新增：维护 action 历史 ---
+        # if not hasattr(self, "_action_history"):
+        #     self._action_history_length = 8
+        #     self._action_history = torch.zeros(
+        #         self.num_envs, self._action_history_length, self.cfg.action_space, device=self.device
+        #     )
 
-        # 把历史整体向前滚动一格，再写入最新 action
-        self._action_history = torch.roll(self._action_history, shifts=-1, dims=1)
-        self._valid_mask = torch.roll(self._valid_mask, shifts=-1, dims=1)
-        self._action_history[:, -1, :] = actions.clone()
-        self._valid_mask[:, -1] = True
-        # --- 新增：随机时延窗口扰动 ---
-        # 在 [-8, -8] 范围里随机窗口起点
-        window_start = random.randint(-8, -8)
-        window_end = window_start + 7  # 窗口长度 8
-        sel_actions = self._action_history[:, window_start:window_end, :]  # shape: (num_envs, 8, action_dim)
-        sel_mask     = self._valid_mask[:, window_start:window_end]
-        counts      = sel_mask.sum(dim=1).unsqueeze(-1)                              # [N, 1]
-        sum_actions = (sel_actions * sel_mask.unsqueeze(-1)).sum(dim=1)              # [N, A]
-        mean_action = torch.where(
-            counts > 0,
-            sum_actions / counts.clamp_min(1),                                       # 有效均值
-            actions                                                            # 没有有效项 -> 用当前动作
-        )
-        self._actions = mean_action.clone()
+        # # 把历史整体向前滚动一格，再写入最新 action
+        # self._action_history = torch.roll(self._action_history, shifts=-1, dims=1)
+        # self._valid_mask = torch.roll(self._valid_mask, shifts=-1, dims=1)
+        # self._action_history[:, -1, :] = actions.clone()
+        # self._valid_mask[:, -1] = True
+        # # --- 新增：随机时延窗口扰动 ---
+        # # 在 [-8, -8] 范围里随机窗口起点
+        # window_start = random.randint(-8, -8)
+        # window_end = window_start + 7  # 窗口长度 8
+        # sel_actions = self._action_history[:, window_start:window_end, :]  # shape: (num_envs, 8, action_dim)
+        # sel_mask     = self._valid_mask[:, window_start:window_end]
+        # counts      = sel_mask.sum(dim=1).unsqueeze(-1)                              # [N, 1]
+        # sum_actions = (sel_actions * sel_mask.unsqueeze(-1)).sum(dim=1)              # [N, A]
+        # mean_action = torch.where(
+        #     counts > 0,
+        #     sum_actions / counts.clamp_min(1),                                       # 有效均值
+        #     actions                                                            # 没有有效项 -> 用当前动作
+        # )
+        # self._actions = mean_action.clone()
         # mean_action = mean_action.clamp(-1.0, 1.0)
         # mean_action[:, 3] = (mean_action[:, 3] + 1.0) * 0.5 # [-1, 1] -> [0, 1]
         
@@ -1105,12 +1191,13 @@ class QuadcopterEnv(DirectRLEnv):
 
         # Extract the current state of the robot
         # Root state [pos, quat, lin_vel, ang_vel] in simulation world frame. Shape is (num_instances, 13).
-        cur_state = self._robot.data.root_state_w.clone()
+        # cur_state = self._robot.data.root_state_w.clone()
 
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
-        force, torque, _, px4info = self._controller.compute_control(cur_state, self._actions, self.step_dt)
+        # force, torque, _, px4info = self._controller.compute_control(cur_state, self._actions, self.step_dt)
+        force, torque, px4info = self._controller.motor_speeds_to_wrench(self._actions, normalized = True)
         self.px4info = px4info
         # force, torque = self._controller.compute_control(cur_state, mean_action, self.step_dt)
         end.record()
@@ -1129,7 +1216,8 @@ class QuadcopterEnv(DirectRLEnv):
             quat_w = self._robot.data.root_quat_w  # quaternion representing rotation from body to world
             rot_matrices_w2b = matrix_from_quat(quat_w).transpose(1, 2)  # shape: (num_envs, 3, 3)
             wind_force_body = torch.bmm(rot_matrices_w2b, wind_force_world.unsqueeze(2)).squeeze(2)
-            wind_weight = torch.clamp(((torch.mean(self._episode_sums["alive_reward"]) / (1.0 / (1.0 - self.cfg.gamma) * self.cfg.reward_coef_alive_reward) - 0.8) / 0.2), 0.0, 1.0)
+            # For trajectory tracking, apply constant wind weight (no curriculum)
+            wind_weight = 1.0
             self._forces[:, 0, :] += wind_force_body * wind_weight
             # print(f"original force: {self._forces[0, 0, :]}")
             # print(f"Wind force: {wind_force_body[0]}")
@@ -1183,602 +1271,179 @@ class QuadcopterEnv(DirectRLEnv):
     def _get_observations(self) -> dict:
         """
         Return the observations for the agent in a dictionary.
+        
+        Observation components:
+        - Position error: current_pos - pos_des (3D)
+        - Rotation matrix: flattened 3x3 matrix (9D)
+        - Velocity error: current_vel - vel_des (3D)
+        - Angular velocity: body frame (3D)
+        - Motor speeds: normalized [0, 1] (4D)
+        
+        Total: 3 + 9 + 3 + 3 + 4 = 22D per frame
         """
-        # # Get the depth image from the main camera
-        # depth_image = self._tiled_camera.data.output["depth"]
-
-        # # Save original shape and flatten to 2D for processing
-        # original_shape = depth_image.shape
-        # batch_size = original_shape[0]
-        # flat_depth = depth_image.reshape(batch_size, -1)
-
-        # invalid_rate = random.random() * 0.15
-        # invalid_masks = torch.rand_like(flat_depth) < invalid_rate
+        # Generate desired trajectory using Langevin dynamics
+        self._generate_desired_trajectory_langevin()
         
-
-        # flat_depth = torch.where(invalid_masks, 
-        #                      torch.tensor(4.0, device=self.device, dtype=flat_depth.dtype),
-        #                      flat_depth)
-
-        # depth_image = flat_depth  # Already in (num_envs, -1) shape
-        # self._depth_history = torch.cat([self._depth_history[:, 1:], depth_image.unsqueeze(dim=1)], dim=1)
-
-        # --- 修改开始 ---
-        # 1. 获取原始的、完美的深度图
-        # 它的原始形状很可能是 (num_envs, height, width, 1)
-        perfect_depth_map_nhwc = self._tiled_camera.data.output["depth"]
-
-        # 2. 【关键修复】调整维度顺序，从 NHWC 变为 NCHW
-        # (N, H, W, C) -> (N, C, H, W)
-        # (300, 60, 80, 1) -> (300, 1, 60, 80)
-        perfect_depth_map_nchw = perfect_depth_map_nhwc.permute(0, 3, 1, 2)
+        # Get current robot states
+        pos_w = self._robot.data.root_pos_w  # (num_envs, 3)
+        quat_w = self._robot.data.root_quat_w  # (num_envs, 4)
+        vel_w = self._robot.data.root_lin_vel_w  # (num_envs, 3)
+        ang_vel_b = self._robot.data.root_ang_vel_b  # (num_envs, 3)
         
-        # 为了后续处理和可视化，我们还需要一个没有通道维度的版本 (N, H, W)
-        perfect_depth_map_nhw = perfect_depth_map_nhwc.squeeze(-1)
-
-        # 3. 将【正确形状的】深度图送入噪声函数
-        # 注意这里我们传入squeeze后的版本，因为噪声函数内部会自己处理通道
-        noisy_map_temp = add_edge_noise_torch(perfect_depth_map_nhw, edge_threshold=1.0, noise_magnitude=0.05)
-        noisy_map_temp1 = add_filling_noise_torch(noisy_map_temp, dropout_rate=0.03, kernel_size=5)
-        final_noisy_map = add_rounding_noise_torch(noisy_map_temp1, levels=128)
-
-        # 4. 使用【带有噪声的深度图】作为网络的输入
-        depth_image_for_network = final_noisy_map 
-        # --- 修改结束 ---
-
-        # 展平为2D进行处理
-        batch_size = depth_image_for_network.shape[0]
-        flat_depth = depth_image_for_network.reshape(batch_size, -1)
-
-        # 更新历史记录
-        self._depth_history = torch.cat([self._depth_history[:, 1:], flat_depth.unsqueeze(dim=1)], dim=1)
-
-        # Initialize omnidirectional TOF values with zeros
-        left_depth = torch.zeros(self.num_envs, device=self.device)
-        right_depth = torch.zeros(self.num_envs, device=self.device)
-        back_depth = torch.zeros(self.num_envs, device=self.device)
-        down_depth = torch.zeros(self.num_envs, device=self.device)
-        
-        # Only process omnidirectional TOF data if enabled
-        if self.cfg.enable_omni_tof:
-            # Get depth data from omnidirectional cameras
-            left_depth_full = self._left_camera.data.output["depth"]
-            right_depth_full = self._right_camera.data.output["depth"]
-            back_depth_full = self._back_camera.data.output["depth"]
-            down_depth_full = self._down_camera.data.output["depth"]
-
-            # Extract center pixels for single-point measurements
-            h, w = self.cfg.left_camera.height, self.cfg.left_camera.width
-            center_h = [h//2 - 1, h//2]
-            center_w = [w//2 - 1, w//2]
-
-            # Extract minimum distance from center pixels for each direction
-            left_depth = torch.min(left_depth_full[:, center_h[0]:center_h[1]+1, center_w[0]:center_w[1]+1].reshape(self.num_envs, -1), dim=1)[0]
-            right_depth = torch.min(right_depth_full[:, center_h[0]:center_h[1]+1, center_w[0]:center_w[1]+1].reshape(self.num_envs, -1), dim=1)[0]
-            back_depth = torch.min(back_depth_full[:, center_h[0]:center_h[1]+1, center_w[0]:center_w[1]+1].reshape(self.num_envs, -1), dim=1)[0]
-            down_depth = torch.min(down_depth_full[:, center_h[0]:center_h[1]+1, center_w[0]:center_w[1]+1].reshape(self.num_envs, -1), dim=1)[0]
-
-        # Get the current position, orientation, and velocity of the robot
-        pos_w = self._robot.data.root_state_w[:, :3]
-        quat_w = self._robot.data.root_quat_w
-        
-        # Directly calculate delta position in body frame by multiplying body velocity by dt
-        # This is more efficient than transforming to world frame and back
-        vel_b = self._robot.data.root_lin_vel_b
-        dt = self.cfg.sim.dt  # Time step
-        delta_pos_b = vel_b * dt  # Simple and efficient computation in body frame
-        
-        # Get the rotation matrix for observation
-        rot_matrix_b2w = matrix_from_quat(quat_w)  # Shape: (num_envs, 3, 3)
-
-        # Record frame for death replay
-        if self._death_replay is not None:
-            # For visualization, still use Euler angles
-            rot_w = torch.stack(euler_xyz_from_quat(quat_w), dim=1)
-            rot_w = torch.stack([normallize_angle(rot_w[:, 0]), normallize_angle(rot_w[:, 1]), normallize_angle(rot_w[:, 2])], dim=1)
-            self._death_replay.record_frame(
-                pos_w=pos_w,
-                rot_w=rot_w,
-                tof_data=depth_image.view(self.num_envs, self.cfg.tiled_camera.height, self.cfg.tiled_camera.width)
-            )
-
-        # # Get direction to goal in world frame
-        # direction_to_goal_w = self._desired_pos_w - pos_w
-        # direction_to_goal_xy_w = direction_to_goal_w[:, :2]
-        # direction_to_goal_xy_w = direction_to_goal_xy_w / (direction_to_goal_xy_w.norm(dim=1, keepdim=True) + 1e-6)
-
-
-        #Get direction to goal in body frame
-        direction_to_goal_w = self._desired_pos_w - pos_w
-        direction_to_goal_xy_w = direction_to_goal_w[:, :2]
-        # 计算 R_b2w 的转置（即 R_w2b）
-        rot_matrix_w2b = rot_matrix_b2w.transpose(1, 2)  # [num_envs, 3, 3]
-
-        # 将 direction_to_goal_xy_w 扩展为 3D 向量（z 分量为 0）
-        direction_to_goal_w_3d = torch.cat([
-            direction_to_goal_xy_w,  # [num_envs, 2]
-            torch.zeros(self.num_envs, 1, device=direction_to_goal_xy_w.device)  # [num_envs, 1]
-        ], dim=1)  # [num_envs, 3]
-
-        # 转换到机体坐标系：v_b = R_w2b @ v_w
-        direction_to_goal_b_3d = torch.bmm(rot_matrix_w2b, direction_to_goal_w_3d.unsqueeze(-1)).squeeze(-1)  # [num_envs, 3]
-
-        # 提取 xy 分量
-        direction_to_goal_xy_b = direction_to_goal_b_3d[:, :2]  # [num_envs, 2]
-        # direction_to_goal_xy_b = direction_to_goal_xy_b / (direction_to_goal_xy_b.norm(dim=1, keepdim=True) + 1e-6)
-
-        
-        direction_to_goal_xy_w = direction_to_goal_xy_w / (direction_to_goal_xy_w.norm(dim=1, keepdim=True) + 1e-6)
-
-        # Flatten the rotation matrix to 9 elements for the observation
+        # Get rotation matrix (body to world)
+        rot_matrix_b2w = matrix_from_quat(quat_w)  # (num_envs, 3, 3)
         rotation_matrix_flat = rot_matrix_b2w.reshape(self.num_envs, 9)
         
-        # Map the observations to appropriate ranges for neural network input
-        self._obs_history = torch.cat(
-            [self._obs_history[:, 1:],
-             torch.cat([
-                # self._noise_5_cfg.func(vel_b, self._noise_5_cfg),
-                vel_b,
-                rotation_matrix_flat,
-                direction_to_goal_xy_b,
-                # delta_pos_b,  # [delta x, delta y, delta z] in body frame # 3
-                (self._desired_pos_w[:, 2]).unsqueeze(dim=-1),  # [desired z]
-                # (self._desired_vel),  # [desired vel]
-                pos_w[:, 2].unsqueeze(dim=-1),
-                self._last_actions,
-            ],dim=-1).unsqueeze(dim=1)
-            ],dim=1)
+        # Compute position error: current - desired
+        pos_error = pos_w - self.pos_des  # (num_envs, 3)
         
-        if self.cfg.enable_video_player:
-            # self.shared_imgs[:] = self._depth_history[:, -1].reshape(self.num_envs, self.cfg.tiled_camera.height, self.cfg.tiled_camera.width).cpu().numpy()
-             # --- 修改开始 ---
-            # 5. 创建用于并排可视化的组合图像
-            h, w = self.cfg.tiled_camera.height, self.cfg.tiled_camera.width
-            
-            combined_vis_imgs = np.zeros((self.num_envs, h, w * 2), dtype=np.float32)
-            
-            # 使用我们之前 squeeze 好的 nhw 格式的原始图
-            combined_vis_imgs[:, :, :w] = perfect_depth_map_nhw.cpu().numpy()
-            combined_vis_imgs[:, :, w:] = final_noisy_map.cpu().numpy()
-            
-            self.shared_imgs[:] = combined_vis_imgs
-            # --- 修改结束 ---
-            self.viewer.update_images(self.shared_imgs)
-            # self.viewer.update_images(self.shared_imgs)
-        # obs = torch.cat([self._obs_history[:, -1].clone(), self._obs_history.view(self.num_envs,-1), self._depth_history.view(self.num_envs,-1)], dim=-1)
-        # obs = torch.cat([self._obs_history[:, -2].view(self.num_envs, -1), self._depth_history[:, -2].view(self.num_envs, -1), self._obs_history[:, -1].view(self.num_envs, -1), self._depth_history[:, -1].view(self.num_envs, -1)], dim=-1)
-        obs = torch.cat([self._obs_history[:, -1].view(self.num_envs, -1), self._depth_history[:, -1].view(self.num_envs, -1)], dim=-1)
+        # Compute velocity error: current - desired
+        vel_error = vel_w - self.vel_des  # (num_envs, 3)
+        
+        # Get motor speeds (normalized actions from last step)
+        motor_speeds_norm = self._last_actions  # (num_envs, 4), already normalized [0, 1]
+        
+        # Concatenate all observation components
+        obs_frame = torch.cat([
+            pos_error,              # 3D
+            rotation_matrix_flat,   # 9D
+            vel_error,              # 3D
+            ang_vel_b,              # 3D
+            motor_speeds_norm,      # 4D
+        ], dim=-1)  # Total: 22D
+        
+        # Update observation history
+        self._obs_history = torch.cat(
+            [self._obs_history[:, 1:], obs_frame.unsqueeze(dim=1)],
+            dim=1
+        )
+        
+        # Create final observation (current frame + history)
+        obs = torch.cat([
+            self._obs_history[:, -1].view(self.num_envs, -1),  # Current observation
+            # self._obs_history.view(self.num_envs, -1),  # Full history (optional)
+        ], dim=-1)
+        
         critic_obs = obs.clone()
-
+        
+        # Check for NaN values
         obs = self.CHECK_NAN(obs, "Observation")
         critic_obs = self.CHECK_NAN(critic_obs, "Privileged Observation")
-
+        
         return {"policy": obs, "critic": critic_obs, "rnd_state": obs}
 
     def _get_rewards(self) -> torch.Tensor:
         """
-        Calculate the reward for each environment.
+        Calculate the reward for each environment based on trajectory tracking.
+        
+        Reward formula:
+        r(s_t, a, s_{t+1}) = -c1·∥p∥ - c2·arccos(1 - |q_z|) - c3·∥a_t - a_{t-1}∥ + c4 - c5·1[terminal(s_{t+1})]
+        
+        Where:
+        - p: position error (current_pos - pos_des)
+        - q_z: z-component of quaternion (orientation error indicator)
+        - a_t, a_{t-1}: current and previous actions
+        - terminal: whether the episode terminates (collision, out of bounds, etc.)
+        - c1, c2, c3, c4, c5: configurable reward coefficients
         """
-        # Current position, orientation, and velocity of the robot
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        pos_w = self._robot.data.root_state_w[:, :3]
-        rot_w = torch.stack(euler_xyz_from_quat(self._robot.data.root_state_w[:, 3:7]), dim=1)
-        rot_w = torch.stack([normallize_angle(rot_w[:, 0]), normallize_angle(rot_w[:, 1]), normallize_angle(rot_w[:, 2])], dim=1)
-        vel_b = self._robot.data.root_lin_vel_b
-
-        # distance to goal center [-0.01, 0.01] (1m/s / 100steps)
-        distance_to_gap = (pos_w - self._desired_pos_w).norm(dim=1)
-        last_distance_to_gap = (self._last_pos_w - self._desired_pos_w).norm(dim=1)
-        delta_distance = last_distance_to_gap - distance_to_gap
-        delta_distance = torch.clamp(delta_distance, min=-0.01 * (self.cfg.max_vel + 2.0), max=0.01 * (self.cfg.max_vel + 2.0))
-        # reward_far = delta_distance * 10.0
-        # distance_far = 5.0
-        # distance_near = 1.0
-        # reward_near = torch.where(
-        #     distance_to_gap <= distance_near,
-        #     0.05 * (distance_near - distance_to_gap) / distance_near,
-        #     torch.zeros_like(distance_to_gap)
-        # ) + 0.1
-        # t = torch.clamp((distance_to_gap - distance_near) / (distance_far - distance_near), 0.0, 1.0)
-        # w_smooth = 3*t*t - 2*t*t*t
-        # distance_reward = w_smooth * reward_far + (1 - w_smooth) * reward_near
-        distance_reward = delta_distance * 10.0
-
-        # direction penalty [-2, 0]
-        # (We define a "forward" direction as +X in world space for illustration.)
-        epsilon = 1e-6
-        pos_diff = pos_w - self._last_pos_w
-        norm_pos_diff = pos_diff.norm(dim=-1, keepdim=True)
-        pos_diff = pos_diff / (norm_pos_diff + epsilon)
-
-        direction_to_goal = self._desired_pos_w - pos_w
-        norm_direction_to_goal = direction_to_goal.norm(dim=-1, keepdim=True)
-        direction_to_goal = direction_to_goal / (norm_direction_to_goal + epsilon)
-        pos_diff_xy = pos_diff[..., :2]
-        direction_to_goal_xy = direction_to_goal[..., :2]
-        direction_penalty = (direction_to_goal_xy * pos_diff_xy).sum(dim=-1) - 1.0
-
-
-        # action magnitude penalty [-6, 0]
-        # shape is (num_envs, 4) -> thrust + rates
-        act_abs = torch.abs(self._actions)
-        # action_magnitude = torch.square(act_abs[:, 0]) + torch.square(act_abs[:, 1] )+ torch.square(2.0 * act_abs[:, 2]) + torch.square(2.0 * act_abs[:, 3])
-        action_magnitude = torch.square(act_abs[:, 0]) + torch.square(act_abs[:, 1]) 
-        action_magnitude_penalty = -action_magnitude
-
-        # action change penalty (difference relative to last actions) [-4, 0]
-        diff_actions = self._actions - self._last_actions
-
-        weights = torch.tensor([1.0, 2.0, 4.0, 1.0], device=self.device)
-        diff_actions_weighted = diff_actions * weights
-        action_change_penalty = - (diff_actions_weighted ** 2).sum(dim=1)
-
-        # action_change_penalty = -diff_actions.norm(dim=1)
-
-        dt = 1/100.0
-        # 计算角速度：基于前三维（角度）
-        angular_velocity = (self._actions[:, 0:3] - self._last_actions[:, 0:3]) / dt
-        # 保存当前角速度以供下一次计算（需要存储 last_angular_velocity）
-        if not hasattr(self, '_last_angular_velocity'):
-            self._last_angular_velocity = torch.zeros_like(angular_velocity, device=self.device)
-        # 计算角速度变化（角加速度）
-        diff_angular_velocity = angular_velocity - self._last_angular_velocity
-        # 应用权重（仅对前三维）
-        angular_weights = torch.tensor([1.0, 1.5, 2.0], device=self.device)  # 复用前三维权重
-        diff_angular_velocity_weighted = diff_angular_velocity * angular_weights
-        # 计算角速度变化惩罚
-        angular_velocity_change_penalty = - (diff_angular_velocity_weighted ** 2).sum(dim=1)
-        # 更新上一时间步的角速度
-        self._last_angular_velocity = angular_velocity.clone()
-
-
-        # Velocity-related rewards and penalties - now separated into individual components
-        speed = vel_b.norm(dim=1)
-        distance_to_goal = (pos_w - self._desired_pos_w).norm(dim=1)
-
-        # Adjust desired speed based on distance to goal
-        # Linearly decrease speed when within 2 meters of goal, reaching 0 at 0.25m
-        original_desired_speed = self._desired_vel.squeeze(-1)
-        speed_adjust_start = 5.0  # Start slowing down
-        speed_adjust_end = 1.0   # Speed should be zero
-
-        # Calculate the linear interpolation factor (0 at 5 meters, 1 at 1 meters)
-        slowdown_factor = torch.clamp((speed_adjust_start - distance_to_goal) / (speed_adjust_start - speed_adjust_end), 0.0, 1.0)
-        # Adjust desired speed: original speed when far, 0 when at goal
-        self._desired_speed = original_desired_speed * (1.0 - slowdown_factor)
-
-        # Velocity-orientation alignment penalty [-2, 0]
-        # Convert to penalty (0 for perfect alignment, -2 for opposite direction)
-        vel_direction_alignment_penalty = -torch.clamp(torch.exp(torch.abs(vel_b[:, 1]) * 5) - 1, max=5.0)
-
-        # Gaussian bump speed reward [-1, 1], with hard penalty for speed > v_max
-        # v_peak = 0.3
-        # sigma = 0.1
-        # v_min = 0.0
-        # v_max = 0.5
-        # # speed shape: (num_envs,) or (num_envs, 1)
-        # # 先计算高斯bump
-        # r = 2.0 * torch.exp(-((speed - v_peak) ** 2) / (2 * sigma ** 2)) - 1.0
-        # # 区间外直接-1
-        # vel_speed_excess_penalty = torch.where((speed < v_min) | (speed > v_max), torch.full_like(speed, -1.0), r)
-
-        v_max = self.cfg.max_vel
-        vel_norm = torch.norm(vel_b, dim=1) 
-        vel_speed_excess_penalty = torch.where(
-            torch.abs(vel_norm) > v_max,
-            -torch.clamp(torch.exp(vel_norm - v_max) - 1.0, max=5.0),
-            torch.zeros_like(vel_norm)
-        )
-
-        # Velocity matching reward [0, 2]
-        # Reward for having speed close to desired speed (now using adjusted desired_speed)
-        vel_speed_match_reward = torch.exp(-5.0 * torch.abs(speed - self._desired_speed)) * 2.0
-
-        # z position penalty [-10, 0]
-        z_pos = pos_w[:, 2]
-        floor_dist = z_pos - (self._desired_pos_w[:, 2]) + 0.2   #0.15
-        floor_penalty = torch.where(
-            floor_dist < 0.0, 
-            -torch.clamp(torch.exp(4.0 * (-floor_dist)) - 1.0, max=5.0),   #2.0 * (-floor_dist)
-            torch.zeros_like(z_pos),
-        )
-        ceiling_dist = (self._desired_pos_w[:, 2]) - z_pos + 0.2
-        ceiling_penalty = torch.where(
-            ceiling_dist < 0.0,
-            -torch.clamp(torch.exp(4.0 * (-ceiling_dist)) - 1.0, max=5.0),
-            torch.zeros_like(z_pos),
-        )
-        z_position_penalty = floor_penalty + ceiling_penalty
-
-        # Perform KD-tree query once to get nearest obstacle distances
-        nearest_obstacle_distances = None
-        if self.occ_kdtree is not None:
-            d, _ = self.occ_kdtree.query(pos_w.cpu(), workers=-1, distance_upper_bound=4.0)
-            nearest_obstacle_distances = torch.tensor(d, device=self.device)
-
-        # collision penalty. [-1, 0]
-        # Check for physical collisions using contact sensor
+        # Get current states
+        pos_w = self._robot.data.root_pos_w  # (num_envs, 3)
+        quat_w = self._robot.data.root_quat_w  # (num_envs, 4) [w, x, y, z]
         
-        # Get termination signal
-        die =  self._numerical_is_unstable | self._is_contact | (self._robot.data.root_pos_w[:, 2] < self.cfg.too_low) | (self._robot.data.root_pos_w[:, 2] > self.cfg.too_high)
-       
-        obstacle_collision_penalty = torch.where(
-            die,
-            torch.ones_like(vel_b[:, 0]),
-            torch.zeros_like(vel_b[:, 0]),
-        )
-        obstacle_collision_penalty = -obstacle_collision_penalty
-
-        # ESDF-based reward
-        esdf_reward = torch.zeros_like(vel_b[:, 0])
-        if nearest_obstacle_distances is not None:
-            safe_threshold = self.cfg.collision_threshold + 0.15
-            esdf_reward = torch.where(
-                nearest_obstacle_distances < safe_threshold,
-                -(torch.exp(5.0 * (safe_threshold - nearest_obstacle_distances)) - 1.0),
-                torch.zeros_like(nearest_obstacle_distances),
-            )
-
-        succeed_reward = self._is_success
-
-        # Angular velocity penalty
-        max_angular_velocity = 3.14 / 4.0 # rad/s
-        ang_vel_b = self._robot.data.root_ang_vel_b.clone() # (num_envs, 3)
-        max_ang_vel_penalty = torch.where(
-            torch.abs(ang_vel_b) > max_angular_velocity,
-            -torch.clamp(torch.exp(torch.abs(torch.abs(ang_vel_b) - max_angular_velocity)) - 1.0, max=10.0),
-            torch.zeros_like(ang_vel_b),
-        ) # (num_envs, 3) -> (num_envs,)
-        max_ang_vel_penalty = torch.sum(max_ang_vel_penalty, dim=1)
-
-        # Angle penalty [-20, 0]
-        max_angle = 3.14 / 4.0 # rad
-        max_angle_penalty = torch.where(
-            torch.abs(rot_w[:, :2]) > max_angle,
-            -torch.clamp(torch.exp(torch.abs(torch.abs(rot_w[:, :2]) - max_angle)) - 1.0, max=10.0),
-            torch.zeros_like(rot_w[:, :2]),
-        )
-        max_angle_penalty = torch.sum(max_angle_penalty, dim=1)
-
-        # z velocity penalty [-1, 0]
-        z_vel_diff = torch.abs(vel_b[:, 2])
-        z_vel_penalty = -torch.clamp(z_vel_diff, max=1.0)
-
-        # Alive reward (before collision) [0, 1]
-        alive_reward = torch.logical_not(die).float()
-
-        lin_vel = torch.sum(torch.square(self._robot.data.root_lin_vel_b), dim=1)
-        ang_vel = torch.sum(torch.square(self._robot.data.root_ang_vel_b), dim=1)
-        distance_to_goal_mapped = 1 - torch.tanh(distance_to_goal / 0.8)
-
-        # self._displacement_history = torch.cat(
-        #     [self._displacement_history[:, :-1],
-        #      (self._robot.data.root_state_w[:, :3] - self._last_pos_w).unsqueeze(1)],
-        #     dim=1
-        # )
-        # mean_displacement = torch.norm(torch.sum(self._displacement_history, dim=1), dim=-1)
-        # self._is_stucking = mean_displacement < self.cfg.stucking_displacement_threshold
-        # stucking_penalty = self._is_stucking.float() * -1.0  # Penalize if stuck
-
-        # depth = self._depth_history[:, -1].reshape(self.num_envs, self.cfg.tiled_camera.height, self.cfg.tiled_camera.width).unsqueeze(dim=1)  # (num_envs, 1, height, width)
-        # downsampled_depth = F.interpolate(depth, size=(self.cfg.tiled_camera.height // 10, self.cfg.tiled_camera.width // 10), mode="bilinear", align_corners=False)
-        # downsampled_depth = downsampled_depth.squeeze(dim=1)
-        # exp_mean = torch.mean(downsampled_depth, dim=(1, 2))
-        # path_penalty_mask = exp_mean > self.cfg.path_penalty_threshold
-        # exp_mean[path_penalty_mask] = 0.0
-        # path_penalty = -1.0 * exp_mean
-
-        # task_time_mask = self.episode_length_buf > (self.cfg.task_max_time - self.cfg.task_reward_time) / (self.cfg.sim.dt * self.cfg.decimation)
-        # task_random_mask = torch.rand(self.num_envs, device=self.device) < self.cfg.task_delta_check
-        # task_reward = torch.logical_or(task_time_mask, task_random_mask).float()
-        # direction = (self._desired_pos_w - pos_w) / self.cfg.task_spatial_scaling
-        # direction = direction.norm(dim=1, keepdim=False)
-        # task_reward = torch.div(task_reward, 1 + direction)
-
-        dijkstra_reward = torch.zeros(self.num_envs, device=self.device)
-        if self.cfg.enable_dijkstra:
-            for i in range(self.cfg.grid_rows):
-                for j in range(self.cfg.grid_cols):
-                    idx = i * self.cfg.grid_cols + j
-                    env_ids = self.grid_idx[idx]
-                    map_min = [j*self.cfg.terrain_length, i*self.cfg.terrain_width, self.cfg.too_low]
-                    if len(env_ids) == 0:
-                        continue
-                    # value = torch.from_numpy(trilinear_interpolate(self._maps[idx], self._robot.data.root_state_w[env_ids, :3].cpu().numpy(), map_min, self.cfg.raster_resolution)).to(dtype=torch.float32, device=self.device)
-                    # last_value = torch.from_numpy(trilinear_interpolate(self._maps[idx], self._last_pos_w[env_ids, :3].cpu().numpy(), map_min, self.cfg.raster_resolution)).to(dtype=torch.float32, device=self.device)
-                    # Sparse
-                    # is_free, free_distances = self._maps[idx].check_positions_occupancy(self._robot.data.root_state_w[env_ids, :3].cpu().numpy())
-                    # last_is_free, last_free_distances = self._maps[idx].check_positions_occupancy(self._last_pos_w[env_ids, :3].cpu().numpy())
-                    # is_free = torch.tensor(is_free, dtype=torch.bool, device=self.device)
-                    # free_distances = torch.tensor(free_distances, dtype=torch.float32, device=self.device)
-                    # last_is_free = torch.tensor(last_is_free, dtype=torch.bool, device=self.device)
-                    # last_free_distances = torch.tensor(last_free_distances, dtype=torch.float32, device=self.device)
-                    # env_ids = torch.tensor(env_ids, device=self.device)
-                    # both_free = is_free & last_is_free
-                    # diff = (last_free_distances - free_distances)[both_free]
-                    # is_free, free_distances = self._maps[idx].check_positions_occupancy(self._robot.data.root_state_w[env_ids, :3].cpu().numpy())
-                    # last_is_free, last_free_distances = self._maps[idx].check_positions_occupancy(self._last_pos_w[env_ids, :3].cpu().numpy())
-                    # is_free = torch.tensor(is_free, dtype=torch.bool, device=self.device)
-                    # free_distances = torch.tensor(free_distances, dtype=torch.float32, device=self.device)
-                    # last_is_free = torch.tensor(last_is_free, dtype=torch.bool, device=self.device)
-                    # last_free_distances = torch.tensor(last_free_distances, dtype=torch.float32, device=self.device)
-                    # env_ids = torch.tensor(env_ids, device=self.device)
-                    # both_free = is_free & last_is_free
-                    # diff = (last_free_distances - free_distances)[both_free]
-                    # diff = torch.clamp(diff, min=-0.1, max=0.1)
-                    # diff = 10 * diff
-                    # env_ids = torch.tensor(env_ids, device=self.device)
-                    # dijkstra_reward[env_ids[both_free]] = diff
-                    # diff = 10 * diff
-                    # env_ids = torch.tensor(env_ids, device=self.device)
-                    # dijkstra_reward[env_ids[both_free]] = diff
-
-                    # is_free, free_distances = self._maps[idx].check_positions_occupancy(self._robot.data.root_state_w[env_ids, :3].cpu().numpy())
-                    # is_free = torch.tensor(is_free, dtype=torch.bool, device=self.device)
-                    # next_points = self._maps[idx].get_next_step_towards_goal(self._robot.data.root_state_w[env_ids, :3][is_free].cpu().numpy())
-                    # next_points = torch.tensor(next_points, dtype=torch.float32, device=self.device)
-                    # directional_vec = next_points - self._robot.data.root_state_w[env_ids, :3][is_free]
-                    # directional_vec = directional_vec / (directional_vec.norm(dim=1, keepdim=True) + 1e-6)  # Normalize to unit vector
-                    # dijkstra_reward[env_ids[is_free]] = torch.bmm(
-                    #     directional_vec.unsqueeze(1),
-                    #     self._robot.data.root_state_w[env_ids[is_free], 7:10].unsqueeze(-1)
-                    # ).squeeze()
-
-
-                    # diff = torch.where(diff < 0, torch.zeros_like(diff), diff)
-                    # dijkstra_reward[env_ids] = torch.where(diff < 0, torch.zeros_like(diff), torch.tanh(diff))
-                    # dijkstra_reward[env_ids] = torch.where(diff < 0, torch.zeros_like(diff), diff)
-                    
-                    # 修改这两行：
-                    value = torch.from_numpy(self._maps[idx].trilinear_interpolate(self._robot.data.root_state_w[env_ids, :3].cpu().numpy())).to(dtype=torch.float32, device=self.device)
-                    last_value = torch.from_numpy(self._maps[idx].trilinear_interpolate(self._last_pos_w[env_ids, :3].cpu().numpy())).to(dtype=torch.float32, device=self.device)
-                    # diff = (last_value - value)[both_free]
-                    diff = last_value - value
-                    diff = torch.clamp(diff, min=-0.01 * (self.cfg.max_vel + 2.0), max=0.01 * (self.cfg.max_vel + 2.0))
-                    diff = 10 * diff
-                    # dijkstra_reward[env_ids[both_free]] = diff
-                    dijkstra_reward[env_ids] = diff
-
-                    # is_free, free_distances = self._maps[idx].check_positions_occupancy(self._robot.data.root_state_w[env_ids, :3].cpu().numpy())
-                    # is_free = torch.tensor(is_free, dtype=torch.bool, device=self.device)
-                    # free_distances = torch.tensor(free_distances, dtype=torch.float32, device=self.device)
-                    # cur_dijkstra_reward = dijkstra_reward[env_ids]
-                    # cur_dijkstra_reward[~is_free] = 0.0
-                    # # 用掩码进行逐元素更新
-                    # mask = is_free & (self._history_distance[env_ids] > free_distances)
-                    # cur_dijkstra_reward[mask] = 1.0
-                    # indices = torch.tensor(env_ids, device=self.device)[mask]
-                    # self._history_distance[indices] = free_distances[mask]
-                    # dijkstra_reward[env_ids] = cur_dijkstra_reward
-
-        cbf_reward = torch.zeros(self.num_envs, device=self.device)
-        gamma = self.cfg.cbf_eta / self.step_dt
-        safe_bound = self.cfg.cbf_safe_bound
-        for i in range(self.cfg.grid_rows):
-            for j in range(self.cfg.grid_cols):
-                idx = i * self.cfg.grid_cols + j
-                env_ids = self.grid_idx[idx]
-                env_ids = torch.tensor(env_ids, device=self.device)
-                map_min = [j*self.cfg.terrain_length, i*self.cfg.terrain_width, self.cfg.too_low]
-                if len(env_ids) == 0:
-                    continue
-                esd, esd_gradient = self._maps[idx].trilinear_interpolate_esdf(self._robot.data.root_state_w[env_ids, :3].cpu().numpy())
-                esd = torch.from_numpy(esd).to(dtype=torch.float32, device=self.device)
-                esd_gradient = torch.from_numpy(esd_gradient).to(dtype=torch.float32, device=self.device)
-                # esd_gradient = torch.from_numpy(self._maps[idx].trilinear_interpolate_esdf_gradient(self._robot.data.root_state_w[env_ids, :3].cpu().numpy())).to(dtype=torch.float32, device=self.device)
-                velocity = self._robot.data.root_lin_vel_w[env_ids]  # (num_envs, 3)
+        # 1. Position error term: -c1·∥p∥
+        # p = current_pos - pos_des
+        pos_error = pos_w - self.pos_des  # (num_envs, 3)
+        pos_error_norm = torch.norm(pos_error, dim=1)  # (num_envs,)
+        position_cost = pos_error_norm  # Raw cost (will be multiplied by coefficient)
         
-                # 计算 h_dot = gradient · velocity (点积)
-                h_dot = torch.sum(esd_gradient * velocity, dim=1)  # (num_envs,)
-                # 计算CBF约束
-                h = esd - safe_bound  # (num_envs,)
-                cbf_reward[env_ids] = h_dot + gamma * h
-
-        cbf_reward = torch.where(
-            cbf_reward < 0.0,
-            cbf_reward,
-            torch.zeros_like(cbf_reward) 
+        # 2. Orientation error term: -c2·arccos(1 - |q_z|)
+        # q_z is the z-component of quaternion (index 3 for [w,x,y,z])
+        q_z = quat_w[:, 3]  # (num_envs,)
+        q_z_abs = torch.abs(q_z)
+        # Clamp the argument to arccos to [-1, 1] for numerical stability
+        arccos_arg = torch.clamp(1.0 - q_z_abs, -1.0, 1.0)
+        orientation_cost = torch.arccos(arccos_arg)  # Raw cost
+        
+        # 3. Action smoothness term: -c3·∥a_t - a_{t-1}∥
+        action_diff = self._actions - self._last_actions  # (num_envs, 4)
+        action_diff_norm = torch.norm(action_diff, dim=1)  # (num_envs,)
+        d_action_cost = action_diff_norm  # Raw cost
+        
+        # 4. Base reward: +c4 (reward_constant)
+        constant = torch.full((self.num_envs,), 1.0, device=self.device)  # Will be scaled by reward_constant
+        
+        # 5. Terminal penalty: -c5·1[terminal]
+        # Check for termination conditions
+        terminal = (
+            self._numerical_is_unstable | 
+            # self._is_contact | 
+            (self._robot.data.root_pos_w[:, 2] < self.cfg.too_low) | 
+            (self._robot.data.root_pos_w[:, 2] > self.cfg.too_high)
         )
-
-        cbf_reward.clamp_(min=-2.0, max=0.0)
-
-        hover_reward = torch.zeros(self.num_envs, device=self.device)
-        # distance_to_goal = torch.norm(self._robot.data.root_state_w[:, :3] - self._desired_pos_w, dim=1)
-        # hover_reward = torch.where(
-        #     distance_to_goal < self.cfg.max_vel * 1.0,
-        #     torch.exp(-1.0 * distance_to_goal),
-        #     torch.zeros_like(distance_to_goal)
-        # )
-        # dijkstra_reward = torch.where(
-        #     distance_to_goal < self.cfg.max_vel * 1.0,
-        #     torch.zeros_like(dijkstra_reward),
-        #     dijkstra_reward,
-        # )
-        # succeed_mask = distance_to_goal < self.cfg.success_radius
-        # # Gather components - Updated to include separate velocity components
+        termination_penalty = terminal.float()  # 1.0 if terminal, 0.0 otherwise
+        
+        # Apply reward coefficients and combine all components
         reward_components = torch.stack(
             [
-                distance_reward * self.cfg.reward_coef_distance_reward,  # 0
-                direction_penalty * self.cfg.reward_coef_direction_penalty,  # 1
-                action_magnitude_penalty * self.cfg.reward_coef_action_magnitude_penalty,  # 2
-                action_change_penalty * self.cfg.reward_coef_action_change_penalty,  # 3
-                vel_direction_alignment_penalty * self.cfg.reward_coef_vel_direction_alignment_penalty,  # 4
-                vel_speed_excess_penalty * self.cfg.reward_coef_vel_speed_excess_penalty,  # 5
-                vel_speed_match_reward * self.cfg.reward_coef_vel_speed_match_reward,  # 6
-                z_position_penalty * self.cfg.reward_coef_z_position_penalty,  # 7
-                obstacle_collision_penalty * self.cfg.reward_coef_obstacle_collision_penalty,  # 8
-                esdf_reward * self.cfg.reward_coef_esdf_reward,  # 9
-                succeed_reward * self.cfg.reward_coef_succeed_reward,  # 10
-                max_ang_vel_penalty * self.cfg.reward_coef_max_ang_vel_penalty,  # 11
-                max_angle_penalty * self.cfg.reward_coef_max_angle_penalty,  # 12
-                alive_reward * self.cfg.reward_coef_alive_reward,  # 13
-                z_vel_penalty * self.cfg.reward_coef_z_vel_penalty,  # 14
-                lin_vel * self.cfg.reward_coef_lin_vel_reward_scale,  # 15
-                ang_vel * self.cfg.reward_coef_ang_vel_reward_scale,  # 16
-                distance_to_goal_mapped * self.cfg.reward_coef_distance_to_goal_reward_scale,  # 17
-                # stucking_penalty * self.cfg.reward_coef_stucking_penalty,  # 18
-                # path_penalty * self.cfg.reward_coef_path_penalty,  # 19
-                # task_reward * self.cfg.reward_coef_task,  # 20
-                dijkstra_reward * self.cfg.reward_coef_dijkstra,  # 21
-                angular_velocity_change_penalty * self.cfg.reward_coef_angular_velocity_change_penalty,  # 22
-                cbf_reward * self.cfg.reward_coef_cbf,  # 23
-                hover_reward * self.cfg.reward_coef_hover_reward,  # 24
+                -position_cost * self.cfg.reward_coef_position_cost,
+                -orientation_cost * self.cfg.reward_coef_orientation_cost,
+                -d_action_cost * self.cfg.reward_coef_d_action_cost,
+                constant * self.cfg.reward_constant,
+                -termination_penalty * self.cfg.reward_coef_termination_penalty,
             ],
             dim=-1
         )
-
+        
         total_reward = torch.sum(reward_components, dim=1)
-
-
-        debug = torch.where(self._episode_sums["obstacle_collision_penalty"] < 0)
-        if debug[0].numel() > 0:
-            print("debug: ",debug)
-            raise ValueError("debug")
- 
-
-
-
-        # For logging:
-        for (key, idx) in zip(self._episode_sums.keys(), range(reward_components.shape[1])):
-            # self._episode_sums[key] = self._episode_sums[key] * self.cfg.gamma + reward_components[:, idx]
+        
+        # For logging (update episode sums)
+        # Store each component for analysis
+        component_names = [
+            "position_penalty",
+            "orientation_penalty", 
+            "action_smoothness_penalty",
+            "base_reward",
+            "terminal_penalty"
+        ]
+        
+        # Update episode sums for logging
+        for key, idx in zip(component_names, range(reward_components.shape[1])):
+            if key not in self._episode_sums:
+                self._episode_sums[key] = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
             self._episode_sums[key] = self._episode_sums[key] + reward_components[:, idx]
-
+        
         # Update "last" values
         self._last_pos_w = pos_w.clone()
         self._last_actions = self._actions.clone()
-        end.record()
-        torch.cuda.synchronize()
-        # print(f"Reward compute time: {start.elapsed_time(end)} ms")
-
+            
         return total_reward
+
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Define terminations and timeouts."""
         time_out = self.episode_length_buf >= self.max_episode_length - 1
         #
         self.CHECK_state()
-        # Goal reached
-        net_contact_forces = self._contact_sensor.data.net_forces_w_history
-        selected_forces = torch.index_select(
-            net_contact_forces,
-            dim=2,
-            index=torch.tensor(self._undesired_contact_body_ids, device=self.device)
-        )
-        max_contact = torch.max(torch.norm(selected_forces, dim=-1), dim=1)[0]
-        physical_contact = torch.sum(max_contact > 0.0, dim=1) > 0
-        is_contact = physical_contact
-        self._is_contact = torch.logical_or(self._is_contact, is_contact.bool())
 
-        if self.cfg.enable_dijkstra:
-            for i in range(self.cfg.grid_rows):
-                for j in range(self.cfg.grid_cols):
-                    idx = i * self.cfg.grid_cols + j
-                    env_ids = self.grid_idx[idx]
-                    is_free, _ = self._maps[idx].check_positions_occupancy(self._robot.data.root_state_w[env_ids, :3].cpu().numpy())
-                    is_free = torch.tensor(is_free, dtype=torch.bool, device=self.device)
-                    self._is_contact[env_ids] = torch.logical_or(self._is_contact[env_ids], ~is_free)
+        # net_contact_forces = self._contact_sensor.data.net_forces_w_history
+        # selected_forces = torch.index_select(
+        #     net_contact_forces,
+        #     dim=2,
+        #     index=torch.tensor(self._undesired_contact_body_ids, device=self.device)
+        # )
+        # max_contact = torch.max(torch.norm(selected_forces, dim=-1), dim=1)[0]
+        # physical_contact = torch.sum(max_contact > 0.0, dim=1) > 0
+        # is_contact = physical_contact
+        # self._is_contact = torch.logical_or(self._is_contact, is_contact.bool())
+
+        # if self.cfg.enable_dijkstra:
+        #     for i in range(self.cfg.grid_rows):
+        #         for j in range(self.cfg.grid_cols):
+        #             idx = i * self.cfg.grid_cols + j
+        #             env_ids = self.grid_idx[idx]
+        #             is_free, _ = self._maps[idx].check_positions_occupancy(self._robot.data.root_state_w[env_ids, :3].cpu().numpy())
+        #             is_free = torch.tensor(is_free, dtype=torch.bool, device=self.device)
+        #             self._is_contact[env_ids] = torch.logical_or(self._is_contact[env_ids], ~is_free)
 
         # distances, _ = self.occ_kdtree.query(self._robot.data.root_pos_w[:, :3].cpu(), workers=-1, distance_upper_bound=self.cfg.distance_upper_bound)
         # distances = torch.tensor(distances, device=self.device)
@@ -1803,8 +1468,10 @@ class QuadcopterEnv(DirectRLEnv):
         # )
         # time_since_first_reach = self.episode_length_buf - self.first_reach_stamp
         # succeed_mask = time_since_first_reach >= self.cfg.success_hold_time_steps
-        distance_to_goal = torch.norm(self._robot.data.root_state_w[:, :3] - self._desired_pos_w, dim=1)
-        succeed_mask = distance_to_goal < self.cfg.success_radius
+
+        # distance_to_goal = torch.norm(self._robot.data.root_state_w[:, :3] - self._desired_pos_w, dim=1)
+        # succeed_mask = distance_to_goal < self.cfg.success_radius
+        # self._is_success = torch.logical_or(self._is_success, succeed_mask.bool())
         
         # rot_matrix_b2w = matrix_from_quat(self._robot.data.root_quat_w)  # Shape: (num_envs, 3, 3)
         # direction_to_goal_w = self._desired_pos_w - self._robot.data.root_state_w[:, :3]
@@ -1824,13 +1491,13 @@ class QuadcopterEnv(DirectRLEnv):
         # # 提取 xy 分量
         # direction_to_goal_xy_b = direction_to_goal_b_3d[:, :2]  # [num_envs, 2]
         # succeed_mask = torch.norm(direction_to_goal_xy_b, dim=1) < self.cfg.success_radius
-        self._is_success = torch.logical_or(self._is_success, succeed_mask.bool())
+        
         conditions = [
             self._numerical_is_unstable,  # Numerical instability
-            self._is_contact,  # Collision
+            # self._is_contact,  # Collision
             self._robot.data.root_pos_w[:, 2] < self.cfg.too_low,  # Z position too low
             self._robot.data.root_pos_w[:, 2] > self.cfg.too_high,
-            self._is_success,  # Goal reached
+            # self._is_success,  # Goal reached
         ]
 
         # Combine all die conditions
@@ -1843,23 +1510,20 @@ class QuadcopterEnv(DirectRLEnv):
         completed_mask = torch.logical_or(died, time_out)
         completed_episodes = torch.sum(completed_mask == True).item()
         if completed_episodes > 0:
-            success_episodes = torch.sum(self._is_success == True).item()
+            # For trajectory tracking task: no success/failure distinction
+            # Only track timeouts (max episode length) and deaths (physical limit violations)
+            died_episodes = torch.sum(died == True).item()
             timeout_episodes = torch.sum(time_out == True).item()
-            outcomes = self._is_success[completed_mask]
-            outcomes = (outcomes.cpu() == True).tolist()
-            outcome =  [self.EpisodeOutcome.SUCCESS if success else self.EpisodeOutcome.FAILURE for success in outcomes]
             self.extras["log"].update({
-                    "Metrics/success_episodes_per_step": success_episodes,
+                    "Metrics/died_episodes_per_step": died_episodes,
                     "Metrics/completed_episodes_per_step": completed_episodes,
                     "Metrics/timeout_episodes_per_step": timeout_episodes,
-                    "Metrics/outcome_episodes_per_step": outcome,
             })
         else:
             self.extras["log"].update({
-                "Metrics/success_episodes_per_step": 0,
+                "Metrics/died_episodes_per_step": 0,
                 "Metrics/completed_episodes_per_step": 0,
                 "Metrics/timeout_episodes_per_step": 0,
-                "Metrics/outcome_episodes_per_step": [],
             })
 
         # # ----- 新增：逐步打印“新发生”的死亡原因与实时高度 -----
@@ -1913,9 +1577,9 @@ class QuadcopterEnv(DirectRLEnv):
             # Reset wind generator for the environments being reset
             self._wind_gen.reset(env_ids)
 
-        # Determine episode outcomes for completed episodes
-        success_mask = self._is_success[env_ids]
-        died_mask = torch.logical_and(self.reset_terminated[env_ids], ~success_mask)
+        # For trajectory tracking task: no success/failure distinction
+        # Only track died (physical limit violations) and timeouts
+        died_mask = self.reset_terminated[env_ids]
         timed_out_mask = self.reset_time_outs[env_ids]
 
         # Create environment masks for DeathReplay
@@ -1924,8 +1588,9 @@ class QuadcopterEnv(DirectRLEnv):
             completed_mask = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
             completed_mask[env_ids] = True
 
+            # For trajectory tracking, no episodes are considered "successful"
+            # All completed episodes are either died or timed out
             success_mask_full = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-            success_mask_full[env_ids] = success_mask
 
             # Update DeathReplay with episode outcomes
             self._death_replay.end_episodes(completed_mask, success_mask_full)
@@ -1933,8 +1598,12 @@ class QuadcopterEnv(DirectRLEnv):
             # Reset DeathReplay for new episodes
             self._death_replay.reset_episode(env_ids)
 
-        # Update episode outcomes and metrics
-        self._update_episode_outcomes_and_metrics(env_ids, success_mask, died_mask, timed_out_mask)
+        # Update episode outcomes and metrics (if this method exists)
+        # For trajectory tracking: died_mask = terminated, no success_mask needed
+        if hasattr(self, '_update_episode_outcomes_and_metrics'):
+            # Pass empty success mask since there's no success criterion in trajectory tracking
+            success_mask = torch.zeros(len(env_ids), dtype=torch.bool, device=self.device)
+            self._update_episode_outcomes_and_metrics(env_ids, success_mask, died_mask, timed_out_mask)
 
         # Update reward component logs
         extras = dict()
@@ -1959,14 +1628,22 @@ class QuadcopterEnv(DirectRLEnv):
         self._action_history[env_ids] = 0.0
         self._valid_mask[env_ids] = False
 
-        # Sample new commands with obstacle validation
-        self._desired_pos_w[env_ids, :2] = torch.zeros_like(self._desired_pos_w[env_ids, :2])
+        # For trajectory tracking task in obstacle-free environment:
+        # Sample random goal positions without obstacle validation
+        # No need for KD-tree or obstacle distance checks
+        self._desired_pos_w[env_ids, :3] = self.env_origins[env_ids]
+        
 
-        # Sample valid positions that are at least 20cm from obstacles
-        min_obstacle_distance = 0.3  # 30cm safety distance
-        max_attempts = 20  # Prevent infinite loops
+        self._desired_pos_w[env_ids, 0] +=  self.cfg.terrain_length / 2.0
+        self._desired_pos_w[env_ids, 1] += self.cfg.terrain_width / 2.0
+        self._desired_pos_w[env_ids, 2] += (self.cfg.desired_low + self.cfg.desired_high) / 2.0
 
-        if self.occ_kdtree is not None:
+        # Legacy obstacle validation code (not needed for trajectory tracking)
+        # Kept for reference but can be removed if no longer needed
+        if False and self.occ_kdtree is not None:
+            # Sample valid positions that are at least 20cm from obstacles
+            min_obstacle_distance = 0.3  # 30cm safety distance
+            max_attempts = 20  # Prevent infinite loops
             # Create index mappings to track which environments still need valid positions
             original_indices = torch.arange(len(env_ids), device=self.device)
             need_valid_position = torch.ones(len(env_ids), dtype=torch.bool, device=self.device)
@@ -2034,17 +1711,12 @@ class QuadcopterEnv(DirectRLEnv):
         else:
             # If KD-tree isn't available, just sample positions without validation
             self._desired_pos_w[env_ids, :3] = self.env_origins[env_ids]
-            if self.cfg.enable_dijkstra:
-                self._desired_pos_w[env_ids, 0] += torch.zeros_like(self._desired_pos_w[env_ids, 0]) + (self.cfg.terrain_length + self.cfg.success_threshold) / 2.0
-                self._desired_pos_w[env_ids, 1] += torch.zeros_like(self._desired_pos_w[env_ids, 1]) + self.cfg.terrain_width / 2.0
-                self._desired_pos_w[env_ids, 2] = torch.zeros_like(self._desired_pos_w[env_ids, 2]) + (self.cfg.desired_low + self.cfg.desired_high) / 2.0
-            else:
-                self._desired_pos_w[env_ids, 0] += torch.zeros_like(self._desired_pos_w[env_ids, 0]).uniform_(self.cfg.success_threshold, self.cfg.terrain_length)
-                self._desired_pos_w[env_ids, 1] += torch.zeros_like(self._desired_pos_w[env_ids, 1]).uniform_(1.0, self.cfg.terrain_width - 1.0)
-                self._desired_pos_w[env_ids, 2] = torch.zeros_like(self._desired_pos_w[env_ids, 2]).uniform_(self.cfg.desired_low, self.cfg.desired_high)
-            # self._desired_pos_w[env_ids, 0] += torch.zeros_like(self._desired_pos_w[env_ids, 0]).uniform_(self.cfg.terrain_length / 2.0, self.cfg.terrain_length / 2.0)
-            # self._desired_pos_w[env_ids, 1] += torch.zeros_like(self._desired_pos_w[env_ids, 1]).uniform_(self.cfg.terrain_width / 2.0, self.cfg.terrain_width / 2.0)
-            # self._desired_pos_w[env_ids, 2] = torch.zeros_like(self._desired_pos_w[env_ids, 2]).uniform_(self.cfg.desired_low, self.cfg.desired_high)
+
+            self._desired_pos_w[env_ids, 0] += torch.zeros_like(self._desired_pos_w[env_ids, 0]) + self.cfg.terrain_length / 2.0
+            self._desired_pos_w[env_ids, 1] += torch.zeros_like(self._desired_pos_w[env_ids, 1]) + self.cfg.terrain_width / 2.0
+            self._desired_pos_w[env_ids, 2] = torch.zeros_like(self._desired_pos_w[env_ids, 2]) + (self.cfg.desired_low + self.cfg.desired_high) / 2.0
+
+
 
         self._desired_vel[env_ids] = torch.zeros_like(self._desired_vel[env_ids]).uniform_(0.5, 0.8)
 
@@ -2065,13 +1737,16 @@ class QuadcopterEnv(DirectRLEnv):
         default_root_state = self._robot.data.default_root_state[env_ids].clone()
         default_root_state[:, :3] = self.env_origins[env_ids].clone()
 
-        if not self.cfg.random_init_pos or len(self._maps) == 0:
-            # default_root_state[:, :3] += self.scene.env_origins[env_ids].clone() + torch.tensor([ (-self.cfg.scene.env_spacing / 2.0) - 1.0, 0.0, 0.0], device=self.device)
-            default_root_state[:, :3] += torch.tensor([self.cfg.start_x, 0.0, 0.0], device=self.device)
-            default_root_state[:, 1] += torch.zeros_like(default_root_state[:, 1]).uniform_(1.0, self.cfg.terrain_width - 1.0)
-            default_root_state[:, 2] += torch.zeros_like(default_root_state[:, 2]).uniform_(self.cfg.desired_low, self.cfg.desired_high)
+        # For trajectory tracking in obstacle-free environment:
+        # Simply sample random initial positions without obstacle validation
+        default_root_state[:, :3] += torch.tensor([self.cfg.start_x, 0.0, 0.0], device=self.device)
+        default_root_state[:, 1] += torch.zeros_like(default_root_state[:, 1]).uniform_(1.0, self.cfg.terrain_width - 1.0)
+        default_root_state[:, 2] += torch.zeros_like(default_root_state[:, 2]).uniform_(self.cfg.desired_low, self.cfg.desired_high)
 
-        else:
+        # Legacy obstacle-aware initialization code (not needed for trajectory tracking)
+        # Kept for reference but disabled
+        if False and self.cfg.random_init_pos and len(self._maps) > 0:
+            max_attempts = 20  # Prevent infinite loops
             # Create index mappings to track which environments still need valid positions
             original_indices = torch.arange(len(env_ids), device=self.device)
             need_valid_position = torch.ones(len(env_ids), dtype=torch.bool, device=self.device)
@@ -2129,24 +1804,35 @@ class QuadcopterEnv(DirectRLEnv):
         # Reset the "last" references for rewards
         self._last_pos_w[env_ids] = default_root_state[:, :3]
         self._last_actions[env_ids] = torch.zeros(4, device=self.device)
-        self._is_contact[env_ids] = False
+        
+        # Reset trajectory tracking state flags
         self._numerical_is_unstable[env_ids] = False
+        
+        # Legacy flags (not used in trajectory tracking but kept for compatibility)
+        self._is_contact[env_ids] = False
         self._is_success[env_ids] = False
         self._is_stucking[env_ids] = False
-        self._displacement_history[env_ids] = torch.zeros(self.cfg.stucking_timesteps, 3, device=self.device)
+        # self._displacement_history[env_ids] = torch.zeros(self.cfg.stucking_timesteps, 3, device=self.device)
+        
+        # Reset observation histories
         self._obs_history[env_ids] = torch.zeros(self.cfg.history_obs, self.cfg.frame_observation_space, device=self.device)
-        self._depth_history[env_ids] = torch.zeros(self.cfg.history_depth, self.cfg.depth_size, device=self.device)
+        # self._depth_history[env_ids] = torch.zeros(self.cfg.history_depth, self.cfg.depth_size, device=self.device)
         self._history_distance = torch.full((self.num_envs,), float('inf'), device=self.device)
+        
         # Reset episode outcome tracking for the reset environments
         self._episode_outcomes[env_ids] = 0
         self.first_reach_stamp[env_ids] = torch.inf
+        
+        # Initialize desired states for trajectory generation
+        self.pos_des[env_ids] = default_root_state[:, :3].clone()  # Start from current position
+        self.vel_des[env_ids] = torch.zeros(len(env_ids), 3, device=self.device)  # Start with zero velocity
 
-        # After setting the desired positions
-        # Update target positions in death replay
+        # Update target positions in death replay (if enabled)
         if self._death_replay is not None:
             self._death_replay.set_target_positions(self._desired_pos_w)
 
-        # Without enough GPU memory, the terrain will fail to generate.
+        # Terrain regeneration (disabled by default with very long timer)
+        # For trajectory tracking in obstacle-free environment, terrain regeneration is not needed
         if (time.time() - self._map_generation_timer) > 3600 * 24 * 10:
             self._calc_env_origins()
             self._regenerate_terrain()
