@@ -44,6 +44,7 @@ class ActorCritic(nn.Module):
         for layer_index in range(len(actor_hidden_dims)):
             if layer_index == len(actor_hidden_dims) - 1:
                 actor_layers.append(nn.Linear(actor_hidden_dims[layer_index], num_actions))
+                actor_layers.append(nn.Tanh())  # Add tanh activation to output layer
             else:
                 actor_layers.append(nn.Linear(actor_hidden_dims[layer_index], actor_hidden_dims[layer_index + 1]))
                 actor_layers.append(activation)
