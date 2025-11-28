@@ -481,30 +481,33 @@ class QuadcopterEnv(DirectRLEnv):
         # 1. 计算机体系下的 Wrench
         force_b, torque_b, px4info = self._controller.motor_speeds_to_wrench(self._actions, normalized=True)
 
-        # 2. 获取姿态
-        quat_w = self._robot.data.root_quat_w
-        rot_b2w = matrix_from_quat(quat_w) # (num_envs, 3, 3)
+        # # 2. 获取姿态
+        # quat_w = self._robot.data.root_quat_w
+        # rot_b2w = matrix_from_quat(quat_w) # (num_envs, 3, 3)
 
-        # 3. 准备机体坐标系下的力和力矩向量
-        # Force: only Z component usually has value, but let's be generic
-        force_vec_b = torch.zeros_like(self._forces[:, 0, :])
-        force_vec_b[:, 2] = force_b[:, 2] # Thrust in Body Z
+        # # 3. 准备机体坐标系下的力和力矩向量
+        # # Force: only Z component usually has value, but let's be generic
+        # force_vec_b = torch.zeros_like(self._forces[:, 0, :])
+        # force_vec_b[:, 2] = force_b[:, 2] # Thrust in Body Z
 
-        # Torque
-        torque_vec_b = torque_b # Torques are in body frame
+        # # Torque
+        # torque_vec_b = torque_b # Torques are in body frame
 
         self.px4info = px4info
 
         # 4. 填充力矩 Buffer
         self._forces.zero_()
         self._torques.zero_()
-        # 5. [关键] 将总力与力矩旋转到世界坐标系
-        force_w = torch.bmm(rot_b2w, force_vec_b.unsqueeze(-1)).squeeze(-1)
-        torque_w = torch.bmm(rot_b2w, torque_vec_b.unsqueeze(-1)).squeeze(-1)
+        # # 5. [关键] 将总力与力矩旋转到世界坐标系
+        # force_w = torch.bmm(rot_b2w, force_vec_b.unsqueeze(-1)).squeeze(-1)
+        # torque_w = torch.bmm(rot_b2w, torque_vec_b.unsqueeze(-1)).squeeze(-1)
 
         # 6. 赋值给 buffer
         self._forces[:, 0, :] = force_w
         self._torques[:, 0, :] = torque_w
+
+        self._forces[:, 0, :] = force_b
+        self._torques[:, 0, :] = torque_b
 
     def _apply_action(self):
         """Apply thrust/moment to the quadcopter."""
