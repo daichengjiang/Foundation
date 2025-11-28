@@ -502,9 +502,9 @@ class QuadcopterEnv(DirectRLEnv):
         # force_w = torch.bmm(rot_b2w, force_vec_b.unsqueeze(-1)).squeeze(-1)
         # torque_w = torch.bmm(rot_b2w, torque_vec_b.unsqueeze(-1)).squeeze(-1)
 
-        # 6. 赋值给 buffer
-        self._forces[:, 0, :] = force_w
-        self._torques[:, 0, :] = torque_w
+        # # 6. 赋值给 buffer
+        # self._forces[:, 0, :] = force_w
+        # self._torques[:, 0, :] = torque_w
 
         self._forces[:, 0, :] = force_b
         self._torques[:, 0, :] = torque_b
