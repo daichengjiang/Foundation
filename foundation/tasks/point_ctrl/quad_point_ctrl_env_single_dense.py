@@ -694,9 +694,9 @@ class QuadcopterEnv(DirectRLEnv):
             
             # Terminal Penalty
             terminal = (
-                self._numerical_is_unstable | 
-                (self._robot.data.root_pos_w[:, 2] < self.cfg.too_low) | 
-                (self._robot.data.root_pos_w[:, 2] > self.cfg.too_high)
+                self._numerical_is_unstable 
+                # (self._robot.data.root_pos_w[:, 2] < self.cfg.too_low) | 
+                # (self._robot.data.root_pos_w[:, 2] > self.cfg.too_high)
             )
             termination_penalty = terminal.float()
             
@@ -755,8 +755,8 @@ class QuadcopterEnv(DirectRLEnv):
 
         conditions = [
             self._numerical_is_unstable,  # Numerical instability
-            self._robot.data.root_pos_w[:, 2] < self.cfg.too_low,  # Z position too low
-            self._robot.data.root_pos_w[:, 2] > self.cfg.too_high,  # Z position too high
+            # self._robot.data.root_pos_w[:, 2] < self.cfg.too_low,  # Z position too low
+            # self._robot.data.root_pos_w[:, 2] > self.cfg.too_high,  # Z position too high
             position_exceeded_langevin,  # Distance from desired trajectory exceeds threshold
         ]
 
@@ -1019,14 +1019,14 @@ class QuadcopterEnv(DirectRLEnv):
                 
                 # 判断是否超过阈值并转为 numpy
                 pos_exceeded = (dist_traj_from_spawn > self.cfg.position_threshold_langevin).cpu().numpy()
-                too_low = (pos_z < self.cfg.too_low)
-                too_high = (pos_z > self.cfg.too_high)
+                # too_low = (pos_z < self.cfg.too_low)
+                # too_high = (pos_z > self.cfg.too_high)
                 
                 for i in range(len(died_env_ids)):
                     self._termination_reason_history.append({
                         "numerical_is_unstable": bool(is_unstable[i]),
-                        "too_low": bool(too_low[i]),
-                        "too_high": bool(too_high[i]),
+                        # "too_low": bool(too_low[i]),
+                        # "too_high": bool(too_high[i]),
                         "position_exceeded_langevin": bool(pos_exceeded[i])  # [新增] 记录该原因
                     })
             
@@ -1047,7 +1047,8 @@ class QuadcopterEnv(DirectRLEnv):
             if num_termination_records > 0:
                 # Count death reasons (no collision in open space)
                 # [新增] 将 position_exceeded_langevin 加入统计列表
-                reason_keys = ["numerical_is_unstable", "too_low", "too_high", "position_exceeded_langevin"]
+                # reason_keys = ["numerical_is_unstable", "too_low", "too_high", "position_exceeded_langevin"]
+                reason_keys = ["numerical_is_unstable", "position_exceeded_langevin"]
                 reason_counts = {key: 0 for key in reason_keys}
                 
                 if len(self._termination_reason_history) > 0:
@@ -1078,8 +1079,8 @@ class QuadcopterEnv(DirectRLEnv):
 
                     # Death reason statistics as percentages of total episodes
                     "Metrics/Died/numerical_is_unstable": reason_counts["numerical_is_unstable"] / num_termination_records * 100.0,
-                    "Metrics/Died/too_low": reason_counts["too_low"] / num_termination_records * 100.0,
-                    "Metrics/Died/too_high": reason_counts["too_high"] / num_termination_records * 100.0,
+                    # "Metrics/Died/too_low": reason_counts["too_low"] / num_termination_records * 100.0,
+                    # "Metrics/Died/too_high": reason_counts["too_high"] / num_termination_records * 100.0,
                     # [新增] 记录新的死亡原因日志
                     "Metrics/Died/position_exceeded_langevin": reason_counts["position_exceeded_langevin"] / num_termination_records * 100.0,
 
