@@ -221,7 +221,11 @@ class QuadcopterEnv(DirectRLEnv):
         self._current_motor_speeds = torch.zeros(self.num_envs, 4, device=self.device)
         
         # Controller
-        mass_tensor = torch.full((self.num_envs,), 0.030, device=self.device)
+
+        mass_tensor = torch.full((self.num_envs,), 0.0282, device=self.device)       
+        arm_l_tensor = torch.full((self.num_envs,), 0.04384, device=self.device)
+        inertia_tensor = torch.tensor([2.44864e-5, 2.44864e-5, 3.61504e-5], device=self.device).repeat(self.num_envs, 1)
+        
         # Store the robot mass for wind force calculation
         self._robot_mass = mass_tensor
         # --- Aerodynamic drag setup (paper model) ---
@@ -234,6 +238,10 @@ class QuadcopterEnv(DirectRLEnv):
             attitude_p_gain=torch.tensor(self.cfg.controller_Kang, device=self.device, dtype=torch.float32),
             attitude_d_gain=torch.tensor(self.cfg.controller_Kdang, device=self.device, dtype=torch.float32),
             rate_p_gain=torch.tensor(self.cfg.controller_Kang_vel, device=self.device, dtype=torch.float32),
+            # 新增参数传递
+            mass=mass_tensor,
+            arm_length=arm_l_tensor,
+            inertia=inertia_tensor
         )
 
         self._is_langevin_task = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
@@ -567,12 +575,12 @@ class QuadcopterEnv(DirectRLEnv):
         # with torch.no_grad():
         #     # 假设 4 个电机都满速 (normalized=1.0) 时的推力
         #     # 这里我们直接看当前产生的力 force_b[0, 2] 与重力的关系
-        #     gravity_force = 9.81 * 0.8  # mass = 0.8
+        #     gravity_force = 9.81 * 0.03  # mass = 0.8
         #     current_thrust = force_b[0, 2].item()
         #     twr = current_thrust / gravity_force
             
         #     print(f"\n=== Physics Check [Env 0] ===")
-        #     print(f"Mass: 0.8 kg | Req Hover Force: {gravity_force:.2f} N")
+        #     print(f"Mass: 0.03 kg | Req Hover Force: {gravity_force:.2f} N")
         #     print(f"Curr Thrust: {current_thrust:.2f} N | TWR (Curr): {twr:.2f}")
         #     # 如果当前是全油门 (Action接近1)，TWR 必须 > 1.5 甚至 > 2.0 才能灵活飞行
         #     print(f"Action Mean: {self._actions[0].mean().item():.2f}") 
