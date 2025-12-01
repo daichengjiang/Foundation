@@ -184,8 +184,8 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     angular_velocity_threshold = 35.0  # rad/s
 
     reward_coef_position_cost = 1.0
-    reward_coef_orientation_cost = 0.2
-    reward_coef_d_action_cost = 1.0
+    reward_coef_orientation_cost = 0.5
+    reward_coef_d_action_cost = 0.1
     reward_coef_termination_penalty = 100.0
     reward_constant = 1.5
 
@@ -221,7 +221,7 @@ class QuadcopterEnv(DirectRLEnv):
         self._current_motor_speeds = torch.zeros(self.num_envs, 4, device=self.device)
         
         # Controller
-        mass_tensor = torch.full((self.num_envs,), 0.800, device=self.device)
+        mass_tensor = torch.full((self.num_envs,), 0.030, device=self.device)
         # Store the robot mass for wind force calculation
         self._robot_mass = mass_tensor
         # --- Aerodynamic drag setup (paper model) ---
@@ -433,6 +433,20 @@ class QuadcopterEnv(DirectRLEnv):
             self.cfg.desired_high
         )
 
+        # # ==================== [新增调试打印] ====================
+        # # 检查当前更新列表中是否包含环境 0
+        # # env_ids 是一个 Tensor，我们检查 0 是否在其中
+        # if (env_ids == 0).any():
+        #     with torch.no_grad():
+        #         # 计算相对于出生点的位移，方便观察是否飘太远
+        #         rel_pos = self.pos_des[0] - self._spawn_pos_w[0]
+                
+        #         print(f"Langevin [Env 0] | "
+        #               f"Pos: {[round(x, 4) for x in self.pos_des[0].cpu().tolist()]} | "
+        #               f"Rel: {[round(x, 4) for x in rel_pos.cpu().tolist()]} | "
+        #               f"Vel: {[round(x, 4) for x in self.vel_des[0].cpu().tolist()]}")
+        # # ======================================================
+
     def _calc_env_origins(self):
         # Generate group origins in a grid that ascends in rows and columns
         robots_per_env = self.cfg.robots_per_env
@@ -549,6 +563,21 @@ class QuadcopterEnv(DirectRLEnv):
             normalized=False # 传入的是真实 rad/s
         )
 
+        # # [新增调试打印] 检查物理可行性
+        # with torch.no_grad():
+        #     # 假设 4 个电机都满速 (normalized=1.0) 时的推力
+        #     # 这里我们直接看当前产生的力 force_b[0, 2] 与重力的关系
+        #     gravity_force = 9.81 * 0.8  # mass = 0.8
+        #     current_thrust = force_b[0, 2].item()
+        #     twr = current_thrust / gravity_force
+            
+        #     print(f"\n=== Physics Check [Env 0] ===")
+        #     print(f"Mass: 0.8 kg | Req Hover Force: {gravity_force:.2f} N")
+        #     print(f"Curr Thrust: {current_thrust:.2f} N | TWR (Curr): {twr:.2f}")
+        #     # 如果当前是全油门 (Action接近1)，TWR 必须 > 1.5 甚至 > 2.0 才能灵活飞行
+        #     print(f"Action Mean: {self._actions[0].mean().item():.2f}") 
+        #     print("=============================")
+
         # 4. 施加力
         self._forces.zero_()
         self._torques.zero_()
@@ -585,7 +614,20 @@ class QuadcopterEnv(DirectRLEnv):
         pos_error_b = torch.bmm(rot_matrix_w2b, pos_error_w.unsqueeze(-1)).squeeze(-1)
         vel_error_b = torch.bmm(rot_matrix_w2b, vel_error_w.unsqueeze(-1)).squeeze(-1)
         # --- [关键修改] 坐标系转换结束 ---
-
+        # [新增调试打印] 验证坐标旋转逻辑
+        # with torch.no_grad():
+        #     # 取出欧拉角 (Roll, Pitch, Yaw)
+        #     r, p, y = euler_xyz_from_quat(quat_w[0].unsqueeze(0))
+        #     yaw_deg = y.item() * 180 / 3.14159
+            
+        #     print(f"\n=== Coord Check [Env 0] ===")
+        #     print(f"Yaw: {yaw_deg:.1f} deg")
+        #     print(f"Err World: {pos_error_w[0].cpu().tolist()}")
+        #     print(f"Err Body : {pos_error_b[0].cpu().tolist()}")
+        #     # 简单验证逻辑：
+        #     # 如果 Yaw = 0, World 和 Body 应该差不多
+        #     # 如果 Yaw = 90 (机头朝左), World 的 X 应该是 Body 的 -Y
+        #     print("===========================")
         # [修改] 使用手动维护的、带有物理延迟的电机速度
         # 为了让网络好训练，通常需要归一化回 [-1, 1] 或 [0, 1]
         omega_min = self._controller.dynamics.motor_omega_min_.unsqueeze(1)
@@ -679,7 +721,17 @@ class QuadcopterEnv(DirectRLEnv):
             
             # 更新历史动作
             self._last_actions = self._actions.clone()
-                
+                    
+            # with torch.no_grad():
+            #     print(f"\n=== Reward Breakdown [Env 0] ===")
+            #     print(f"Pos Cost : {r_pos[0].item():.4f}")
+            #     print(f"Ori Cost : {r_ori[0].item():.4f}")
+            #     print(f"Act Cost : {r_act[0].item():.4f}")
+            #     print(f"Base Rew : {r_base[0].item():.4f}")
+            #     print(f"Term Pen : {r_term[0].item():.4f}")
+            #     print(f"TOTAL    : {total_reward[0].item():.4f}")
+            #     print("================================")
+
             return total_reward
 
 
