@@ -180,7 +180,7 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     position_threshold = 15.0  # meters
     position_threshold_langevin = 14  # 根据实际需求调整
 
-    linear_velocity_threshold = 2.0  # m/s
+    linear_velocity_threshold = 4.0  # m/s
     angular_velocity_threshold = 35.0  # rad/s
 
     reward_coef_position_cost = 1.0
