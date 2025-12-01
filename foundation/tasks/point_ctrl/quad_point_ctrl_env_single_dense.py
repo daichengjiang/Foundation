@@ -49,7 +49,7 @@ import collections
 import itertools
 
 
-MAP_SIZE = (350, 350) 
+MAP_SIZE = (500, 500) 
 
 # [0, 2pi] -> [-pi, pi]
 def normallize_angle(angle: torch.Tensor):
@@ -121,8 +121,8 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
 
     map_size = MAP_SIZE
 
-    grid_rows = 30 # 12
-    grid_cols = 30 # 1
+    grid_rows = 40 # 12
+    grid_cols = 40 # 1
     terrain_width = 10
     terrain_length = 10
     robots_per_env = 1
@@ -215,6 +215,11 @@ class QuadcopterEnv(DirectRLEnv):
         else:
             self._wind_gen = None
 
+        self.motor_tau = 0.05 # 假设值，RAPTOR中是采样的
+        self.dt = self.cfg.sim.dt
+        self.motor_alpha = self.dt / (self.dt + self.motor_tau)
+        self._current_motor_speeds = torch.zeros(self.num_envs, 4, device=self.device)
+        
         # Controller
         mass_tensor = torch.full((self.num_envs,), 0.800, device=self.device)
         # Store the robot mass for wind force calculation
@@ -250,8 +255,8 @@ class QuadcopterEnv(DirectRLEnv):
         self._langevin_dt = 0.01  # Time step for integration
         self._langevin_friction = 1.0  # Damping coefficient (gamma)
         self._langevin_omega = 2.0  # Oscillator frequency (omega)
-        self._langevin_sigma = 0.5  # Noise intensity (sigma)
-        self._langevin_alpha = 0.01  # Smoothing factor for exponential moving average (alpha)
+        self._langevin_sigma = 1.0  # Noise intensity (sigma)
+        self._langevin_alpha = 1.0  # Smoothing factor for exponential moving average (alpha)
 
         # Logging
         # [修改] 键名必须与 _get_rewards 中的 reward_items 字典键名完全一致
@@ -273,7 +278,7 @@ class QuadcopterEnv(DirectRLEnv):
         # Robot references
         self._body_id = self._robot.find_bodies("body")[0]
 
-        self._last_actions = torch.zeros(self.num_envs, 4, device=self.device) # [roll_rate, pitch_rate, yaw_rate, thrust]
+        self._last_actions = torch.zeros(self.num_envs, 4, device=self.device) # 
         self._numerical_is_unstable = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self._spawn_pos_w = torch.zeros(self.num_envs, 3, device=self.device)  # Store spawn/respawn positions
 
@@ -373,6 +378,9 @@ class QuadcopterEnv(DirectRLEnv):
         if env_ids is None:
             env_ids = torch.arange(self.num_envs, device=self.device)
         
+        # if len(env_ids) > 0 and env_ids[0] == 0:
+        #     print(f"Langevin V: {self.vel_des[0]}, Pos Error: {self.pos_des[0] - self._spawn_pos_w[0]}")
+
         n_envs = len(env_ids)
         
         # Get parameters from config
@@ -503,43 +511,51 @@ class QuadcopterEnv(DirectRLEnv):
             self._map_generation_timer = 0
 
     def _pre_physics_step(self, actions: torch.Tensor):
+
         # 1. 更新轨迹 (仅针对 Langevin 任务)
         if torch.any(self._is_langevin_task):
             self._generate_desired_trajectory_langevin(env_ids=torch.where(self._is_langevin_task)[0])
 
-        actions = (actions + 1.0) * 0.5
-        self._actions = actions.clone()
+        # 1. Action Clamp (之前讨论过的)
+        raw_actions_clamped = torch.clamp(actions, -1.0, 1.0)
+        action_setpoint_normalized = (raw_actions_clamped + 1.0) * 0.5
 
-        # 1. 计算机体系下的 Wrench
-        force_b, torque_b, px4info = self._controller.motor_speeds_to_wrench(self._actions, normalized=True)
+        # with torch.no_grad():
+        #     # 使用 .cpu().tolist() 将 Tensor 转为纯列表，看着更清爽
+        #     print(f"Action (Env 0): {action_setpoint_normalized[0].cpu().tolist()}")
+        
+        # 保存 Action 用于 Observation 的 "Last Action"
+        self._actions = action_setpoint_normalized.clone()
 
-        # # 2. 获取姿态
-        # quat_w = self._robot.data.root_quat_w
-        # rot_b2w = matrix_from_quat(quat_w) # (num_envs, 3, 3)
+        # 2. [新增] 模拟电机一阶低通滤波 (First-order Low-pass Filter)
+        # 将归一化的 Setpoint 转换为 真实的 RPM/Rad/s 范围
+        omega_min = self._controller.dynamics.motor_omega_min_.unsqueeze(1)
+        omega_max = self._controller.dynamics.motor_omega_max_.unsqueeze(1)
+        
+        # 目标转速 (Target Omega)
+        target_motor_speeds = omega_min + action_setpoint_normalized * (omega_max - omega_min)
+        
+        # 更新当前电机转速 (Current Omega)
+        # formula: current = alpha * target + (1 - alpha) * previous
+        # 注意：RAPTOR 论文中上升和下降的延迟可能不同 (Tm_up, Tm_down)
+        self._current_motor_speeds = (self.motor_alpha * target_motor_speeds + 
+                                      (1.0 - self.motor_alpha) * self._current_motor_speeds)
 
-        # # 3. 准备机体坐标系下的力和力矩向量
-        # # Force: only Z component usually has value, but let's be generic
-        # force_vec_b = torch.zeros_like(self._forces[:, 0, :])
-        # force_vec_b[:, 2] = force_b[:, 2] # Thrust in Body Z
+        # 3. 计算力 (使用带有延迟的 _current_motor_speeds)
+        # 注意：这里不需要 normalized=True 了，因为我们已经反归一化了
+        # 或者你修改 motor_speeds_to_wrench 让它接受非归一化输入
+        force_b, torque_b, px4info = self._controller.motor_speeds_to_wrench(
+            self._current_motor_speeds, 
+            normalized=False # 传入的是真实 rad/s
+        )
 
-        # # Torque
-        # torque_vec_b = torque_b # Torques are in body frame
-
-        self.px4info = px4info
-
-        # 4. 填充力矩 Buffer
+        # 4. 施加力
         self._forces.zero_()
         self._torques.zero_()
-        # # 5. [关键] 将总力与力矩旋转到世界坐标系
-        # force_w = torch.bmm(rot_b2w, force_vec_b.unsqueeze(-1)).squeeze(-1)
-        # torque_w = torch.bmm(rot_b2w, torque_vec_b.unsqueeze(-1)).squeeze(-1)
-
-        # # 6. 赋值给 buffer
-        # self._forces[:, 0, :] = force_w
-        # self._torques[:, 0, :] = torque_w
-
         self._forces[:, 0, :] = force_b
         self._torques[:, 0, :] = torque_b
+        
+        self._robot.set_external_force_and_torque(self._forces, self._torques, body_ids=self._body_id)
 
     def _apply_action(self):
         """Apply thrust/moment to the quadcopter."""
@@ -570,16 +586,36 @@ class QuadcopterEnv(DirectRLEnv):
         vel_error_b = torch.bmm(rot_matrix_w2b, vel_error_w.unsqueeze(-1)).squeeze(-1)
         # --- [关键修改] 坐标系转换结束 ---
 
-        # 3. 拼接 Observation (使用转换后的 _b 变量)
-        obs = torch.cat([
-            pos_error_b,            # 3维 (Body Frame)
-            rotation_matrix_flat,   # 9维
-            vel_error_b,            # 3维 (Body Frame)
-            ang_vel_b,              # 3维
-            self._last_actions,     # 4维
-            self._robot.data.joint_vel # 4维
-        ], dim=-1)  # 总共 26维
+        # [修改] 使用手动维护的、带有物理延迟的电机速度
+        # 为了让网络好训练，通常需要归一化回 [-1, 1] 或 [0, 1]
+        omega_min = self._controller.dynamics.motor_omega_min_.unsqueeze(1)
+        omega_max = self._controller.dynamics.motor_omega_max_.unsqueeze(1)
         
+        # 归一化当前电机速度 [0, 1]
+        motor_speeds_obs = (self._current_motor_speeds - omega_min) / (omega_max - omega_min)
+
+        obs = torch.cat([
+            pos_error_b,            
+            rotation_matrix_flat,  
+            vel_error_b,           
+            ang_vel_b,              
+            self._last_actions,     
+            motor_speeds_obs  # <--- 使用这个替换 joint_vel
+        ], dim=-1)
+        
+        # with torch.no_grad():
+        #     o = obs[0] # 取出环境0的数据
+        #     print(f"\n=== [Env 0 Observation] Total Dim: {o.shape[0]} ===")
+        #     # 使用 .cpu().numpy() 并保留4位小数，方便阅读
+        #     print(f"Pos Err (Body) [0:3]  : {np.array2string(o[0:3].cpu().numpy(), precision=4, suppress_small=True)}")
+        #     print(f"Rot Mat (Flat) [3:12] : {np.array2string(o[3:12].cpu().numpy(), precision=4, suppress_small=True)}")
+        #     print(f"Vel Err (Body) [12:15]: {np.array2string(o[12:15].cpu().numpy(), precision=4, suppress_small=True)}")
+        #     print(f"Ang Vel (Body) [15:18]: {np.array2string(o[15:18].cpu().numpy(), precision=4, suppress_small=True)}")
+        #     print(f"Last Actions   [18:22]: {np.array2string(o[18:22].cpu().numpy(), precision=4, suppress_small=True)}")
+        #     print(f"Motor Speeds   [22:26]: {np.array2string(o[22:26].cpu().numpy(), precision=4, suppress_small=True)}")
+        #     print("==============================================\n")
+
+
         # 4. 去除冗余历史堆叠，直接返回当前帧
         obs = self.CHECK_NAN(obs, "Observation")
         return {"policy": obs, "critic": obs, "rnd_state": obs}
@@ -807,6 +843,9 @@ class QuadcopterEnv(DirectRLEnv):
                 self.pos_des_raw[null_task_ids] = target_pos
                 self.vel_des_raw[null_task_ids] = 0.0
 
+            if env_ids is not None and len(env_ids) > 0:
+                self._current_motor_speeds[env_ids] = 0.0
+
     def _set_debug_vis_impl(self, debug_vis: bool):
         """Show debug markers if debug_vis is True."""
         # create markers if necessary for the first tome
@@ -885,7 +924,6 @@ class QuadcopterEnv(DirectRLEnv):
                 # 位置：使用 self.pos_des (这是 Langevin 算法计算出的当前时刻目标位置)
                 # 姿态：球体旋转看不出来，直接复用机器人的姿态 (root_quat_w) 以节省计算开销
                 self.traj_visualizer.visualize(self.pos_des, self._robot.data.root_quat_w)
-                
                 
             
     class EpisodeOutcome(IntEnum):
