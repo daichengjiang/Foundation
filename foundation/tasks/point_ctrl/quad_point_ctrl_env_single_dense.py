@@ -243,11 +243,11 @@ class QuadcopterEnv(DirectRLEnv):
         self.vel_des_raw = torch.zeros(self.num_envs, 3, device=self.device)  # Raw velocity
         
         # Langevin trajectory generation parameters (damped harmonic oscillator with noise)
-        self._langevin_dt = 0.1  # Time step for integration
-        self._langevin_friction = 2.0  # Damping coefficient (gamma)
-        self._langevin_omega = 1.0  # Oscillator frequency (omega)
+        self._langevin_dt = 0.01  # Time step for integration
+        self._langevin_friction = 1.0  # Damping coefficient (gamma)
+        self._langevin_omega = 2.0  # Oscillator frequency (omega)
         self._langevin_sigma = 0.5  # Noise intensity (sigma)
-        self._langevin_alpha = 0.9  # Smoothing factor for exponential moving average (alpha)
+        self._langevin_alpha = 0.01  # Smoothing factor for exponential moving average (alpha)
 
         # Logging
         self._episode_sums = {
@@ -743,10 +743,29 @@ class QuadcopterEnv(DirectRLEnv):
             default_root_state[:, 1] += self.cfg.terrain_width / 2.0
             default_root_state[:, 2] += (self.cfg.too_low + self.cfg.too_high) / 2.0
 
-            # ... (此处保留你原有的 随机化/Langevin 初始化/Null Trajectory 代码) ...
-            # 注意：为了代码简洁，这里省略了你原来的随机化代码，请务必保留你原本的这些逻辑
-            # ... 
+            # 处理 Null Trajectory 任务 (Position Control) 的初始状态随机化
+            # 论文: "random state (e.g., up to 90 deg tilt)"
+            
+            # # 1. 随机姿态 (Roll/Pitch up to 90 deg, Yaw random)
+            # # 这里使用简单的欧拉角转四元数采样
+            # r = (torch.rand(len(env_ids), device=self.device) * 2 - 1) * (math.pi / 2) # +/- 90 deg
+            # p = (torch.rand(len(env_ids), device=self.device) * 2 - 1) * (math.pi / 2)
+            # y = (torch.rand(len(env_ids), device=self.device) * 2 - 1) * math.pi      # Full yaw
+            
+            # # 注意：IsaacLab utils 可能需要特定的转换函数，这里示意逻辑
+            # # 实际上可以使用 isaaclab.utils.math.quat_from_euler_xyz(r, p, y)
 
+            # random_quat = quat_from_euler_xyz(r, p, y)
+            
+            # # 2. 随机线速度 (e.g., +/- 2 m/s) 和角速度
+            # random_lin_vel = (torch.rand(len(env_ids), 3, device=self.device) * 2 - 1) * 2.0
+            # random_ang_vel = (torch.rand(len(env_ids), 3, device=self.device) * 2 - 1) * 5.0
+
+            # # 应用随机化 (仅对 Null Trajectory 任务更重要，Langevin 任务通常从平稳开始或者也随机)
+            # # 简单起见，对所有重置环境应用：
+            # default_root_state[:, 3:7] = random_quat
+            # default_root_state[:, 7:10] = random_lin_vel
+            # default_root_state[:, 10:13] = random_ang_vel
             # 写入物理引擎
             # 记得确保你之前的随机化代码更新了 default_root_state
             self._robot.write_root_pose_to_sim(default_root_state[:, :7], env_ids)
