@@ -456,29 +456,40 @@ class QuadcopterEnv(DirectRLEnv):
         print(f"Grid indices: {self.grid_idx}")
 
     def _setup_scene(self):
-        """Create and clone the environment scene."""
-        # Set up the robot
-        self._robot = Articulation(self.cfg.robot)
-        robot_prims = find_matching_prim_paths("/World/envs/env_.*/Robot")
-        for prim_path in robot_prims:
-            prims_utils.set_prim_property(prim_path + "/body", "physics:mass", 0.049)
-            prims_utils.set_prim_property(prim_path + "/body", "physics:diagonalInertia", (1.3615e-5, 1.3615e-5, 3.257e-5))
-            if self.cfg.robot_vis == True:
-                prims_utils.set_prim_property(prim_path, "visibility", "visible")
-            else:
-                prims_utils.set_prim_property(prim_path, "visibility", "invisible")
+            """Create and clone the environment scene."""
+            # Set up the robot
+            self._robot = Articulation(self.cfg.robot)
+            
+            # 1. 先克隆环境 (此时 USD 里的 /World/envs/env_X/Robot 才会被创建)
+            # Clone the scene
+            self.scene.clone_environments(copy_from_source=False)
 
-        # Clone the scene
-        self.scene.clone_environments(copy_from_source=False)
+            # 2. Add the robot to the scene
+            self.scene.articulations["robot"] = self._robot
 
-        # Add the robot to the scene
-        self.scene.articulations["robot"] = self._robot
+            # 3. 环境存在后，再去查找路径并设置可见性
+            robot_prims = find_matching_prim_paths("/World/envs/env_.*/Robot")
+            
+            # 检查是否找到了 Prim，方便调试
+            if len(robot_prims) == 0:
+                print("[Warning] No robot prims found! Check your prim_path regex.")
+                
+            for prim_path in robot_prims:
+                # 修改物理属性 (如果需要)
+                prims_utils.set_prim_property(prim_path + "/body", "physics:mass", 0.049)
+                prims_utils.set_prim_property(prim_path + "/body", "physics:diagonalInertia", (1.3615e-5, 1.3615e-5, 3.257e-5))
+                
+                # 设置可见性
+                if self.cfg.robot_vis == True:
+                    prims_utils.set_prim_property(prim_path, "visibility", "visible")
+                else:
+                    prims_utils.set_prim_property(prim_path, "visibility", "invisible")
 
-        # Add lights
-        light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
-        light_cfg.func("/World/Light", light_cfg)
+            # Add lights
+            light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
+            light_cfg.func("/World/Light", light_cfg)
 
-        self._map_generation_timer = 0
+            self._map_generation_timer = 0
 
     def _pre_physics_step(self, actions: torch.Tensor):
         # 1. 更新轨迹 (仅针对 Langevin 任务)
