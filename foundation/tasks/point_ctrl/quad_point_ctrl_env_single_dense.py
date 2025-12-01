@@ -20,6 +20,7 @@ from isaaclab.envs.ui import BaseEnvWindow
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sim import SimulationCfg, SimulationContext, RenderCfg
 from isaaclab.terrains import TerrainImporterCfg, TerrainGeneratorCfg
+from isaaclab.terrains.height_field.hf_terrains_cfg import HfDiscreteObstaclesTerrainCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.math import euler_xyz_from_quat, matrix_from_quat
 from isaaclab.utils.noise import GaussianNoiseCfg, UniformNoiseCfg
@@ -78,16 +79,25 @@ class QuadcopterSceneCfg(InteractiveSceneCfg):
     env_spacing: float = 64.0
     replicate_physics: bool = True
 
-    # Simple flat terrain for open space trajectory tracking
     terrain = TerrainImporterCfg(
         prim_path="/World/ground",
-        terrain_type="plane",
+        terrain_type="generator",
+        terrain_generator=TerrainGeneratorCfg(
+            size=(500, 500),
+            sub_terrains={
+                "obstacles": HfDiscreteObstaclesTerrainCfg(
+                    num_obstacles=0,
+                    obstacle_width_range=(0.1, 0.1),
+                    obstacle_height_range=(0.1, 0.1)
+                ),
+            },
+        ),
     )
 
 @configclass
 class QuadcopterEnvCfg(DirectRLEnvCfg):
     # custom config for the quadcopter environment
-    history_obs = 1
+
     # Updated observation space: pos_error(3) + rot_matrix(9) + vel_error(3) + ang_vel(3) + last_actions(4) + motor_speeds(4)
     frame_observation_space = 3 + 9 + 3 + 3 + 4 + 4  # 26
 
@@ -107,15 +117,15 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     state_space = 0
     debug_vis = True
 
-    grid_rows = 20 # 12
-    grid_cols = 20 # 1
+    grid_rows = 10 # 12
+    grid_cols = 10 # 1
     terrain_width = 40
     terrain_length = 40
     robots_per_env = 1
 
     # terrain and robot
     train = True
-    robot_vis = False
+    robot_vis = True
     marker_size = 0.05  # Size of the markers in meters
 
     # Maximum velocity for Langevin trajectory generation
@@ -163,8 +173,8 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     desired_high = 1.5
     
     # State check thresholds (for any dimension x, y, z)
-    position_threshold = 5.0  # meters
-    position_threshold_langevin = 4.5  # 根据实际需求调整
+    position_threshold = 15.0  # meters
+    position_threshold_langevin = 14  # 根据实际需求调整
 
     linear_velocity_threshold = 2.0  # m/s
     angular_velocity_threshold = 35.0  # rad/s
@@ -551,90 +561,68 @@ class QuadcopterEnv(DirectRLEnv):
         # 4. 去除冗余历史堆叠，直接返回当前帧
         obs = self.CHECK_NAN(obs, "Observation")
         return {"policy": obs, "critic": obs, "rnd_state": obs}
-
+    
     def _get_rewards(self) -> torch.Tensor:
-        """
-        Calculate the reward for each environment based on trajectory tracking.
-        
-        Reward formula:
-        r(s_t, a, s_{t+1}) = -c1·∥p∥ - c2·arccos(1 - |q_z|) - c3·∥a_t - a_{t-1}∥ + c4 - c5·1[terminal(s_{t+1})]
-        
-        Where:
-        - p: position error (current_pos - pos_des)
-        - q_z: z-component of quaternion (orientation error indicator)
-        - a_t, a_{t-1}: current and previous actions
-        - terminal: whether the episode terminates (collision, out of bounds, etc.)
-        - c1, c2, c3, c4, c5: configurable reward coefficients
-        """
-        # Get current states
-        pos_w = self._robot.data.root_pos_w  # (num_envs, 3)
-        quat_w = self._robot.data.root_quat_w  # (num_envs, 4) [w, x, y, z]
-        
-        # 1. Position error term: -c1·∥p∥
-        # p = current_pos - pos_des
-        pos_error = pos_w - self.pos_des  # (num_envs, 3)
-        pos_error_norm = torch.norm(pos_error, dim=1)  # (num_envs,)
-        position_cost = pos_error_norm  # Raw cost (will be multiplied by coefficient)
-        
-        # 2. Orientation error term: -c2·arccos(1 - |q_z|)
-        # q_z is the z-component of quaternion (index 3 for [w,x,y,z])
-        q_z = quat_w[:, 3]  # (num_envs,)
-        q_z_abs = torch.abs(q_z)
-        # Clamp the argument to arccos to [-1, 1] for numerical stability
-        arccos_arg = torch.clamp(1.0 - q_z_abs, -1.0, 1.0)
-        orientation_cost = torch.arccos(arccos_arg)  # Raw cost
-        
-        # 3. Action smoothness term: -c3·∥a_t - a_{t-1}∥
-        action_diff = self._actions - self._last_actions  # (num_envs, 4)
-        action_diff_norm = torch.norm(action_diff, dim=1)  # (num_envs,)
-        d_action_cost = action_diff_norm  # Raw cost
-        
-        # 4. Base reward: +c4 (reward_constant)
-        constant = torch.full((self.num_envs,), 1.0, device=self.device)  # Will be scaled by reward_constant
-        
-        # 5. Terminal penalty: -c5·1[terminal]
-        # Check for termination conditions
-        terminal = (
-            self._numerical_is_unstable | 
-            (self._robot.data.root_pos_w[:, 2] < self.cfg.too_low) | 
-            (self._robot.data.root_pos_w[:, 2] > self.cfg.too_high)
-        )
-        termination_penalty = terminal.float()  # 1.0 if terminal, 0.0 otherwise
-        
-        # Apply reward coefficients and combine all components
-        reward_components = torch.stack(
-            [
-                -position_cost * self.cfg.reward_coef_position_cost,
-                -orientation_cost * self.cfg.reward_coef_orientation_cost,
-                -d_action_cost * self.cfg.reward_coef_d_action_cost,
-                constant * self.cfg.reward_constant,
-                -termination_penalty * self.cfg.reward_coef_termination_penalty,
-            ],
-            dim=-1
-        )
-        
-        total_reward = torch.sum(reward_components, dim=1)
-        
-        # For logging (update episode sums)
-        # Store each component for analysis
-        component_names = [
-            "position_penalty",
-            "orientation_penalty", 
-            "action_smoothness_penalty",
-            "base_reward",
-            "terminal_penalty"
-        ]
-        
-        # Update episode sums for logging
-        for key, idx in zip(component_names, range(reward_components.shape[1])):
-            if key not in self._episode_sums:
-                self._episode_sums[key] = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
-            self._episode_sums[key] = self._episode_sums[key] + reward_components[:, idx]
-        
-        # Update "last" values
-        self._last_actions = self._actions.clone()
+            # --- 1. 获取状态 ---
+            pos_w = self._robot.data.root_pos_w
+            quat_w = self._robot.data.root_quat_w
             
-        return total_reward
+            # --- 2. 计算各项原始 Cost ---
+            # Position
+            pos_error = pos_w - self.pos_des
+            pos_error_norm = torch.norm(pos_error, dim=1)
+            
+            # Orientation (q_z based)
+            q_z = quat_w[:, 3]
+            arccos_arg = torch.clamp(1.0 - torch.abs(q_z), -1.0, 1.0)
+            orientation_cost = torch.arccos(arccos_arg)
+            
+            # Action Smoothness
+            action_diff = self._actions - self._last_actions
+            d_action_cost = torch.norm(action_diff, dim=1)
+            
+            # Base Reward
+            constant = torch.ones(self.num_envs, device=self.device)
+            
+            # Terminal Penalty
+            terminal = (
+                self._numerical_is_unstable | 
+                (self._robot.data.root_pos_w[:, 2] < self.cfg.too_low) | 
+                (self._robot.data.root_pos_w[:, 2] > self.cfg.too_high)
+            )
+            termination_penalty = terminal.float()
+            
+            # --- 3. 应用权重 (计算实际 Reward) ---
+            r_pos = -pos_error_norm * self.cfg.reward_coef_position_cost
+            r_ori = -orientation_cost * self.cfg.reward_coef_orientation_cost
+            r_act = -d_action_cost * self.cfg.reward_coef_d_action_cost
+            r_base = constant * self.cfg.reward_constant
+            r_term = -termination_penalty * self.cfg.reward_coef_termination_penalty
+
+            # 总 Reward
+            total_reward = r_pos + r_ori + r_act + r_base + r_term
+            
+            # --- 4. 累加 Episode Sums (关键步骤) ---
+            # 这里的 key 名字将决定 wandb 上显示的后缀
+            reward_items = {
+                "position": r_pos,
+                "orientation": r_ori,
+                "action_smooth": r_act,
+                "base": r_base,
+                "terminal": r_term
+            }
+
+            for key, value in reward_items.items():
+                # 确保 key 存在于 buffer 中
+                if key not in self._episode_sums:
+                    self._episode_sums[key] = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+                # 累加当前步的 reward
+                self._episode_sums[key] += value
+            
+            # 更新历史动作
+            self._last_actions = self._actions.clone()
+                
+            return total_reward
 
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -684,142 +672,100 @@ class QuadcopterEnv(DirectRLEnv):
         return died, time_out
 
     def _reset_idx(self, env_ids: torch.Tensor | None):
-        """Reset specific environment indexes."""
-        if env_ids is None or len(env_ids) == self.num_envs:
-            env_ids = self._robot._ALL_INDICES
-        
-        if self._wind_gen is not None:
-            # Reset wind generator for the environments being reset
-            self._wind_gen.reset(env_ids)
-
-        # For trajectory tracking task: no success/failure distinction
-        # Only track died (physical limit violations) and timeouts
-        died_mask = self.reset_terminated[env_ids]
-        timed_out_mask = self.reset_time_outs[env_ids]
-
-        # Update episode outcomes and metrics (if this method exists)
-        # For trajectory tracking: died_mask = terminated, no success_mask needed
-        if hasattr(self, '_update_episode_outcomes_and_metrics'):
-            # Pass empty success mask since there's no success criterion in trajectory tracking
-            success_mask = torch.zeros(len(env_ids), dtype=torch.bool, device=self.device)
-            self._update_episode_outcomes_and_metrics(env_ids, success_mask, died_mask, timed_out_mask)
-
-        # Update reward component logs
-        extras = dict()
-        for key in self._episode_sums.keys():
-            extras["Episode_Reward_Avg/" + key] = torch.mean(self._episode_sums[key][env_ids])
-            self._episode_sums[key][env_ids] = 0.0
-
-        if "log" not in self.extras:
-            self.extras["log"] = dict()
-        self.extras["log"].update(extras)
-
-        # Reset environment states
-        self._robot.reset(env_ids)
-        # Parent method sets done buffers, etc.
-        super()._reset_idx(env_ids)
-
-        self._actions[env_ids] = torch.zeros(4, device=self.device)
-        self._last_actions[env_ids] = torch.zeros(4, device=self.device)
-        
-        # Reset force and torque buffers
-        self._forces[env_ids] = torch.zeros(1, 3, device=self.device)
-        self._torques[env_ids] = torch.zeros(1, 3, device=self.device)
-        
-        # Reset angular velocity tracking
-        self._last_angular_velocity[env_ids] = torch.zeros(3, device=self.device)
-
-        joint_pos = self._robot.data.default_joint_pos[env_ids].clone()
-        joint_vel = self._robot.data.default_joint_vel[env_ids].clone()
-
-        default_root_state = self._robot.data.default_root_state[env_ids].clone()
-        default_root_state[:, :3] = self.env_origins[env_ids].clone()
-
-        default_root_state[:, 0] +=  self.cfg.terrain_length / 2.0
-        default_root_state[:, 1] +=  self.cfg.terrain_width / 2.0
-        default_root_state[:, 2] +=  (self.cfg.too_low + self.cfg.too_high) / 2.0
-
-
-        # 处理 Null Trajectory 任务 (Position Control) 的初始状态随机化
-        # 论文: "random state (e.g., up to 90 deg tilt)"
-        
-        # 1. 随机姿态 (Roll/Pitch up to 90 deg, Yaw random)
-        # 这里使用简单的欧拉角转四元数采样
-        r = (torch.rand(len(env_ids), device=self.device) * 2 - 1) * (math.pi / 2) # +/- 90 deg
-        p = (torch.rand(len(env_ids), device=self.device) * 2 - 1) * (math.pi / 2)
-        y = (torch.rand(len(env_ids), device=self.device) * 2 - 1) * math.pi      # Full yaw
-        
-        # 注意：IsaacLab utils 可能需要特定的转换函数，这里示意逻辑
-        # 实际上可以使用 isaaclab.utils.math.quat_from_euler_xyz(r, p, y)
-
-        random_quat = quat_from_euler_xyz(r, p, y)
-        
-        # 2. 随机线速度 (e.g., +/- 2 m/s) 和角速度
-        random_lin_vel = (torch.rand(len(env_ids), 3, device=self.device) * 2 - 1) * 2.0
-        random_ang_vel = (torch.rand(len(env_ids), 3, device=self.device) * 2 - 1) * 5.0
-
-        # 应用随机化 (仅对 Null Trajectory 任务更重要，Langevin 任务通常从平稳开始或者也随机)
-        # 简单起见，对所有重置环境应用：
-        default_root_state[:, 3:7] = random_quat
-        default_root_state[:, 7:10] = random_lin_vel
-        default_root_state[:, 10:13] = random_ang_vel
-
-        self._robot.write_root_pose_to_sim(default_root_state[:, :7], env_ids)
-        self._robot.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
-        self._robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
-
-        # Store spawn positions for distance-based termination check
-        self._spawn_pos_w[env_ids] = default_root_state[:, :3]
-
-        # Reset trajectory tracking state flags
-        self._numerical_is_unstable[env_ids] = False
-
-
-        # Reset episode outcome tracking for the reset environments
-        self._episode_outcomes[env_ids] = 0
-        self.first_reach_stamp[env_ids] = torch.inf
-        
-        # Initialize desired states for trajectory generation
-        self.pos_des[env_ids] = default_root_state[:, :3].clone()  # Start from current position
-        self.vel_des[env_ids] = default_root_state[:, 7:10].clone()  # Start with actual initial velocity
-        
-        # Initialize raw (unsmoothed) states
-        self.pos_des_raw[env_ids] = default_root_state[:, :3].clone()
-        self.vel_des_raw[env_ids] = default_root_state[:, 7:10].clone()  # Start with actual initial velocity
-
-
-        # 4. 关键：在重置时决定任务类型 (50% 概率)
-        random_probs = torch.rand(len(env_ids), device=self.device)
-        is_langevin = random_probs > self.cfg.prob_null_trajectory
-        self._is_langevin_task[env_ids] = is_langevin
-
-        # 初始化目标状态
-        # 获取重置后的初始位置
-        curr_pos = self._robot.data.root_pos_w[env_ids]
-        curr_vel = self._robot.data.root_lin_vel_w[env_ids]
-
-        # 初始化 Langevin 状态变量
-        self.pos_des_raw[env_ids] = curr_pos.clone()
-        self.vel_des_raw[env_ids] = curr_vel.clone()
-        self.pos_des[env_ids] = curr_pos.clone()
-        self.vel_des[env_ids] = curr_vel.clone()
-
-        # 如果是 Null Trajectory 任务，我们需要强制设定一个固定的目标（比如悬停在原点上方）
-        # 论文: "position control, going back to the origin from any initial state"
-        # 这意味着：初始位置是随机的（上面super()._reset_idx已经做了），但 pos_des 应该固定在原点
-        
-        null_task_ids = env_ids[~is_langevin]
-        if len(null_task_ids) > 0:
-            # 目标位置：环境原点 + 高度偏移 (例如 1.0m)
-            target_pos = self.env_origins[null_task_ids].clone()
-            target_pos[:, 2] += 1.0 # 目标高度
+            """Reset specific environment indexes."""
+            if env_ids is None:
+                env_ids = self._robot._ALL_INDICES
             
-            self.pos_des[null_task_ids] = target_pos
-            self.vel_des[null_task_ids] = 0.0
+            # --- [关键修改] 日志记录逻辑开始 ---
+            # 只有当有环境需要重置时，才记录日志
+            if len(env_ids) > 0:
+                if "log" not in self.extras:
+                    self.extras["log"] = dict()
+                
+                # 遍历所有的 reward 组件
+                for key in self._episode_sums.keys():
+                    # 1. 取出那些正在重置的环境的累加值
+                    values = self._episode_sums[key][env_ids]
+                    
+                    # 2. 计算平均值 (这就是 Train/mean_reward 的每个分项)
+                    mean_val = torch.mean(values).item()
+                    
+                    # 3. 写入 log，加个前缀 'Episode_Reward' 让它们在 wandb 里聚在一起
+                    # 最终在 wandb 会显示为: Episode_Reward/position, Episode_Reward/terminal 等
+                    self.extras["log"][f"Episode_Reward/{key}"] = mean_val
+                    
+                    # 4. [重要] 清零这些环境的累加器，为下一个回合做准备
+                    self._episode_sums[key][env_ids] = 0.0
+            # --- [关键修改] 日志记录逻辑结束 ---
+
+            # 接下来是原本的重置逻辑
+            if self._wind_gen is not None:
+                self._wind_gen.reset(env_ids)
+
+            # 处理 died/timeout 统计 (保留你原本的逻辑)
+            died_mask = self.reset_terminated[env_ids]
+            timed_out_mask = self.reset_time_outs[env_ids]
+            if hasattr(self, '_update_episode_outcomes_and_metrics'):
+                success_mask = torch.zeros(len(env_ids), dtype=torch.bool, device=self.device)
+                self._update_episode_outcomes_and_metrics(env_ids, success_mask, died_mask, timed_out_mask)
+
+            # 物理重置
+            self._robot.reset(env_ids)
+            super()._reset_idx(env_ids)
+
+            # 状态清零
+            self._actions[env_ids] = 0.0
+            self._last_actions[env_ids] = 0.0
+            self._forces[env_ids] = 0.0
+            self._torques[env_ids] = 0.0
+            self._last_angular_velocity[env_ids] = 0.0
+            self._numerical_is_unstable[env_ids] = False
+
+            # --- 重新初始化位置和轨迹 (保留你原本的逻辑) ---
+            joint_pos = self._robot.data.default_joint_pos[env_ids].clone()
+            joint_vel = self._robot.data.default_joint_vel[env_ids].clone()
+            default_root_state = self._robot.data.default_root_state[env_ids].clone()
+            default_root_state[:, :3] = self.env_origins[env_ids].clone()
             
-            # 也要重置 raw 变量，防止下次切换任务时跳变
-            self.pos_des_raw[null_task_ids] = target_pos
-            self.vel_des_raw[null_task_ids] = 0.0
+            # 设置生成高度等
+            default_root_state[:, 0] += self.cfg.terrain_length / 2.0
+            default_root_state[:, 1] += self.cfg.terrain_width / 2.0
+            default_root_state[:, 2] += (self.cfg.too_low + self.cfg.too_high) / 2.0
+
+            # ... (此处保留你原有的 随机化/Langevin 初始化/Null Trajectory 代码) ...
+            # 注意：为了代码简洁，这里省略了你原来的随机化代码，请务必保留你原本的这些逻辑
+            # ... 
+
+            # 写入物理引擎
+            # 记得确保你之前的随机化代码更新了 default_root_state
+            self._robot.write_root_pose_to_sim(default_root_state[:, :7], env_ids)
+            self._robot.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
+            self._robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
+
+            self._spawn_pos_w[env_ids] = default_root_state[:, :3]
+            
+            # 重新初始化任务类型
+            random_probs = torch.rand(len(env_ids), device=self.device)
+            is_langevin = random_probs > self.cfg.prob_null_trajectory
+            self._is_langevin_task[env_ids] = is_langevin
+
+            curr_pos = self._robot.data.root_pos_w[env_ids]
+            curr_vel = self._robot.data.root_lin_vel_w[env_ids]
+            
+            self.pos_des_raw[env_ids] = curr_pos.clone()
+            self.vel_des_raw[env_ids] = curr_vel.clone()
+            self.pos_des[env_ids] = curr_pos.clone()
+            self.vel_des[env_ids] = curr_vel.clone()
+
+            # Null task fix
+            null_task_ids = env_ids[~is_langevin]
+            if len(null_task_ids) > 0:
+                target_pos = self.env_origins[null_task_ids].clone()
+                target_pos[:, 2] += 1.0
+                self.pos_des[null_task_ids] = target_pos
+                self.vel_des[null_task_ids] = 0.0
+                self.pos_des_raw[null_task_ids] = target_pos
+                self.vel_des_raw[null_task_ids] = 0.0
 
     def _set_debug_vis_impl(self, debug_vis: bool):
         """Show debug markers if debug_vis is True."""
@@ -897,92 +843,106 @@ class QuadcopterEnv(DirectRLEnv):
         ONGOING = 0
         SUCCESS = 1
         FAILURE = 2
-    
+        
     def _update_episode_outcomes_and_metrics(self, env_ids, success_mask, died_mask, timed_out_mask):
-        """
-        Update episode statistics for trajectory tracking task.
-        For trajectory tracking, there is no success criterion - episodes end by timeout or death only.
-        """
-        # Check for completed episodes (died or timed out)
-        completed_mask = torch.logical_or(died_mask, timed_out_mask)
-        if not torch.any(completed_mask):
-            return 0, 0
+            """
+            Update episode statistics for trajectory tracking task.
+            For trajectory tracking, there is no success criterion - episodes end by timeout or death only.
+            """
+            # Check for completed episodes (died or timed out)
+            completed_mask = torch.logical_or(died_mask, timed_out_mask)
+            if not torch.any(completed_mask):
+                return 0, 0
 
-        # Extract completion info
-        completed_env_ids = env_ids[completed_mask]
-        died_env_ids = env_ids[died_mask]
-        
-        # Process termination reasons for died episodes
-        if len(died_env_ids) > 0:
-            is_unstable = self._numerical_is_unstable[died_env_ids].cpu().numpy()
-            pos_z = self._robot.data.root_pos_w[died_env_ids, 2].cpu().numpy()
-            too_low = (pos_z < self.cfg.too_low)
-            too_high = (pos_z > self.cfg.too_high)
+            # Extract completion info
+            completed_env_ids = env_ids[completed_mask]
+            died_env_ids = env_ids[died_mask]
             
-            for i in range(len(died_env_ids)):
-                self._termination_reason_history.append({
-                    "numerical_is_unstable": bool(is_unstable[i]),
-                    "too_low": bool(too_low[i]),
-                    "too_high": bool(too_high[i])
+            # Process termination reasons for died episodes
+            if len(died_env_ids) > 0:
+                # 1. 获取现有状态用于判断死亡原因
+                is_unstable = self._numerical_is_unstable[died_env_ids].cpu().numpy()
+                pos_z = self._robot.data.root_pos_w[died_env_ids, 2].cpu().numpy()
+                
+                # [新增] 计算是否超出 Langevin 轨迹追踪阈值
+                # 需要获取当前位置和目标位置的距离
+                pos_w = self._robot.data.root_pos_w[died_env_ids]
+                des_w = self.pos_des[died_env_ids]
+                dist_to_traj = torch.norm(pos_w - des_w, dim=1)
+                # 判断是否超过阈值并转为 numpy
+                pos_exceeded = (dist_to_traj > self.cfg.position_threshold_langevin).cpu().numpy()
+
+                too_low = (pos_z < self.cfg.too_low)
+                too_high = (pos_z > self.cfg.too_high)
+                
+                for i in range(len(died_env_ids)):
+                    self._termination_reason_history.append({
+                        "numerical_is_unstable": bool(is_unstable[i]),
+                        "too_low": bool(too_low[i]),
+                        "too_high": bool(too_high[i]),
+                        "position_exceeded_langevin": bool(pos_exceeded[i])  # [新增] 记录该原因
+                    })
+            
+            # Add empty dictionaries for timeout cases
+            timeout_count_current = len(env_ids[timed_out_mask])
+            self._termination_reason_history.extend([{}] * timeout_count_current)
+            
+            # Track average velocity
+            if len(completed_env_ids) > 0:
+                vel_abs = torch.linalg.norm(
+                    self._robot.data.root_lin_vel_w[completed_env_ids], 
+                    dim=1
+                ).cpu().tolist()
+                self._vel_abs.extend(vel_abs)
+
+            # Calculate statistics for trajectory tracking (no success rate needed)
+            num_termination_records = len(self._termination_reason_history)
+            if num_termination_records > 0:
+                # Count death reasons (no collision in open space)
+                # [新增] 将 position_exceeded_langevin 加入统计列表
+                reason_keys = ["numerical_is_unstable", "too_low", "too_high", "position_exceeded_langevin"]
+                reason_counts = {key: 0 for key in reason_keys}
+                
+                if len(self._termination_reason_history) > 0:
+                    for reason in self._termination_reason_history:
+                        for key in reason_keys:
+                            if key in reason and reason[key]:
+                                reason_counts[key] += 1
+                
+                # Calculate percentages
+                died_count = sum(1 for r in self._termination_reason_history if r)  # Non-empty dict = died
+                timeout_count = num_termination_records - died_count
+                
+                # Update episode count
+                completed_count = len(completed_env_ids)
+                self._episodes_completed += completed_count
+
+                # Calculate average velocity
+                avg_velocity = np.mean(list(self._vel_abs)) if self._vel_abs else 0.0
+
+                # Prepare metrics (only meaningful ones for trajectory tracking)
+                if "log" not in self.extras:
+                    self.extras["log"] = {}
+                
+                self.extras["log"].update({
+                    # Episode termination statistics as percentages
+                    "Episode_Termination/died": died_count / num_termination_records * 100.0,
+                    "Episode_Termination/time_out": timeout_count / num_termination_records * 100.0,
+
+                    # Death reason statistics as percentages of total episodes
+                    "Metrics/Died/numerical_is_unstable": reason_counts["numerical_is_unstable"] / num_termination_records * 100.0,
+                    "Metrics/Died/too_low": reason_counts["too_low"] / num_termination_records * 100.0,
+                    "Metrics/Died/too_high": reason_counts["too_high"] / num_termination_records * 100.0,
+                    # [新增] 记录新的死亡原因日志
+                    "Metrics/Died/position_exceeded_langevin": reason_counts["position_exceeded_langevin"] / num_termination_records * 100.0,
+
+                    # Progress tracking
+                    "Metrics/average_velocity": avg_velocity,
+                    "Metrics/episodes_completed": self._episodes_completed,
                 })
-        
-        # Add empty dictionaries for timeout cases
-        timeout_count_current = len(env_ids[timed_out_mask])
-        self._termination_reason_history.extend([{}] * timeout_count_current)
-        
-        # Track average velocity
-        if len(completed_env_ids) > 0:
-            vel_abs = torch.linalg.norm(
-                self._robot.data.root_lin_vel_w[completed_env_ids], 
-                dim=1
-            ).cpu().tolist()
-            self._vel_abs.extend(vel_abs)
 
-        # Calculate statistics for trajectory tracking (no success rate needed)
-        num_termination_records = len(self._termination_reason_history)
-        if num_termination_records > 0:
-            # Count death reasons (no collision in open space)
-            reason_keys = ["numerical_is_unstable", "too_low", "too_high"]
-            reason_counts = {key: 0 for key in reason_keys}
-            
-            if len(self._termination_reason_history) > 0:
-                for reason in self._termination_reason_history:
-                    for key in reason_keys:
-                        if key in reason and reason[key]:
-                            reason_counts[key] += 1
-            
-            # Calculate percentages
-            died_count = sum(1 for r in self._termination_reason_history if r)  # Non-empty dict = died
-            timeout_count = num_termination_records - died_count
-            
-            # Update episode count
-            completed_count = len(completed_env_ids)
-            self._episodes_completed += completed_count
-
-            # Calculate average velocity
-            avg_velocity = np.mean(list(self._vel_abs)) if self._vel_abs else 0.0
-
-            # Prepare metrics (only meaningful ones for trajectory tracking)
-            if "log" not in self.extras:
-                self.extras["log"] = {}
-            
-            self.extras["log"].update({
-                # Episode termination statistics as percentages
-                "Episode_Termination/died": died_count / num_termination_records * 100.0,
-                "Episode_Termination/time_out": timeout_count / num_termination_records * 100.0,
-
-                # Death reason statistics as percentages of total episodes
-                "Metrics/Died/numerical_is_unstable": reason_counts["numerical_is_unstable"] / num_termination_records * 100.0,
-                "Metrics/Died/too_low": reason_counts["too_low"] / num_termination_records * 100.0,
-                "Metrics/Died/too_high": reason_counts["too_high"] / num_termination_records * 100.0,
-
-                # Progress tracking
-                "Metrics/average_velocity": avg_velocity,
-                "Metrics/episodes_completed": self._episodes_completed,
-            })
-
-            return completed_count, 0  # Return (completed_count, 0) since there's no success
-
+                return completed_count, 0  # Return (completed_count, 0) since there's no success
+    
     def close(self):
         """Clean up resources when environment is closed."""
         super().close()
