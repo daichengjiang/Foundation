@@ -107,7 +107,7 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     observation_space = frame_observation_space  # 26D: pos_error(3) + rot_matrix(9) + vel_error(3) + ang_vel(3) + last_actions(4) + motor_speeds(4)
 
     # 轨迹采样配置
-    prob_null_trajectory = 0.5  # 50% 概率做定点控制
+    prob_null_trajectory = 0  # 50% 概率做定点控制
 
     # gamma in ppo, only for logging
     gamma = 0.99
@@ -254,14 +254,15 @@ class QuadcopterEnv(DirectRLEnv):
         self._langevin_alpha = 0.01  # Smoothing factor for exponential moving average (alpha)
 
         # Logging
+        # [修改] 键名必须与 _get_rewards 中的 reward_items 字典键名完全一致
         self._episode_sums = {
             key: torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
             for key in [
-                "position_penalty",
-                "orientation_penalty",
-                "action_smoothness_penalty",
-                "base_reward",
-                "terminal_penalty",
+                "position",       # 原代码是 "position_penalty"
+                "orientation",    # 原代码是 "orientation_penalty"
+                "action_smooth",  # 原代码是 "action_smoothness_penalty"
+                "base",           # 原代码是 "base_reward"
+                "terminal",       # 原代码是 "terminal_penalty" <-- 这就是你要删的那个
             ]
         }
         
@@ -368,54 +369,56 @@ class QuadcopterEnv(DirectRLEnv):
         
         Args:
             env_ids: Environments to update. If None, updates all environments.
-        """
+        """ 
         if env_ids is None:
             env_ids = torch.arange(self.num_envs, device=self.device)
         
         n_envs = len(env_ids)
         
         # Get parameters from config
-        gamma = self._langevin_friction  # damping coefficient
-        omega = self._langevin_omega  # oscillator frequency
-        sigma = self._langevin_sigma  # noise intensity
-        dt = self._langevin_dt  # integration time step
-        alpha = self._langevin_alpha  # smoothing factor
+        gamma = self._langevin_friction
+        omega = self._langevin_omega
+        sigma = self._langevin_sigma
+        dt = self._langevin_dt
+        alpha = self._langevin_alpha
         
         sqrt_dt = torch.sqrt(torch.tensor(dt, device=self.device))
         
         # Get previous raw states
-        x_prev = self.pos_des_raw[env_ids]  # (n_envs, 3)
-        v_prev = self.vel_des_raw[env_ids]  # (n_envs, 3)
+        x_prev_global = self.pos_des_raw[env_ids]
+        v_prev = self.vel_des_raw[env_ids]
         
-        # Generate Wiener process noise: dW ~ N(0, 1) * sqrt(dt)
+        # [核心修正] 获取对应的出生点，计算局部坐标
+        spawn_pos = self._spawn_pos_w[env_ids]
+        x_prev_local = x_prev_global - spawn_pos  # 这是一个相对于出生点的向量
+        
+        # Generate Wiener process noise
         dW = sqrt_dt * torch.randn(n_envs, 3, device=self.device)
         
-        # Update velocity using damped harmonic oscillator with noise
-        # v_next = v_prev + (-γv - ω²x) dt + σ dW
-        v_next = v_prev + (-gamma * v_prev - omega * omega * x_prev) * dt + sigma * dW
+        # Update velocity using damped harmonic oscillator
+        # 注意：这里用 x_prev_local，确保力是把球拉回 spawn_pos，而不是世界原点
+        v_next = v_prev + (-gamma * v_prev - omega * omega * x_prev_local) * dt + sigma * dW
         
-        # Update position using velocity
-        # x_next = x_prev + v_next dt
-        x_next = x_prev + v_next * dt
+        # Update position
+        # 速度更新完后，计算新的局部位置，或者直接更新全局位置
+        x_next_global = x_prev_global + v_next * dt
         
-        # Store raw (unsmoothed) states
-        self.pos_des_raw[env_ids] = x_next
+        # Store raw states
+        self.pos_des_raw[env_ids] = x_next_global
         self.vel_des_raw[env_ids] = v_next
         
-        # Apply exponential moving average smoothing
-        # v_smooth = α * v_next + (1 - α) * v_smooth_prev
+        # Apply smoothing
         v_smooth_prev = self.vel_des[env_ids]
         v_smooth = alpha * v_next + (1.0 - alpha) * v_smooth_prev
         
-        # x_smooth = x_smooth_prev + v_smooth * dt
         x_smooth_prev = self.pos_des[env_ids]
         x_smooth = x_smooth_prev + v_smooth * dt
         
-        # Store smoothed states (these are used for control)
+        # Store smoothed states
         self.pos_des[env_ids] = x_smooth
         self.vel_des[env_ids] = v_smooth
         
-        # Keep z-coordinate within reasonable bounds (only for smoothed trajectory)
+        # Keep z-coordinate reasonable
         self.pos_des[env_ids, 2] = torch.clamp(
             self.pos_des[env_ids, 2],
             self.cfg.desired_low,
@@ -651,9 +654,8 @@ class QuadcopterEnv(DirectRLEnv):
         self.CHECK_state()
 
         # Check distance from desired trajectory position (Langevin threshold)
-        pos_w = self._robot.data.root_pos_w  # (num_envs, 3)
-        distance_from_desired = torch.norm(pos_w - self.pos_des, dim=1)  # (num_envs,)
-        position_exceeded_langevin = distance_from_desired > self.cfg.position_threshold_langevin
+        dist_traj_from_spawn = torch.norm(self.pos_des - self._spawn_pos_w, dim=1)
+        position_exceeded_langevin = dist_traj_from_spawn > self.cfg.position_threshold_langevin
 
         conditions = [
             self._numerical_is_unstable,  # Numerical instability
@@ -780,8 +782,9 @@ class QuadcopterEnv(DirectRLEnv):
             self._robot.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
             self._robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
 
-            self._spawn_pos_w[env_ids] = default_root_state[:, :3]
-            
+            spawn_pos = default_root_state[:, :3].clone()
+            self._spawn_pos_w[env_ids] = spawn_pos
+                
             # 重新初始化任务类型
             random_probs = torch.rand(len(env_ids), device=self.device)
             is_langevin = random_probs > self.cfg.prob_null_trajectory
@@ -790,16 +793,15 @@ class QuadcopterEnv(DirectRLEnv):
             curr_pos = self._robot.data.root_pos_w[env_ids]
             curr_vel = self._robot.data.root_lin_vel_w[env_ids]
             
-            self.pos_des_raw[env_ids] = curr_pos.clone()
-            self.vel_des_raw[env_ids] = curr_vel.clone()
-            self.pos_des[env_ids] = curr_pos.clone()
-            self.vel_des[env_ids] = curr_vel.clone()
+            self.pos_des_raw[env_ids] = spawn_pos.clone()
+            self.vel_des_raw[env_ids] = 0.0  # 初始速度设为0，防止一出生就飞走
+            self.pos_des[env_ids] = spawn_pos.clone()
+            self.vel_des[env_ids] = 0.0
 
             # Null task fix
             null_task_ids = env_ids[~is_langevin]
             if len(null_task_ids) > 0:
-                target_pos = self.env_origins[null_task_ids].clone()
-                target_pos[:, 2] += 1.0
+                target_pos = self._spawn_pos_w[null_task_ids].clone()
                 self.pos_des[null_task_ids] = target_pos
                 self.vel_des[null_task_ids] = 0.0
                 self.pos_des_raw[null_task_ids] = target_pos
@@ -847,19 +849,17 @@ class QuadcopterEnv(DirectRLEnv):
             # Trajectory visualizer for Langevin path
             if not hasattr(self, 'traj_visualizer'):
                 print("create trajectory visualizer")
-                traj_cfg = VisualizationMarkersCfg(
-                    markers={
-                        "sphere": sim_utils.SphereCfg(
-                            radius=0.05,
-                            visual_material=sim_utils.PreviewSurfaceCfg(
-                                diffuse_color=(1.0, 0.0, 0.0),  # Red for trajectory
-                            ),
-                        ),
-                    },
-                    prim_path = "/Visuals/Trajectory"
-                )
+                # 使用预置的绿色箭头配置
+                traj_cfg = GREEN_ARROW_X_MARKER_CFG.copy()
+                traj_cfg.prim_path = "/Visuals/Trajectory"
+                
+                # 设置箭头的大小 (X, Y, Z)，Z轴通常是箭头的长度方向
+                # 这里设置为和 current_yaw_visualizer 类似的大小
+                traj_cfg.markers["arrow"].scale = (self.cfg.marker_size, self.cfg.marker_size, self.cfg.marker_size * 4)
+                
                 self.traj_visualizer = VisualizationMarkers(traj_cfg)
-                print("Created traj_visualizer")
+                print("Created traj_visualizer (Green Arrow)")
+                
             self.traj_visualizer.set_visibility(True)
                 
         else:
@@ -874,9 +874,20 @@ class QuadcopterEnv(DirectRLEnv):
 
         
     def _debug_vis_callback(self, event):
-        """Update debug markers with current robot pose."""
-        self.current_yaw_visualizer.visualize(self._robot.data.root_pos_w, self._robot.data.root_quat_w)
+            """Update debug markers with current robot pose."""
+            # 1. 更新当前机器人的朝向箭头 (原有的)
+            self.current_yaw_visualizer.visualize(self._robot.data.root_pos_w, self._robot.data.root_quat_w)
 
+            # ==================== 新增代码开始 ====================
+            # 2. 更新 Langevin 轨迹目标点 (红色球体)
+            if hasattr(self, "traj_visualizer"):
+                # visualize 接收 (num_envs, 3) 的位置 和 (num_envs, 4) 的四元数
+                # 位置：使用 self.pos_des (这是 Langevin 算法计算出的当前时刻目标位置)
+                # 姿态：球体旋转看不出来，直接复用机器人的姿态 (root_quat_w) 以节省计算开销
+                self.traj_visualizer.visualize(self.pos_des, self._robot.data.root_quat_w)
+                
+                
+            
     class EpisodeOutcome(IntEnum):
         ONGOING = 0
         SUCCESS = 1
@@ -902,14 +913,14 @@ class QuadcopterEnv(DirectRLEnv):
                 is_unstable = self._numerical_is_unstable[died_env_ids].cpu().numpy()
                 pos_z = self._robot.data.root_pos_w[died_env_ids, 2].cpu().numpy()
                 
-                # [新增] 计算是否超出 Langevin 轨迹追踪阈值
-                # 需要获取当前位置和目标位置的距离
-                pos_w = self._robot.data.root_pos_w[died_env_ids]
+                # 判断的是：Langevin 轨迹点 (pos_des) 是否距离 出生点 (_spawn_pos_w) 太远
                 des_w = self.pos_des[died_env_ids]
-                dist_to_traj = torch.norm(pos_w - des_w, dim=1)
+                spawn_w = self._spawn_pos_w[died_env_ids]
+                
+                dist_traj_from_spawn = torch.norm(des_w - spawn_w, dim=1)
+                
                 # 判断是否超过阈值并转为 numpy
-                pos_exceeded = (dist_to_traj > self.cfg.position_threshold_langevin).cpu().numpy()
-
+                pos_exceeded = (dist_traj_from_spawn > self.cfg.position_threshold_langevin).cpu().numpy()
                 too_low = (pos_z < self.cfg.too_low)
                 too_high = (pos_z > self.cfg.too_high)
                 
