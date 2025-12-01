@@ -49,6 +49,8 @@ import collections
 import itertools
 
 
+MAP_SIZE = (350, 350) 
+
 # [0, 2pi] -> [-pi, pi]
 def normallize_angle(angle: torch.Tensor):
     return torch.fmod(angle + math.pi, 2 * math.pi) - math.pi
@@ -83,7 +85,7 @@ class QuadcopterSceneCfg(InteractiveSceneCfg):
         prim_path="/World/ground",
         terrain_type="generator",
         terrain_generator=TerrainGeneratorCfg(
-            size=(500, 500),
+            size=MAP_SIZE,
             sub_terrains={
                 "obstacles": HfDiscreteObstaclesTerrainCfg(
                     num_obstacles=0,
@@ -117,10 +119,12 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     state_space = 0
     debug_vis = True
 
-    grid_rows = 10 # 12
-    grid_cols = 10 # 1
-    terrain_width = 40
-    terrain_length = 40
+    map_size = MAP_SIZE
+
+    grid_rows = 30 # 12
+    grid_cols = 30 # 1
+    terrain_width = 10
+    terrain_length = 10
     robots_per_env = 1
 
     # terrain and robot
@@ -437,11 +441,15 @@ class QuadcopterEnv(DirectRLEnv):
         terrain_width = self.cfg.terrain_width
         terrain_length = self.cfg.terrain_length
 
+        map_size_x, map_size_y = self.cfg.map_size
+        offset_x = -map_size_x / 2.0
+        offset_y = -map_size_y / 2.0
+
         for i in range(num_groups):
             row = (i // grid_cols) % grid_rows  # Loop rows if exceeding grid capacity
             col = i % grid_cols  # Loop columns if exceeding grid capacity
-            group_origins[i, 0] = col * terrain_length
-            group_origins[i, 1] = row * terrain_width
+            group_origins[i, 0] = col * terrain_length + offset_x
+            group_origins[i, 1] = row * terrain_width + offset_y
     
         # Assign the same origin to all environments within a group
         self.env_origins = group_origins.repeat_interleave(robots_per_env, dim=0)[:self.num_envs]
