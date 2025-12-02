@@ -51,6 +51,16 @@ import itertools
 
 MAP_SIZE = (500, 500) 
 
+# 手动定义球体标记配置
+SPHERE_MARKER_CFG = VisualizationMarkersCfg(
+    markers={
+        "sphere": sim_utils.SphereCfg(
+            radius=0.02,  # 默认半径，后续会通过 scale 调整
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 1.0, 1.0)),
+        ),
+    }
+)
+
 # [0, 2pi] -> [-pi, pi]
 def normallize_angle(angle: torch.Tensor):
     return torch.fmod(angle + math.pi, 2 * math.pi) - math.pi
@@ -107,7 +117,7 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     observation_space = frame_observation_space  # 26D: pos_error(3) + rot_matrix(9) + vel_error(3) + ang_vel(3) + last_actions(4) + motor_speeds(4)
 
     # 轨迹采样配置
-    prob_null_trajectory = 0  # 50% 概率做定点控制
+    prob_null_trajectory = 0.5  # 50% 概率做定点控制
 
     # gamma in ppo, only for logging
     gamma = 0.99
@@ -131,9 +141,6 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     train = True
     robot_vis = True
     marker_size = 0.05  # Size of the markers in meters
-
-    # Maximum velocity for Langevin trajectory generation
-    max_vel = 2.0
 
     ui_window_class_type = QuadcopterEnvWindow
 
@@ -175,12 +182,14 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     too_high = 1.7
     desired_low = 0.5  
     desired_high = 1.5
+
+    height = 3.0
     
     # State check thresholds (for any dimension x, y, z)
     position_threshold = 15.0  # meters
     position_threshold_langevin = 14  # 根据实际需求调整
 
-    linear_velocity_threshold = 2.0  # m/s
+    linear_velocity_threshold = 4.0  # m/s
     angular_velocity_threshold = 35.0  # rad/s
 
     reward_coef_position_cost = 1.0
@@ -434,12 +443,6 @@ class QuadcopterEnv(DirectRLEnv):
         self.pos_des[env_ids] = x_smooth
         self.vel_des[env_ids] = v_smooth
         
-        # Keep z-coordinate reasonable
-        self.pos_des[env_ids, 2] = torch.clamp(
-            self.pos_des[env_ids, 2],
-            self.cfg.desired_low,
-            self.cfg.desired_high
-        )
 
         # # ==================== [新增调试打印] ====================
         # # 检查当前更新列表中是否包含环境 0
@@ -593,6 +596,29 @@ class QuadcopterEnv(DirectRLEnv):
         self._torques[:, 0, :] = torque_b
         
         self._robot.set_external_force_and_torque(self._forces, self._torques, body_ids=self._body_id)
+
+        # # ==================== [新增调试打印] ====================
+        # # 频率控制: 每 50 步打印一次 (约 0.5秒~1秒一次，取决于仿真dt)
+        # if self.common_step_counter % 10 == 0:
+        #     env_id = 0  # 只监控第 0 号环境
+            
+        #     # 获取当前模式
+        #     mode_str = "Langevin (Moving)" if self._is_langevin_task[env_id] else "Position (Fixed)"
+            
+        #     # 获取 Desired State
+        #     p = self.pos_des[env_id].cpu().tolist()
+        #     v = self.vel_des[env_id].cpu().tolist()
+            
+        #     # 获取当前实际位置 (用于对比)
+        #     curr_p = self._robot.data.root_pos_w[env_id].cpu().tolist()
+            
+        #     print(f"\n[Step {self.common_step_counter}] Env {env_id} Mode: \033[1;33m{mode_str}\033[0m")
+        #     print(f"  > Des Pos : [{p[0]:.3f}, {p[1]:.3f}, {p[2]:.3f}]")
+        #     print(f"  > Cur Pos : [{curr_p[0]:.3f}, {curr_p[1]:.3f}, {curr_p[2]:.3f}]")
+        #     print(f"  > Des Vel : [{v[0]:.3f}, {v[1]:.3f}, {v[2]:.3f}]")
+        #     print("-" * 40)
+        # # ======================================================
+
 
     def _apply_action(self):
         """Apply thrust/moment to the quadcopter."""
@@ -789,44 +815,32 @@ class QuadcopterEnv(DirectRLEnv):
         return died, time_out
 
     def _reset_idx(self, env_ids: torch.Tensor | None):
-            """Reset specific environment indexes."""
+            """Reset specific environment indexes with RAPTOR initialization distribution."""
             if env_ids is None:
                 env_ids = self._robot._ALL_INDICES
             
-            # --- [关键修改] 日志记录逻辑开始 ---
-            # 只有当有环境需要重置时，才记录日志
-            if len(env_ids) > 0:
+            num_resets = len(env_ids)
+            
+            # --- 1. 日志记录逻辑 (保持不变) ---
+            if num_resets > 0:
                 if "log" not in self.extras:
                     self.extras["log"] = dict()
-                
-                # 遍历所有的 reward 组件
                 for key in self._episode_sums.keys():
-                    # 1. 取出那些正在重置的环境的累加值
                     values = self._episode_sums[key][env_ids]
-                    
-                    # 2. 计算平均值 (这就是 Train/mean_reward 的每个分项)
                     mean_val = torch.mean(values).item()
-                    
-                    # 3. 写入 log，加个前缀 'Episode_Reward' 让它们在 wandb 里聚在一起
-                    # 最终在 wandb 会显示为: Episode_Reward/position, Episode_Reward/terminal 等
                     self.extras["log"][f"Episode_Reward/{key}"] = mean_val
-                    
-                    # 4. [重要] 清零这些环境的累加器，为下一个回合做准备
                     self._episode_sums[key][env_ids] = 0.0
-            # --- [关键修改] 日志记录逻辑结束 ---
 
-            # 接下来是原本的重置逻辑
+            # --- 2. 基础重置 ---
             if self._wind_gen is not None:
                 self._wind_gen.reset(env_ids)
 
-            # 处理 died/timeout 统计 (保留你原本的逻辑)
             died_mask = self.reset_terminated[env_ids]
             timed_out_mask = self.reset_time_outs[env_ids]
             if hasattr(self, '_update_episode_outcomes_and_metrics'):
-                success_mask = torch.zeros(len(env_ids), dtype=torch.bool, device=self.device)
+                success_mask = torch.zeros(num_resets, dtype=torch.bool, device=self.device)
                 self._update_episode_outcomes_and_metrics(env_ids, success_mask, died_mask, timed_out_mask)
 
-            # 物理重置
             self._robot.reset(env_ids)
             super()._reset_idx(env_ids)
 
@@ -837,155 +851,255 @@ class QuadcopterEnv(DirectRLEnv):
             self._torques[env_ids] = 0.0
             self._last_angular_velocity[env_ids] = 0.0
             self._numerical_is_unstable[env_ids] = False
+            self._current_motor_speeds[env_ids] = 0.0
 
-            # --- 重新初始化位置和轨迹 (保留你原本的逻辑) ---
+            # --- 3. RAPTOR 初始化逻辑 ---
+            
+            # 定义物理参数
+            l_arm = 0.04384  # 论文中的 l_arm
+            r_pos_limit = 10.0 * l_arm  # 位置采样半径 (~0.44m)
+            v_lin_limit = 1.0           # 线速度限制 (1 m/s)
+            v_ang_limit = 1.0           # 角速度限制 (1 rad/s)
+            
+            # 辅助函数：球体内均匀采样 (Uniform sampling within a sphere)
+            # r = R * u^(1/3), direction = randn / norm
+            def sample_in_sphere(radius, n_samples):
+                # 随机方向
+                direction = torch.randn(n_samples, 3, device=self.device)
+                direction = F.normalize(direction, p=2, dim=1)
+                # 随机半径 (立方根保证体积均匀分布)
+                u = torch.rand(n_samples, 1, device=self.device)
+                r = radius * torch.pow(u, 1.0/3.0)
+                return direction * r
+
+            # A. 生成随机状态偏移
+            # 1. 位置偏移
+            pos_offset = sample_in_sphere(r_pos_limit, num_resets)
+            
+            # 2. 线速度
+            lin_vel = sample_in_sphere(v_lin_limit, num_resets)
+            
+            # 3. 角速度
+            ang_vel = sample_in_sphere(v_ang_limit, num_resets)
+            
+            # 4. 姿态 (Orientation): 最大 90度倾斜 + 随机 Yaw
+            # 这里为了稳健性，我们在 [-pi/2, pi/2] 范围内独立采样 Roll 和 Pitch
+            # 虽然这在对角线上可能超过90度，但在 "Foundation Policy" 训练中通常作为 worst-case
+            roll = (torch.rand(num_resets, device=self.device) * 2 - 1) * (math.pi / 2.0) # +/- 90 deg
+            pitch = (torch.rand(num_resets, device=self.device) * 2 - 1) * (math.pi / 2.0)# +/- 90 deg
+            yaw = (torch.rand(num_resets, device=self.device) * 2 - 1) * math.pi          # +/- 180 deg
+            
+            quat = quat_from_euler_xyz(roll, pitch, yaw)
+
+            # B. 10% 概率覆盖为 "Target State" (悬停状态)
+            # "With a probability of 10%, the initial state is overwritten with the target state (all zeros)"
+            reset_to_target_probs = torch.rand(num_resets, device=self.device)
+            is_perfect_start = reset_to_target_probs < 0.10
+
+            # 覆盖为完美状态
+            pos_offset[is_perfect_start] = 0.0
+            lin_vel[is_perfect_start] = 0.0
+            ang_vel[is_perfect_start] = 0.0
+            
+            # 完美姿态 (Identity Quaternion: w=1, x=0, y=0, z=0)
+            identity_quat = torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device).repeat(num_resets, 1)
+            quat[is_perfect_start] = identity_quat[is_perfect_start]
+
+            # --- 4. 设置仿真器状态 ---
+            
+            # 获取默认状态
             joint_pos = self._robot.data.default_joint_pos[env_ids].clone()
             joint_vel = self._robot.data.default_joint_vel[env_ids].clone()
-            default_root_state = self._robot.data.default_root_state[env_ids].clone()
-            default_root_state[:, :3] = self.env_origins[env_ids].clone()
             
-            # 设置生成高度等
-            default_root_state[:, 0] += self.cfg.terrain_length / 2.0
-            default_root_state[:, 1] += self.cfg.terrain_width / 2.0
-            default_root_state[:, 2] += (self.cfg.too_low + self.cfg.too_high) / 2.0
+            # 计算出生中心点 (Spawn Center)
+            spawn_center = self.env_origins[env_ids].clone()
+            spawn_center[:, 0] += self.cfg.terrain_length / 2.0
+            spawn_center[:, 1] += self.cfg.terrain_width / 2.0
+            spawn_center[:, 2] += self.cfg.height
 
-            # 处理 Null Trajectory 任务 (Position Control) 的初始状态随机化
-            # 论文: "random state (e.g., up to 90 deg tilt)"
+            # 记录出生点 (Spawn Position = Center + Offset)
+            # 注意：这里的 Offset 是随机扰动
+            # 如果是 Perfect Start，Offset 为 0，即生在正中心
+            start_pos = spawn_center + pos_offset
             
-            # # 1. 随机姿态 (Roll/Pitch up to 90 deg, Yaw random)
-            # # 这里使用简单的欧拉角转四元数采样
-            # r = (torch.rand(len(env_ids), device=self.device) * 2 - 1) * (math.pi / 2) # +/- 90 deg
-            # p = (torch.rand(len(env_ids), device=self.device) * 2 - 1) * (math.pi / 2)
-            # y = (torch.rand(len(env_ids), device=self.device) * 2 - 1) * math.pi      # Full yaw
-            
-            # # 注意：IsaacLab utils 可能需要特定的转换函数，这里示意逻辑
-            # # 实际上可以使用 isaaclab.utils.math.quat_from_euler_xyz(r, p, y)
+            # 更新 Spawn Pos 记录
+            # 注意：通常 self._spawn_pos_w 记录的是"目标点"或"基准点"，用于计算相对距离
+            # 在 RAPTOR 中，任务是 "Go to origin (relative)"，所以基准点应该是 spawn_center
+            self._spawn_pos_w[env_ids] = spawn_center 
 
-            # random_quat = quat_from_euler_xyz(r, p, y)
-            
-            # # 2. 随机线速度 (e.g., +/- 2 m/s) 和角速度
-            # random_lin_vel = (torch.rand(len(env_ids), 3, device=self.device) * 2 - 1) * 2.0
-            # random_ang_vel = (torch.rand(len(env_ids), 3, device=self.device) * 2 - 1) * 5.0
+            # 构建 Root State 写入仿真
+            root_state = self._robot.data.default_root_state[env_ids].clone()
+            root_state[:, :3] = start_pos
+            root_state[:, 3:7] = quat
+            root_state[:, 7:10] = lin_vel
+            root_state[:, 10:13] = ang_vel
 
-            # # 应用随机化 (仅对 Null Trajectory 任务更重要，Langevin 任务通常从平稳开始或者也随机)
-            # # 简单起见，对所有重置环境应用：
-            # default_root_state[:, 3:7] = random_quat
-            # default_root_state[:, 7:10] = random_lin_vel
-            # default_root_state[:, 10:13] = random_ang_vel
-            # 写入物理引擎
-            # 记得确保你之前的随机化代码更新了 default_root_state
-            self._robot.write_root_pose_to_sim(default_root_state[:, :7], env_ids)
-            self._robot.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
+            self._robot.write_root_pose_to_sim(root_state[:, :7], env_ids)
+            self._robot.write_root_velocity_to_sim(root_state[:, 7:], env_ids)
             self._robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
 
-            spawn_pos = default_root_state[:, :3].clone()
-            self._spawn_pos_w[env_ids] = spawn_pos
-                
-            # 重新初始化任务类型
-            random_probs = torch.rand(len(env_ids), device=self.device)
-            is_langevin = random_probs > self.cfg.prob_null_trajectory
+            # --- 5. 任务与轨迹初始化 ---
+
+            # 重新采样任务类型 (50% 概率)
+            random_task_probs = torch.rand(num_resets, device=self.device)
+            is_langevin = random_task_probs > self.cfg.prob_null_trajectory
             self._is_langevin_task[env_ids] = is_langevin
 
-            curr_pos = self._robot.data.root_pos_w[env_ids]
-            curr_vel = self._robot.data.root_lin_vel_w[env_ids]
-            
-            self.pos_des_raw[env_ids] = spawn_pos.clone()
-            self.vel_des_raw[env_ids] = 0.0  # 初始速度设为0，防止一出生就飞走
-            self.pos_des[env_ids] = spawn_pos.clone()
+            # 初始化期望状态 (Desired States)
+            # 无论是 Langevin 还是 Null 任务，初始期望位置都设为 spawn_center
+            # 这样 Policy 一上来就会看到 pos_error = pos_offset
+            self.pos_des[env_ids] = spawn_center.clone()
             self.vel_des[env_ids] = 0.0
+            
+            # Langevin 轨迹生成器的内部状态也重置到中心
+            self.pos_des_raw[env_ids] = spawn_center.clone()
+            self.vel_des_raw[env_ids] = 0.0
 
-            # Null task fix
-            null_task_ids = env_ids[~is_langevin]
-            if len(null_task_ids) > 0:
-                target_pos = self._spawn_pos_w[null_task_ids].clone()
-                self.pos_des[null_task_ids] = target_pos
-                self.vel_des[null_task_ids] = 0.0
-                self.pos_des_raw[null_task_ids] = target_pos
-                self.vel_des_raw[null_task_ids] = 0.0
+            # # 调试打印 (Env 0)
+            # if (env_ids == 0).any():
+            #     # 找到环境0在当前 batch 中的索引
+            #     batch_idx = (env_ids == 0).nonzero(as_tuple=False).item()
+                
+            #     # 提取数据
+            #     p_offset = pos_offset[batch_idx].cpu().tolist()
+            #     l_v = lin_vel[batch_idx].cpu().tolist()
+            #     perfect = is_perfect_start[batch_idx].item()
+                
+            #     # --- [修复] 从最终的四元数反算欧拉角用于显示 ---
+            #     # 取出最终实际发送给物理引擎的四元数 (Root State 包含了被 Perfect Start 覆盖后的结果)
+            #     final_quat = root_state[batch_idx, 3:7].unsqueeze(0)
+            #     final_r, final_p, final_y = euler_xyz_from_quat(final_quat)
+                
+            #     r_deg = math.degrees(final_r.item())
+            #     p_deg = math.degrees(final_p.item())
+            #     y_deg = math.degrees(final_y.item()) # 新增：转换 Yaw
+            #     # ------------------------------------------------
 
-            if env_ids is not None and len(env_ids) > 0:
-                self._current_motor_speeds[env_ids] = 0.0
+            #     print(f"\n\033[1;36m>>> [RAPTOR Reset Env 0]\033[0m")
+            #     print(f"    Perfect Start (10%): {perfect}")
+            #     print(f"    Pos Offset (m)     : [{p_offset[0]:.3f}, {p_offset[1]:.3f}, {p_offset[2]:.3f}]")
+            #     print(f"    Lin Vel (m/s)      : [{l_v[0]:.3f}, {l_v[1]:.3f}, {l_v[2]:.3f}]")
+            #     # 修改：同时打印 R, P, Y
+            #     print(f"    Attitude (R/P/Y)   : [{r_deg:.1f}, {p_deg:.1f}, {y_deg:.1f}]")
+            #     print("-" * 40)
 
     def _set_debug_vis_impl(self, debug_vis: bool):
-        """Show debug markers if debug_vis is True."""
-        # create markers if necessary for the first tome
-        
-        print(f"debug_vis: {self.cfg.debug_vis}")
+            """Show debug markers if debug_vis is True."""
+            
+            print(f"debug_vis: {self.cfg.debug_vis}")
 
-        if debug_vis:
-            if not hasattr(self, "goal_pos_visualizer"):
-                marker_cfg = CUBOID_MARKER_CFG.copy()
-                marker_cfg.markers["cuboid"].size = (self.cfg.marker_size, self.cfg.marker_size, self.cfg.marker_size) # 0.05, 0.05, 0.05
-                # marker_cfg.markers["cuboid"].size = (5, 5, 5) # 0.05, 0.05, 0.05
-                # -- goal pose
-                marker_cfg.prim_path = "/Visuals/Command/goal_position"
-                self.goal_pos_visualizer = VisualizationMarkers(marker_cfg)
-                print("Created goal_pos_visualizer")
-            # set their visibility to true
-            self.goal_pos_visualizer.set_visibility(True)
+            if debug_vis:
+                # 1. Goal Position (保持不变 - 这是一个方块)
+                if not hasattr(self, "goal_pos_visualizer"):
+                    marker_cfg = CUBOID_MARKER_CFG.copy()
+                    marker_cfg.markers["cuboid"].size = (self.cfg.marker_size, self.cfg.marker_size, self.cfg.marker_size)
+                    marker_cfg.prim_path = "/Visuals/Command/goal_position"
+                    self.goal_pos_visualizer = VisualizationMarkers(marker_cfg)
+                self.goal_pos_visualizer.set_visibility(True)
 
-            if not hasattr(self, "goal_yaw_visualizer"):
-                goal_arrow_cfg = GREEN_ARROW_X_MARKER_CFG.copy()
-                goal_arrow_cfg.markers["arrow"].scale = (self.cfg.marker_size, self.cfg.marker_size, self.cfg.marker_size*4) # 0.05, 0.05, 0.2
-                # goal_arrow_cfg.markers["arrow"].scale = (5, 5, 10) #0.05, 0.05, 0.2
-                # -- goal yaw
-                goal_arrow_cfg.prim_path = "/Visuals/Command/goal_yaw"
-                self.goal_yaw_visualizer = VisualizationMarkers(goal_arrow_cfg)
-                print("Created goal_yaw_visualizer")
-            # set their visibility to true
-            self.goal_yaw_visualizer.set_visibility(True)
+                # 2. Goal Yaw (保持不变 - 这是一个箭头，表示朝向目标)
+                if not hasattr(self, "goal_yaw_visualizer"):
+                    goal_arrow_cfg = GREEN_ARROW_X_MARKER_CFG.copy()
+                    goal_arrow_cfg.markers["arrow"].scale = (self.cfg.marker_size, self.cfg.marker_size, self.cfg.marker_size*4)
+                    goal_arrow_cfg.prim_path = "/Visuals/Command/goal_yaw"
+                    self.goal_yaw_visualizer = VisualizationMarkers(goal_arrow_cfg)
+                self.goal_yaw_visualizer.set_visibility(True)
 
-            if not hasattr(self, "current_yaw_visualizer"):
-                current_arrow_cfg = BLUE_ARROW_X_MARKER_CFG.copy()
-                current_arrow_cfg.markers["arrow"].scale = (self.cfg.marker_size, self.cfg.marker_size, self.cfg.marker_size*4)
-                # -- current yaw
-                current_arrow_cfg.prim_path = "/Visuals/Command/current_yaw"
-                self.current_yaw_visualizer = VisualizationMarkers(current_arrow_cfg)
-                print("Created current_yaw_visualizer")
-            # set their visibility to true
-            self.current_yaw_visualizer.set_visibility(True)
+                # 3. Current Robot Position (蓝色球)
+                if not hasattr(self, "current_yaw_visualizer"):
+                    print("create robot position visualizer (Sphere)")
+                    # 使用球体配置
+                    current_vis_cfg = SPHERE_MARKER_CFG.copy()
+                    current_vis_cfg.prim_path = "/Visuals/Command/current_yaw"
+                    
+                    # 设置缩放 (和红绿球保持一致)
+                    scale_val = self.cfg.marker_size
+                    current_vis_cfg.markers["sphere"].scale = (scale_val, scale_val, scale_val)
+                    
+                    # 设置颜色: 蓝色 (R=0, G=0, B=1)
+                    current_vis_cfg.markers["sphere"].visual_material.diffuse_color = (0.0, 0.0, 1.0)
+                    
+                    self.current_yaw_visualizer = VisualizationMarkers(current_vis_cfg)
+                self.current_yaw_visualizer.set_visibility(True)
 
-            # Trajectory visualizer for Langevin path
-            if not hasattr(self, 'traj_visualizer'):
-                print("create trajectory visualizer")
-                # 使用预置的绿色箭头配置
-                traj_cfg = GREEN_ARROW_X_MARKER_CFG.copy()
-                traj_cfg.prim_path = "/Visuals/Trajectory"
+                # 4. Langevin Trajectory (绿色球)
+                if not hasattr(self, 'traj_langevin_visualizer'):
+                    print("create langevin trajectory visualizer (Sphere)")
+                    # 使用球体配置
+                    langevin_cfg = SPHERE_MARKER_CFG.copy()
+                    langevin_cfg.prim_path = "/Visuals/TrajectoryLangevin"
+                    # 设置缩放 (X, Y, Z)
+                    langevin_cfg.markers["sphere"].scale = (self.cfg.marker_size, self.cfg.marker_size, self.cfg.marker_size)
+                    # 设置颜色: 绿色 (R=0, G=1, B=0)
+                    langevin_cfg.markers["sphere"].visual_material.diffuse_color = (0.0, 1.0, 0.0)
+                    self.traj_langevin_visualizer = VisualizationMarkers(langevin_cfg)
+                self.traj_langevin_visualizer.set_visibility(True)
+
+                # 5. Fixed/Null Trajectory (红色球)
+                if not hasattr(self, 'traj_fixed_visualizer'):
+                    print("create fixed trajectory visualizer (Sphere)")
+                    # 使用球体配置
+                    fixed_cfg = SPHERE_MARKER_CFG.copy()
+                    fixed_cfg.prim_path = "/Visuals/TrajectoryFixed"
+                    # 设置缩放
+                    fixed_cfg.markers["sphere"].scale = (self.cfg.marker_size, self.cfg.marker_size, self.cfg.marker_size)
+                    # 设置颜色: 红色 (R=1, G=0, B=0)
+                    fixed_cfg.markers["sphere"].visual_material.diffuse_color = (1.0, 0.0, 0.0)
+                    self.traj_fixed_visualizer = VisualizationMarkers(fixed_cfg)
+                self.traj_fixed_visualizer.set_visibility(True)
+                    
+            else:
+                # 隐藏逻辑
+                if hasattr(self, "goal_pos_visualizer"): self.goal_pos_visualizer.set_visibility(False)
+                if hasattr(self, "goal_yaw_visualizer"): self.goal_yaw_visualizer.set_visibility(False)
+                if hasattr(self, "current_yaw_visualizer"): self.current_yaw_visualizer.set_visibility(False)
+                if hasattr(self, "traj_langevin_visualizer"): self.traj_langevin_visualizer.set_visibility(False)
+                if hasattr(self, "traj_fixed_visualizer"): self.traj_fixed_visualizer.set_visibility(False)
+                # 清理可能的旧变量
+                if hasattr(self, 'traj_visualizer'): self.traj_visualizer.set_visibility(False)
                 
-                # 设置箭头的大小 (X, Y, Z)，Z轴通常是箭头的长度方向
-                # 这里设置为和 current_yaw_visualizer 类似的大小
-                traj_cfg.markers["arrow"].scale = (self.cfg.marker_size, self.cfg.marker_size, self.cfg.marker_size * 4)
-                
-                self.traj_visualizer = VisualizationMarkers(traj_cfg)
-                print("Created traj_visualizer (Green Arrow)")
-                
-            self.traj_visualizer.set_visibility(True)
-                
-        else:
-            if hasattr(self, "goal_pos_visualizer"):
-                self.goal_pos_visualizer.set_visibility(False)
-            if hasattr(self, "goal_yaw_visualizer"):
-                self.goal_yaw_visualizer.set_visibility(False)
-            if hasattr(self, "current_yaw_visualizer"):
-                self.current_yaw_visualizer.set_visibility(False)
-            if hasattr(self, 'traj_visualizer'):
-                self.traj_visualizer.set_visibility(False)
-
-        
     def _debug_vis_callback(self, event):
             """Update debug markers with current robot pose."""
-            # 1. 更新当前机器人的朝向箭头 (原有的)
-            self.current_yaw_visualizer.visualize(self._robot.data.root_pos_w, self._robot.data.root_quat_w)
-
-            # ==================== 新增代码开始 ====================
-            # 2. 更新 Langevin 轨迹目标点 (红色球体)
-            if hasattr(self, "traj_visualizer"):
-                # visualize 接收 (num_envs, 3) 的位置 和 (num_envs, 4) 的四元数
-                # 位置：使用 self.pos_des (这是 Langevin 算法计算出的当前时刻目标位置)
-                # 姿态：球体旋转看不出来，直接复用机器人的姿态 (root_quat_w) 以节省计算开销
-                self.traj_visualizer.visualize(self.pos_des, self._robot.data.root_quat_w)
-                
             
+            # 1. 机器人本体的蓝色箭头 (这个保持不变，需要跟随机器人动)
+            if hasattr(self, "current_yaw_visualizer"):
+                self.current_yaw_visualizer.visualize(self._robot.data.root_pos_w, self._robot.data.root_quat_w)
+
+            # ================= [关键修改：固定姿态为0] =================
+            
+            # 构造一个单位四元数 (w=1, x=0, y=0, z=0)
+            # 它的形状必须和 robot.data.root_quat_w 一样: (num_envs, 4)
+            fixed_rot = torch.zeros_like(self._robot.data.root_quat_w)
+            fixed_rot[:, 0] = 1.0  # 设置 w 分量为 1.0
+            
+            # 准备一个“藏在地底”的坐标，用于隐藏不需要显示的球
+            invisible_pos = torch.zeros_like(self.pos_des) 
+            invisible_pos[:, 2] = -100.0 
+            
+            # 2. 更新 Langevin 绿色球
+            if hasattr(self, "traj_langevin_visualizer"):
+                pos_green = invisible_pos.clone()
+                
+                # 只有 Langevin 任务显示绿色
+                mask = self._is_langevin_task
+                if mask.any():
+                    pos_green[mask] = self.pos_des[mask]
+                
+                # 使用 fixed_rot，球体姿态永远为0
+                self.traj_langevin_visualizer.visualize(pos_green, fixed_rot)
+
+            # 3. 更新 Fixed 红色球
+            if hasattr(self, "traj_fixed_visualizer"):
+                pos_red = invisible_pos.clone()
+                
+                # 只有 Fixed 任务显示红色
+                mask = ~self._is_langevin_task
+                if mask.any():
+                    pos_red[mask] = self.pos_des[mask]
+                    
+                # 使用 fixed_rot，球体姿态永远为0
+                self.traj_fixed_visualizer.visualize(pos_red, fixed_rot)
+
     class EpisodeOutcome(IntEnum):
         ONGOING = 0
         SUCCESS = 1
