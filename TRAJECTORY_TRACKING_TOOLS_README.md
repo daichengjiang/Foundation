@@ -34,9 +34,7 @@
 
 **直接使用Python：**
 ```bash
-python foundation/rsl_rl/play_best_model.py \
-    --task Isaac-Quadcopter-Point-Ctrl-v0 \
-    --checkpoint logs/rsl_rl/your_experiment/best_model.pt \
+python foundation/rsl_rl/play_best_model.py --task Isaac-Quadcopter-Point-Ctrl-v0 --checkpoint logs/rsl_rl/your_experiment/best_model.pt \
     --num_envs 4 \
     --max_steps 10000
 ```
@@ -56,8 +54,7 @@ ls -l logs/rsl_rl/your_experiment/YYYY-MM-DD_HH-MM-SS_trajectory_tracking/
 ### 第三步：生成可视化图表
 
 ```bash
-python foundation/rsl_rl/visualize_trajectory.py \
-    --data_dir logs/rsl_rl/your_experiment/YYYY-MM-DD_HH-MM-SS_trajectory_tracking
+python foundation/rsl_rl/visualize_trajectory.py --data_dir logs/rsl_rl/your_experiment/YYYY-MM-DD_HH-MM-SS_trajectory_tracking
 ```
 
 图表保存在 `plots/` 子目录中。

@@ -304,6 +304,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             f.write(f"{'=' * 80}\n")
             f.write(f"Checkpoint: {checkpoint_path}\n")
             f.write(f"Task: {args_cli.task}\n")
+            f.write(f"trajectory_type: {env_cfg.trajectory_type}\n")
             f.write(f"Num Envs: {env_cfg.scene.num_envs}\n")
             f.write(f"Seed: {env_cfg.seed}\n")
             f.write(f"Total Steps: {timestep}\n")

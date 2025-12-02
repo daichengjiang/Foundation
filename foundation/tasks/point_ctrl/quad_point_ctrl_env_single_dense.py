@@ -283,7 +283,7 @@ class QuadcopterEnv(DirectRLEnv):
         self._figure8_frequency = 0.1  # Frequency of the figure-8 motion (Hz)
         self._figure8_scale_x = 1.0  # Scale of the figure-8 in x direction (meters)
         self._figure8_scale_y = 0.5  # Scale of the figure-8 in y direction (meters)
-        self._figure8_height = 1.0  # Height of the figure-8 trajectory (meters)
+        self._figure8_height = 3.0  # Height of the figure-8 trajectory (meters)
 
         # Logging
         # [修改] 键名必须与 _get_rewards 中的 reward_items 字典键名完全一致
