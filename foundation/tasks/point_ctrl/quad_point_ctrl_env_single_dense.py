@@ -116,8 +116,11 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     # Calculate total observation space (without depth history, only current frame)
     observation_space = frame_observation_space  # 26D: pos_error(3) + rot_matrix(9) + vel_error(3) + ang_vel(3) + last_actions(4) + motor_speeds(4)
 
-    # 轨迹采样配置
+
     prob_null_trajectory = 0.5  # 50% 概率做定点控制
+
+    # 轨迹类型选择: "langevin" 或 "figure8"
+    trajectory_type = "langevin"  # Default to Langevin during training
 
     # gamma in ppo, only for logging
     gamma = 0.99
@@ -274,6 +277,13 @@ class QuadcopterEnv(DirectRLEnv):
         self._langevin_omega = 2.0  # Oscillator frequency (omega)
         self._langevin_sigma = 1.0  # Noise intensity (sigma)
         self._langevin_alpha = 1.0  # Smoothing factor for exponential moving average (alpha)
+        
+        # Figure-8 trajectory parameters
+        self._figure8_time = torch.zeros(self.num_envs, device=self.device)  # Time variable for figure-8
+        self._figure8_frequency = 0.1  # Frequency of the figure-8 motion (Hz)
+        self._figure8_scale_x = 1.0  # Scale of the figure-8 in x direction (meters)
+        self._figure8_scale_y = 0.5  # Scale of the figure-8 in y direction (meters)
+        self._figure8_height = 1.0  # Height of the figure-8 trajectory (meters)
 
         # Logging
         # [修改] 键名必须与 _get_rewards 中的 reward_items 字典键名完全一致
@@ -458,6 +468,65 @@ class QuadcopterEnv(DirectRLEnv):
         #               f"Vel: {[round(x, 4) for x in self.vel_des[0].cpu().tolist()]}")
         # # ======================================================
 
+    def _generate_desired_trajectory_figure8(self, env_ids: torch.Tensor = None):
+        """
+        Generate desired position and velocity following a figure-8 (lemniscate) trajectory.
+        
+        The trajectory is parametrically defined as:
+        x(t) = A * sin(ωt)
+        y(t) = B * sin(2ωt)
+        z(t) = constant height
+        
+        where:
+        - A: scale in x direction
+        - B: scale in y direction  
+        - ω: angular frequency (2π * frequency)
+        
+        Args:
+            env_ids: Environments to update. If None, updates all environments.
+        """
+        if env_ids is None:
+            env_ids = torch.arange(self.num_envs, device=self.device)
+        
+        n_envs = len(env_ids)
+        
+        # Update time variable
+        self._figure8_time[env_ids] += self.dt
+        t = self._figure8_time[env_ids]
+        
+        # Angular frequency
+        omega = 2 * math.pi * self._figure8_frequency
+        
+        # Get spawn positions as trajectory centers
+        spawn_pos = self._spawn_pos_w[env_ids]
+        
+        # Calculate figure-8 position (relative to spawn point)
+        x_rel = self._figure8_scale_x * torch.sin(omega * t)
+        y_rel = self._figure8_scale_y * torch.sin(2 * omega * t)
+        z_abs = self._figure8_height
+        
+        # Combine into position vector (world frame)
+        pos_des_new = torch.stack([
+            spawn_pos[:, 0] + x_rel,
+            spawn_pos[:, 1] + y_rel,
+            torch.full((n_envs,), z_abs, device=self.device)
+        ], dim=1)
+        
+        # Calculate velocity by differentiating the trajectory
+        vx = self._figure8_scale_x * omega * torch.cos(omega * t)
+        vy = self._figure8_scale_y * 2 * omega * torch.cos(2 * omega * t)
+        vz = torch.zeros(n_envs, device=self.device)
+        
+        vel_des_new = torch.stack([vx, vy, vz], dim=1)
+        
+        # Update desired states
+        self.pos_des[env_ids] = pos_des_new
+        self.vel_des[env_ids] = vel_des_new
+        
+        # Also update raw states for consistency
+        self.pos_des_raw[env_ids] = pos_des_new
+        self.vel_des_raw[env_ids] = vel_des_new
+
     def _calc_env_origins(self):
         # Generate group origins in a grid that ascends in rows and columns
         robots_per_env = self.cfg.robots_per_env
@@ -537,8 +606,12 @@ class QuadcopterEnv(DirectRLEnv):
 
     def _pre_physics_step(self, actions: torch.Tensor):
 
-        # 1. 更新轨迹 (仅针对 Langevin 任务)
-        if torch.any(self._is_langevin_task):
+        # 1. 更新轨迹 (根据配置的轨迹类型)
+        if self.cfg.trajectory_type == "figure8":
+            # 使用八字形轨迹
+            self._generate_desired_trajectory_figure8()
+        elif torch.any(self._is_langevin_task):
+            # 使用 Langevin 轨迹 (仅针对 Langevin 任务)
             self._generate_desired_trajectory_langevin(env_ids=torch.where(self._is_langevin_task)[0])
 
         # 1. Action Clamp (之前讨论过的)
@@ -852,6 +925,11 @@ class QuadcopterEnv(DirectRLEnv):
             self._last_angular_velocity[env_ids] = 0.0
             self._numerical_is_unstable[env_ids] = False
             self._current_motor_speeds[env_ids] = 0.0
+
+        
+            # 重置轨迹时间 (用于八字形轨迹)
+            self._figure8_time[env_ids] = 0.0
+
 
             # --- 3. RAPTOR 初始化逻辑 ---
             
