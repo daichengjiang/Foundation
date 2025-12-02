@@ -86,8 +86,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
     
-    # Force Langevin trajectory generation (disable null trajectory)
-    env_cfg.prob_null_trajectory = 0.0  # All environments use Langevin trajectory
+    # Force figure-8 trajectory for testing
+    env_cfg.trajectory_type = "figure8"
+    env_cfg.prob_null_trajectory = 0.0  # Disable null trajectory
     
     # Enable debug visualization for trajectory tracking
     env_cfg.debug_vis = True
@@ -181,38 +182,56 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         
         # run everything in inference mode
         with torch.inference_mode():
-            # get actions from policy
-            actions = policy(obs)
             
-            # Get current state before stepping
-            current_pos = env.unwrapped._robot.data.root_pos_w.clone()
-            current_vel = env.unwrapped._robot.data.root_lin_vel_w.clone()
+            # -----------------------------------------------------------------
+            # --- 1. 获取 t 步的期望状态，并缓存下来 ---
+            # -----------------------------------------------------------------
             desired_pos = env.unwrapped.pos_des.clone()
             desired_vel = env.unwrapped.vel_des.clone()
             
-            # Calculate tracking errors
-            pos_error = torch.norm(current_pos - desired_pos, dim=1)
-            vel_error = torch.norm(current_vel - desired_vel, dim=1)
+            # -----------------------------------------------------------------
+            # --- 2. 获取 t 步的动作 a_t ---
+            # -----------------------------------------------------------------
+            actions = policy(obs) # obs 来自上一个时间步的 step() 结果
+            
+            # -----------------------------------------------------------------
+            # --- 3. 执行动作，环境从 t-1 转移到 t ---
+            # -----------------------------------------------------------------
+            # 在 env.step() 内部，机器人实际位置变为 current_pos_t
+            # 且环境的期望位置 pos_des/vel_des 可能会更新为下一时刻 t+1 的值
+            obs, rewards, dones, extras = env.step(actions)
+            
+            # -----------------------------------------------------------------
+            # --- 4. 获取 t 步的实际状态 ---
+            # -----------------------------------------------------------------
+            # 这是动作执行后的新位置/速度
+            current_pos = env.unwrapped._robot.data.root_pos_w.clone()
+            current_vel = env.unwrapped._robot.data.root_lin_vel_w.clone()
+            
+            # -----------------------------------------------------------------
+            # --- 5. 计算跟踪误差 (使用 t 步的实际状态 和 t 步缓存的期望状态) ---
+            # -----------------------------------------------------------------
+            pos_error = torch.norm(current_pos - desired_pos, dim=1) 
+            vel_error = torch.norm(current_vel - desired_vel, dim=1) 
             
             # Store tracking errors for each environment
             for env_id in range(env.num_envs):
+                # 使用修正后的 pos_error/vel_error
                 position_errors_all[env_id].append(pos_error[env_id].item())
                 velocity_errors_all[env_id].append(vel_error[env_id].item())
             
             # Save trajectory data (only for environment 0 to reduce storage)
             if args_cli.save_trajectory:
+                # 记录 t 步的数据
                 trajectory_data['desired_pos'].append(desired_pos[0].cpu().numpy())
                 trajectory_data['actual_pos'].append(current_pos[0].cpu().numpy())
                 trajectory_data['desired_vel'].append(desired_vel[0].cpu().numpy())
                 trajectory_data['actual_vel'].append(current_vel[0].cpu().numpy())
                 trajectory_data['position_error'].append(pos_error[0].item())
                 trajectory_data['velocity_error'].append(vel_error[0].item())
-                trajectory_data['actions'].append(actions[0].cpu().numpy())
+                trajectory_data['actions'].append(actions[0].cpu().numpy()) # actions 是 t 步使用的动作
                 trajectory_data['timestamps'].append(timestep * dt)
-            
-            # step environment
-            obs, rewards, dones, extras = env.step(actions)
-            
+                        
             timestep += 1
             
             # Print periodic statistics
@@ -220,8 +239,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 avg_pos_error = torch.mean(pos_error).item()
                 avg_vel_error = torch.mean(vel_error).item()
                 print(f"Step {timestep:5d} | "
-                      f"Avg Pos Error: {avg_pos_error:.4f}m | "
-                      f"Avg Vel Error: {avg_vel_error:.4f}m/s")
+                    f"Avg Pos Error: {avg_pos_error:.4f}m | "
+                    f"Avg Vel Error: {avg_vel_error:.4f}m/s")
         
         # time delay for real-time evaluation
         if args_cli.realtime:
