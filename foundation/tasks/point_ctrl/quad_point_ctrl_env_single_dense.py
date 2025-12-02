@@ -273,10 +273,10 @@ class QuadcopterEnv(DirectRLEnv):
         
         # Langevin trajectory generation parameters (damped harmonic oscillator with noise)
         self._langevin_dt = 0.01  # Time step for integration
-        self._langevin_friction = 1.0  # Damping coefficient (gamma)
-        self._langevin_omega = 2.0  # Oscillator frequency (omega)
-        self._langevin_sigma = 1.0  # Noise intensity (sigma)
-        self._langevin_alpha = 1.0  # Smoothing factor for exponential moving average (alpha)
+        self._langevin_friction = 0.5  # Damping coefficient (gamma)
+        self._langevin_omega = 1.5  # Oscillator frequency (omega)
+        self._langevin_sigma = 3.0  # Noise intensity (sigma)
+        self._langevin_alpha = 0.2  # Smoothing factor for exponential moving average (alpha)
         
         # Figure-8 trajectory parameters
         self._figure8_time = torch.zeros(self.num_envs, device=self.device)  # Time variable for figure-8
@@ -434,6 +434,19 @@ class QuadcopterEnv(DirectRLEnv):
         # 注意：这里用 x_prev_local，确保力是把球拉回 spawn_pos，而不是世界原点
         v_next = v_prev + (-gamma * v_prev - omega * omega * x_prev_local) * dt + sigma * dW
         
+        # ==================== [新增] 速度限幅 (Velocity Clamp) ====================
+        max_vel = 3.0  # 限制langevin轨迹最大速度
+        
+        # 计算当前速度模长 (N, 1)
+        v_norm = torch.norm(v_next, dim=1, keepdim=True)
+        
+        # 如果模长 > max_vel，则缩放；否则保持原样 (使用 min(1.0, limit/norm))
+        # 加上 1e-6 防止除以零
+        scale_factor = torch.clamp(max_vel / (v_norm + 1e-6), max=1.0)
+        
+        # 应用缩放，保持方向不变
+        v_next = v_next * scale_factor
+
         # Update position
         # 速度更新完后，计算新的局部位置，或者直接更新全局位置
         x_next_global = x_prev_global + v_next * dt
@@ -672,7 +685,7 @@ class QuadcopterEnv(DirectRLEnv):
 
         # # ==================== [新增调试打印] ====================
         # # 频率控制: 每 50 步打印一次 (约 0.5秒~1秒一次，取决于仿真dt)
-        # if self.common_step_counter % 10 == 0:
+        # if self.common_step_counter % 1 == 0:
         #     env_id = 0  # 只监控第 0 号环境
             
         #     # 获取当前模式
