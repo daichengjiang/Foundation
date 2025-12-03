@@ -46,6 +46,7 @@ from enum import IntEnum
 import collections
 import itertools
 
+from dataclasses import dataclass
 
 MAP_SIZE = (500, 500) 
 
@@ -58,6 +59,23 @@ SPHERE_MARKER_CFG = VisualizationMarkersCfg(
         ),
     }
 )
+
+@configclass
+class QuadcopterDynamicsCfg:
+    # 默认值 (Crazyflie 2.1 参数作为默认)
+    mass: float = 0.0282
+    arm_length: float = 0.04384
+    # Inertia: Ixx, Iyy, Izz
+    inertia: tuple[float, float, float] = (2.44864e-5, 2.44864e-5, 3.61504e-5)
+    
+    # 推力系数相关 (km/kf ratio for torque, or specific coefficients)
+    # 在你的控制器中，这通常体现为 max_thrust 或 thrust_coefficient
+    # RAPTOR 论文是通过调整 controller 的参数或归一化映射来实现的
+    # 这里我们通过推重比来反推 max_thrust
+    thrust_to_weight: float = 2.25  # 示例默认值
+
+    # 电机参数
+    motor_tau: float = 0.05 
 
 # [0, 2pi] -> [-pi, pi]
 def normallize_angle(angle: torch.Tensor):
@@ -164,6 +182,8 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
         )
     )
 
+    dynamics: QuadcopterDynamicsCfg = QuadcopterDynamicsCfg()
+
     # Controller parameters
     controller_Kang = [8.0, 8.0, 8.0]  # Roll and pitch angle controller gains   #15 15 20
     controller_Kdang = [1.0, 1.0, 1.0]                                            #0.8 0.8 1.2
@@ -202,31 +222,46 @@ class QuadcopterEnv(DirectRLEnv):
         self.start_time = time.time()
 
         self.render_mode = "human"
-
-        self.motor_tau = 0.05 # 假设值，RAPTOR中是采样的
+        
+        #  从 cfg 读取电机时间常数
+        self.motor_tau = self.cfg.dynamics.motor_tau 
         self.dt = self.cfg.sim.dt
         self.motor_alpha = self.dt / (self.dt + self.motor_tau)
         self._current_motor_speeds = torch.zeros(self.num_envs, 4, device=self.device)
         
+
         # Controller
 
-        mass_tensor = torch.full((self.num_envs,), 0.0282, device=self.device)       
-        arm_l_tensor = torch.full((self.num_envs,), 0.04384, device=self.device)
-        inertia_tensor = torch.tensor([2.44864e-5, 2.44864e-5, 3.61504e-5], device=self.device).repeat(self.num_envs, 1)
-        
+        # ... 获取动力学参数 ...
+        mass_tensor = torch.full((self.num_envs,), self.cfg.dynamics.mass, device=self.device)
+        arm_l_tensor = torch.full((self.num_envs,), self.cfg.dynamics.arm_length, device=self.device)
+        inertia_tensor = torch.tensor(self.cfg.dynamics.inertia, device=self.device).repeat(self.num_envs, 1)
+
+        # [关键] 获取 TWR
+        twr_tensor = torch.full((self.num_envs,), self.cfg.dynamics.thrust_to_weight, device=self.device)
+
+
         # Store the robot mass for wind force calculation
         self._robot_mass = mass_tensor
+
+        # [关键] 根据推重比重新计算控制器的参数
+        # RAPTOR 的做法是：网络输出的动作通常是电机转速的映射。
+        # 如果控制器需要 thrust_constant (kf)，需要根据 TWR 和 Mass 调整。
+        # 在 SimpleQuadrotorController 内部，通常有一个 max_thrust 或 kf。
+        # 如果 SimpleQuadrotorController 是基于推力系数计算力的，你需要在这里传入调整后的系数。
+        
+        # 假设 SimpleQuadrotorController 内部根据 kf * omega^2 = thrust
+        # Max Thrust (4 motors) = Mass * Gravity * TWR
+        # Max Thrust per motor = (Mass * 9.81 * TWR) / 4
+        # 假设最大转速 max_omega 固定 (或者也需要缩放)，则 kf 需要调整
 
         self._controller = SimpleQuadrotorController(
             num_envs=self.num_envs,
             device=self.device,
-            attitude_p_gain=torch.tensor(self.cfg.controller_Kang, device=self.device, dtype=torch.float32),
-            attitude_d_gain=torch.tensor(self.cfg.controller_Kdang, device=self.device, dtype=torch.float32),
-            rate_p_gain=torch.tensor(self.cfg.controller_Kang_vel, device=self.device, dtype=torch.float32),
-            # 新增参数传递
             mass=mass_tensor,
             arm_length=arm_l_tensor,
-            inertia=inertia_tensor
+            inertia=inertia_tensor,
+            thrust_to_weight=twr_tensor  # <--- 传入这个关键参数
         )
 
         self._is_langevin_task = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
@@ -594,6 +629,10 @@ class QuadcopterEnv(DirectRLEnv):
 
             # 3. 环境存在后，再去查找路径并设置可见性
             robot_prims = find_matching_prim_paths("/World/envs/env_.*/Robot")
+
+            # 读取配置参数
+            mass_val = self.cfg.dynamics.mass
+            inertia_val = self.cfg.dynamics.inertia
             
             # 检查是否找到了 Prim，方便调试
             if len(robot_prims) == 0:
@@ -601,8 +640,8 @@ class QuadcopterEnv(DirectRLEnv):
                 
             for prim_path in robot_prims:
                 # 修改物理属性 (如果需要)
-                prims_utils.set_prim_property(prim_path + "/body", "physics:mass", 0.0282)
-                prims_utils.set_prim_property(prim_path + "/body", "physics:diagonalInertia", (2.44864e-5, 2.44864e-5, 3.61504e-5))
+                prims_utils.set_prim_property(prim_path + "/body", "physics:mass", mass_val)
+                prims_utils.set_prim_property(prim_path + "/body", "physics:diagonalInertia", inertia_val)
                 prims_utils.set_prim_property(prim_path + "/body", "physics:centerOfMass", (0.0, 0.0, 0.0))
                 
                 # 设置可见性
