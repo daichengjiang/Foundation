@@ -260,6 +260,15 @@ class QuadcopterEnv(DirectRLEnv):
 
         self._is_langevin_task = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
+        # === [修改] 细化死亡原因的标志位 ===
+        self._numerical_is_unstable = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        # 新增具体的死亡原因记录 (Sub-reasons)
+        self._died_pos_limit = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)      # 飞出半径
+        self._died_lin_vel_limit = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)  # 线速度过大
+        self._died_ang_vel_limit = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)  # 角速度过大
+        self._died_tilt_limit = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)     # 倾角 > 90度
+        self._died_nan = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)            # 数值 NaN
+
         # Quadcopter references
         self._actions = torch.zeros(self.num_envs, gym.spaces.flatdim(self.single_action_space), device=self.device)
         self._forces = torch.zeros(self.num_envs, 1, 3, device=self.device)
@@ -325,80 +334,65 @@ class QuadcopterEnv(DirectRLEnv):
 
         self._calc_env_origins()
 
-
     def CHECK_NAN(self, tensor, name):
         if torch.isnan(tensor).any().item():
             print(f"[{name}] NaN detected in tensor of shape {tensor.shape}.")
             nan_env_mask = torch.any(torch.isnan(tensor), dim=1)
+            
+            # === [修改] 记录具体的 NaN 错误 ===
+            self._died_nan = torch.logical_or(self._died_nan, nan_env_mask)
+            self._numerical_is_unstable = torch.logical_or(self._numerical_is_unstable, nan_env_mask)
+            # =================================
+            
             nan_env_indices = torch.where(nan_env_mask)[0]
             print(f"NaN positions: {nan_env_indices}")
-            self._numerical_is_unstable = torch.logical_or(self._numerical_is_unstable, nan_env_mask)
             tensor = tensor.nan_to_num(nan=0.0)
-            raise ValueError("observation is NAN NAN NAN")
+            # raise ValueError("observation is NAN NAN NAN") # 可以选择注释掉以免训练中断
             return tensor
         else:
             return tensor
 
-    # def CHECK_state(self):
-    #         # Limit
-    #         max_angular_velocity = 3.14 * 2.0 * 20.0 # rad/s
-
-    #         # State
-    #         ang_vel_b = self._robot.data.root_ang_vel_b
-    #         rot_w = torch.stack(euler_xyz_from_quat(self._robot.data.root_quat_w), dim=1) # (num_envs, 3) roll, pitch, yaw
-    #         rot_w = torch.stack([normallize_angle(rot_w[:, 0]), normallize_angle(rot_w[:, 1]), normallize_angle(rot_w[:, 2])], dim=1)
-
-    #         state_is_unstable = torch.any(torch.abs(ang_vel_b) > max_angular_velocity, dim=1)
-
-    #         self._numerical_is_unstable = torch.logical_or(self._numerical_is_unstable, state_is_unstable)
-
     def CHECK_state(self):
-            """
-            Check if any environment should terminate based on state thresholds.
-            
-            Episode terminates if ANY dimension (x, y, z) satisfies ANY of:
-            - distance from spawn point > position_threshold
-            - |linear_velocity[i]| > linear_velocity_threshold
-            - |angular_velocity[i]| > angular_velocity_threshold
-            - Tilt angle > 90 degrees (Body Z-axis points downwards)
-            
-            This function updates self._numerical_is_unstable flag.
-            """
-            # Get robot states
-            pos_w = self._robot.data.root_pos_w  # (num_envs, 3)
-            lin_vel_w = self._robot.data.root_lin_vel_w  # (num_envs, 3)
-            ang_vel_b = self._robot.data.root_ang_vel_b  # (num_envs, 3)
-            quat_w = self._robot.data.root_quat_w # (num_envs, 4)
-            
-            # 1. Check distance from spawn point
-            distance_from_spawn = torch.norm(pos_w - self._spawn_pos_w, dim=1)
-            position_exceeded = distance_from_spawn > self.cfg.position_threshold
-            
-            # 2. Check linear velocity threshold
-            linear_velocity_exceeded = torch.any(torch.abs(lin_vel_w) > self.cfg.linear_velocity_threshold, dim=1)
-            
-            # 3. Check angular velocity threshold
-            angular_velocity_exceeded = torch.any(torch.abs(ang_vel_b) > self.cfg.angular_velocity_threshold, dim=1)
+        """
+        Check state thresholds and log specific failure reasons.
+        """
+        # Get robot states
+        pos_w = self._robot.data.root_pos_w 
+        lin_vel_w = self._robot.data.root_lin_vel_w 
+        ang_vel_b = self._robot.data.root_ang_vel_b 
+        quat_w = self._robot.data.root_quat_w
+        
+        # 1. Check distance from spawn point
+        distance_from_spawn = torch.norm(pos_w - self._spawn_pos_w, dim=1)
+        position_exceeded = distance_from_spawn > self.cfg.position_threshold
+        
+        # 2. Check linear velocity threshold
+        linear_velocity_exceeded = torch.any(torch.abs(lin_vel_w) > self.cfg.linear_velocity_threshold, dim=1)
+        
+        # 3. Check angular velocity threshold
+        angular_velocity_exceeded = torch.any(torch.abs(ang_vel_b) > self.cfg.angular_velocity_threshold, dim=1)
 
-            # 4. Check Tilt > 90 degrees (Roll/Pitch limit)
-            # 计算旋转矩阵 R_b->w
-            rot_matrix = matrix_from_quat(quat_w) 
-            # 取出矩阵的 (3,3) 元素 (索引 [2, 2])
-            # 这代表机体 Z 轴 (0,0,1) 在世界系 Z 轴上的投影分量
-            body_z_projected = rot_matrix[:, 2, 2]
-            # 如果投影 < 0，说明机体 Z 轴指向下方，即倾斜角 > 90度
-            tilt_exceeded = body_z_projected < 0.0
-            
-            # Combine all conditions
-            state_is_unstable = (
-                position_exceeded | 
-                linear_velocity_exceeded | 
-                angular_velocity_exceeded | 
-                tilt_exceeded
-            )
-            
-            # Update the numerical instability flag
-            self._numerical_is_unstable = torch.logical_or(self._numerical_is_unstable, state_is_unstable)
+        # 4. Check Tilt > 90 degrees
+        rot_matrix = matrix_from_quat(quat_w) 
+        body_z_projected = rot_matrix[:, 2, 2]
+        tilt_exceeded = body_z_projected < 0.0
+        
+        # === [修改] 分别更新各个具体的死亡原因 (使用逻辑或，保留历史记录直到 reset) ===
+        self._died_pos_limit = torch.logical_or(self._died_pos_limit, position_exceeded)
+        self._died_lin_vel_limit = torch.logical_or(self._died_lin_vel_limit, linear_velocity_exceeded)
+        self._died_ang_vel_limit = torch.logical_or(self._died_ang_vel_limit, angular_velocity_exceeded)
+        self._died_tilt_limit = torch.logical_or(self._died_tilt_limit, tilt_exceeded)
+        
+        # 总开关：只要有一个触发，就标记为不稳定
+        state_is_unstable = (
+            self._died_pos_limit | 
+            self._died_lin_vel_limit | 
+            self._died_ang_vel_limit | 
+            self._died_tilt_limit |
+            self._died_nan
+        )
+        
+        self._numerical_is_unstable = torch.logical_or(self._numerical_is_unstable, state_is_unstable)
 
     def _generate_desired_trajectory_langevin(self, env_ids: torch.Tensor = None):
         """
@@ -959,10 +953,16 @@ class QuadcopterEnv(DirectRLEnv):
             self._forces[env_ids] = 0.0
             self._torques[env_ids] = 0.0
             self._last_angular_velocity[env_ids] = 0.0
+            # === [修改] 清零所有不稳定性标志位 ===
             self._numerical_is_unstable[env_ids] = False
+            self._died_pos_limit[env_ids] = False
+            self._died_lin_vel_limit[env_ids] = False
+            self._died_ang_vel_limit[env_ids] = False
+            self._died_tilt_limit[env_ids] = False
+            self._died_nan[env_ids] = False
+
             self._current_motor_speeds[env_ids] = 0.0
 
-        
             # 重置轨迹时间 (用于八字形轨迹)
             self._figure8_time[env_ids] = 0.0
 
@@ -1225,45 +1225,44 @@ class QuadcopterEnv(DirectRLEnv):
         ONGOING = 0
         SUCCESS = 1
         FAILURE = 2
-        
+            
     def _update_episode_outcomes_and_metrics(self, env_ids, success_mask, died_mask, timed_out_mask):
             """
-            Update episode statistics for trajectory tracking task.
-            For trajectory tracking, there is no success criterion - episodes end by timeout or death only.
+            Update episode statistics with detailed failure reasons.
             """
-            # Check for completed episodes (died or timed out)
             completed_mask = torch.logical_or(died_mask, timed_out_mask)
             if not torch.any(completed_mask):
                 return 0, 0
 
-            # Extract completion info
             completed_env_ids = env_ids[completed_mask]
             died_env_ids = env_ids[died_mask]
             
             # Process termination reasons for died episodes
             if len(died_env_ids) > 0:
-                # 1. 获取现有状态用于判断死亡原因
-                is_unstable = self._numerical_is_unstable[died_env_ids].cpu().numpy()
-                pos_z = self._robot.data.root_pos_w[died_env_ids, 2].cpu().numpy()
+                # === [修改] 提取细分的死亡原因 ===
+                # 将 Tensor 转为 numpy bool 数组
+                reason_pos_limit = self._died_pos_limit[died_env_ids].cpu().numpy()
+                reason_lin_vel = self._died_lin_vel_limit[died_env_ids].cpu().numpy()
+                reason_ang_vel = self._died_ang_vel_limit[died_env_ids].cpu().numpy()
+                reason_tilt = self._died_tilt_limit[died_env_ids].cpu().numpy()
+                reason_nan = self._died_nan[died_env_ids].cpu().numpy()
                 
-                # 判断的是：Langevin 轨迹点 (pos_des) 是否距离 出生点 (_spawn_pos_w) 太远
+                # 计算 Langevin 距离 (原来的逻辑)
                 des_w = self.pos_des[died_env_ids]
                 spawn_w = self._spawn_pos_w[died_env_ids]
-                
                 dist_traj_from_spawn = torch.norm(des_w - spawn_w, dim=1)
-                
-                # 判断是否超过阈值并转为 numpy
-                pos_exceeded = (dist_traj_from_spawn > self.cfg.position_threshold_langevin).cpu().numpy()
-                # too_low = (pos_z < self.cfg.too_low)
-                # too_high = (pos_z > self.cfg.too_high)
+                reason_langevin = (dist_traj_from_spawn > self.cfg.position_threshold_langevin).cpu().numpy()
                 
                 for i in range(len(died_env_ids)):
                     self._termination_reason_history.append({
-                        "numerical_is_unstable": bool(is_unstable[i]),
-                        # "too_low": bool(too_low[i]),
-                        # "too_high": bool(too_high[i]),
-                        "position_exceeded_langevin": bool(pos_exceeded[i])  # [新增] 记录该原因
+                        "died_pos_limit": bool(reason_pos_limit[i]),
+                        "died_lin_vel": bool(reason_lin_vel[i]),
+                        "died_ang_vel": bool(reason_ang_vel[i]),
+                        "died_tilt": bool(reason_tilt[i]),
+                        "died_nan": bool(reason_nan[i]),
+                        "position_exceeded_langevin": bool(reason_langevin[i])
                     })
+                # ===============================
             
             # Add empty dictionaries for timeout cases
             timeout_count_current = len(env_ids[timed_out_mask])
@@ -1277,13 +1276,18 @@ class QuadcopterEnv(DirectRLEnv):
                 ).cpu().tolist()
                 self._vel_abs.extend(vel_abs)
 
-            # Calculate statistics for trajectory tracking (no success rate needed)
+            # Calculate statistics
             num_termination_records = len(self._termination_reason_history)
             if num_termination_records > 0:
-                # Count death reasons (no collision in open space)
-                # [新增] 将 position_exceeded_langevin 加入统计列表
-                # reason_keys = ["numerical_is_unstable", "too_low", "too_high", "position_exceeded_langevin"]
-                reason_keys = ["numerical_is_unstable", "position_exceeded_langevin"]
+                # === [修改] 定义需要统计的键名列表 ===
+                reason_keys = [
+                    "died_pos_limit", 
+                    "died_lin_vel", 
+                    "died_ang_vel", 
+                    "died_tilt", 
+                    "died_nan", 
+                    "position_exceeded_langevin"
+                ]
                 reason_counts = {key: 0 for key in reason_keys}
                 
                 if len(self._termination_reason_history) > 0:
@@ -1292,39 +1296,30 @@ class QuadcopterEnv(DirectRLEnv):
                             if key in reason and reason[key]:
                                 reason_counts[key] += 1
                 
-                # Calculate percentages
-                died_count = sum(1 for r in self._termination_reason_history if r)  # Non-empty dict = died
+                died_count = sum(1 for r in self._termination_reason_history if r)
                 timeout_count = num_termination_records - died_count
                 
-                # Update episode count
-                completed_count = len(completed_env_ids)
-                self._episodes_completed += completed_count
-
-                # Calculate average velocity
+                self._episodes_completed += len(completed_env_ids)
                 avg_velocity = np.mean(list(self._vel_abs)) if self._vel_abs else 0.0
 
-                # Prepare metrics (only meaningful ones for trajectory tracking)
                 if "log" not in self.extras:
                     self.extras["log"] = {}
                 
+                # 更新主日志
                 self.extras["log"].update({
-                    # Episode termination statistics as percentages
                     "Episode_Termination/died": died_count / num_termination_records * 100.0,
                     "Episode_Termination/time_out": timeout_count / num_termination_records * 100.0,
-
-                    # Death reason statistics as percentages of total episodes
-                    "Metrics/Died/numerical_is_unstable": reason_counts["numerical_is_unstable"] / num_termination_records * 100.0,
-                    # "Metrics/Died/too_low": reason_counts["too_low"] / num_termination_records * 100.0,
-                    # "Metrics/Died/too_high": reason_counts["too_high"] / num_termination_records * 100.0,
-                    # [新增] 记录新的死亡原因日志
-                    "Metrics/Died/position_exceeded_langevin": reason_counts["position_exceeded_langevin"] / num_termination_records * 100.0,
-
-                    # Progress tracking
                     "Metrics/average_velocity": avg_velocity,
                     "Metrics/episodes_completed": self._episodes_completed,
                 })
 
-                return completed_count, 0  # Return (completed_count, 0) since there's no success
+                # === [修改] 更新细分原因日志 ===
+                for key in reason_keys:
+                    # 记录名为 "Metrics/Died/died_tilt" 等等
+                    self.extras["log"][f"Metrics/Died/{key}"] = reason_counts[key] / num_termination_records * 100.0
+                # ===============================
+
+                return len(completed_env_ids), 0
     
     def close(self):
         """Clean up resources when environment is closed."""
