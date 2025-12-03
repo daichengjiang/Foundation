@@ -122,6 +122,8 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     # 轨迹类型选择: "langevin" 或 "figure8"
     trajectory_type = "langevin"  # Default to Langevin during training
 
+    train_or_play: bool = True  # 默认为 True (训练模式)，命令行可通过 --train_or_play=False 修改
+
     # gamma in ppo, only for logging
     gamma = 0.99
 
@@ -948,53 +950,60 @@ class QuadcopterEnv(DirectRLEnv):
             
             # 定义物理参数
             l_arm = 0.04384  # 论文中的 l_arm
-            r_pos_limit = 10.0 * l_arm  # 位置采样半径 (~0.44m)
-            v_lin_limit = 1.0           # 线速度限制 (1 m/s)
-            v_ang_limit = 1.0           # 角速度限制 (1 rad/s)
-            
-            # 辅助函数：球体内均匀采样 (Uniform sampling within a sphere)
-            # r = R * u^(1/3), direction = randn / norm
-            def sample_in_sphere(radius, n_samples):
-                # 随机方向
-                direction = torch.randn(n_samples, 3, device=self.device)
-                direction = F.normalize(direction, p=2, dim=1)
-                # 随机半径 (立方根保证体积均匀分布)
-                u = torch.rand(n_samples, 1, device=self.device)
-                r = radius * torch.pow(u, 1.0/3.0)
-                return direction * r
 
-            # A. 生成随机状态偏移
-            # 1. 位置偏移
-            pos_offset = sample_in_sphere(r_pos_limit, num_resets)
-            
-            # 2. 线速度
-            lin_vel = sample_in_sphere(v_lin_limit, num_resets)
-            
-            # 3. 角速度
-            ang_vel = sample_in_sphere(v_ang_limit, num_resets)
-            
-            # 4. 姿态 (Orientation): 最大 90度倾斜 + 随机 Yaw
-            # 这里为了稳健性，我们在 [-pi/2, pi/2] 范围内独立采样 Roll 和 Pitch
-            # 虽然这在对角线上可能超过90度，但在 "Foundation Policy" 训练中通常作为 worst-case
-            roll = (torch.rand(num_resets, device=self.device) * 2 - 1) * (math.pi / 2.0) # +/- 90 deg
-            pitch = (torch.rand(num_resets, device=self.device) * 2 - 1) * (math.pi / 2.0)# +/- 90 deg
-            yaw = (torch.rand(num_resets, device=self.device) * 2 - 1) * math.pi          # +/- 180 deg
-            
-            quat = quat_from_euler_xyz(roll, pitch, yaw)
 
-            # B. 10% 概率覆盖为 "Target State" (悬停状态)
-            # "With a probability of 10%, the initial state is overwritten with the target state (all zeros)"
-            reset_to_target_probs = torch.rand(num_resets, device=self.device)
-            is_perfect_start = reset_to_target_probs < 0.10
+            if self.cfg.train_or_play:
+                # ================= [TRAIN MODE] =================
+                # 原有的随机化逻辑
+                
+                r_pos_limit = 10.0 * l_arm  # 位置采样半径
+                v_lin_limit = 1.0           # 线速度限制
+                v_ang_limit = 1.0           # 角速度限制
 
-            # 覆盖为完美状态
-            pos_offset[is_perfect_start] = 0.0
-            lin_vel[is_perfect_start] = 0.0
-            ang_vel[is_perfect_start] = 0.0
-            
-            # 完美姿态 (Identity Quaternion: w=1, x=0, y=0, z=0)
-            identity_quat = torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device).repeat(num_resets, 1)
-            quat[is_perfect_start] = identity_quat[is_perfect_start]
+                # 辅助函数：球体内均匀采样
+                def sample_in_sphere(radius, n_samples):
+                    direction = torch.randn(n_samples, 3, device=self.device)
+                    direction = F.normalize(direction, p=2, dim=1)
+                    u = torch.rand(n_samples, 1, device=self.device)
+                    r = radius * torch.pow(u, 1.0/3.0)
+                    return direction * r
+
+                # A. 生成随机状态偏移
+                pos_offset = sample_in_sphere(r_pos_limit, num_resets)
+                lin_vel = sample_in_sphere(v_lin_limit, num_resets)
+                ang_vel = sample_in_sphere(v_ang_limit, num_resets)
+                
+                # 姿态随机
+                roll = (torch.rand(num_resets, device=self.device) * 2 - 1) * (math.pi / 2.0)
+                pitch = (torch.rand(num_resets, device=self.device) * 2 - 1) * (math.pi / 2.0)
+                yaw = (torch.rand(num_resets, device=self.device) * 2 - 1) * math.pi
+                quat = quat_from_euler_xyz(roll, pitch, yaw)
+
+                # B. 10% 概率覆盖为完美初始状态
+                reset_to_target_probs = torch.rand(num_resets, device=self.device)
+                is_perfect_start = reset_to_target_probs < 0.10 
+
+                pos_offset[is_perfect_start] = 0.0
+                lin_vel[is_perfect_start] = 0.0
+                ang_vel[is_perfect_start] = 0.0
+                
+                identity_quat = torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device).repeat(num_resets, 1)
+                quat[is_perfect_start] = identity_quat[is_perfect_start]
+                
+            else:
+                # ================= [PLAY MODE] =================
+                # 强制全部归零，不进行随机化
+                
+                pos_offset = torch.zeros(num_resets, 3, device=self.device)
+                lin_vel = torch.zeros(num_resets, 3, device=self.device)
+                ang_vel = torch.zeros(num_resets, 3, device=self.device)
+                
+                # 强制姿态水平 (Identity Quaternion: w=1, x=0, y=0, z=0)
+                quat = torch.zeros(num_resets, 4, device=self.device)
+                quat[:, 0] = 1.0 
+                
+                # Play 模式下不需要 perfect_start 标记，因为本身就是 perfect
+                is_perfect_start = torch.ones(num_resets, dtype=torch.bool, device=self.device)
 
             # --- 4. 设置仿真器状态 ---
             
