@@ -1000,7 +1000,7 @@ class QuadcopterEnv(DirectRLEnv):
                 
                 # 强制姿态水平 (Identity Quaternion: w=1, x=0, y=0, z=0)
                 quat = torch.zeros(num_resets, 4, device=self.device)
-                quat[:, 3] = 1.0 
+                quat[:, 0] = 1.0 
                 
                 # Play 模式下不需要 perfect_start 标记，因为本身就是 perfect
                 is_perfect_start = torch.ones(num_resets, dtype=torch.bool, device=self.device)
