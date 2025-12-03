@@ -42,8 +42,6 @@ import csv
 
 from foundation.utils.simple_controller import SimpleQuadrotorController
 
-from foundation.utils.wind_gen import WindGustGenerator
-
 from enum import IntEnum
 import collections
 import itertools
@@ -171,22 +169,11 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     controller_Kdang = [1.0, 1.0, 1.0]                                            #0.8 0.8 1.2
     controller_Kang_vel = [15.0, 15.0, 15.0]  # Roll, pitch, and yaw angular velocity controller gains
 
-    enable_aero_drag = False
-    drag_coeffs = (0.003, 0.003, 0.003)   # dx, dy, dz，机体系“转子/气动阻力系数”，可按机架调
-    drag_rand_scale = 0.5              # 域随机化幅度：±50%（论文设置）
-    drag_v_clip = 8.0                 # 可选：速度范数上限，避免数值爆
-
     # scene
     scene: InteractiveSceneCfg = QuadcopterSceneCfg()
 
     # robot
     robot: ArticulationCfg = CRAZYFLIE_CFG.replace(prim_path="/World/envs/env_.*/Robot")
-
-    # thresholds
-    too_low = 0.3
-    too_high = 1.7
-    desired_low = 0.5  
-    desired_high = 1.5
 
     height = 3.0
     
@@ -203,7 +190,6 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     reward_coef_termination_penalty = 100.0
     reward_constant = 1.5
 
-    enable_wind_generator = False
 
 class QuadcopterEnv(DirectRLEnv):
     """A quadcopter environment adapted to use the reward logic from the training code."""
@@ -216,18 +202,6 @@ class QuadcopterEnv(DirectRLEnv):
         self.start_time = time.time()
 
         self.render_mode = "human"
-
-        # Initialize wind generator
-        if self.cfg.enable_wind_generator:
-            self._wind_gen = WindGustGenerator(
-                num_envs=self.num_envs,
-                device=self.device,
-                dt=self.cfg.sim.dt,
-                tau=1.0,
-                sigma=0.5
-            )
-        else:
-            self._wind_gen = None
 
         self.motor_tau = 0.05 # 假设值，RAPTOR中是采样的
         self.dt = self.cfg.sim.dt
@@ -242,9 +216,6 @@ class QuadcopterEnv(DirectRLEnv):
         
         # Store the robot mass for wind force calculation
         self._robot_mass = mass_tensor
-        # --- Aerodynamic drag setup (paper model) ---
-        dx, dy, dz = self.cfg.drag_coeffs
-        self._drag_D = torch.tensor([dx, dy, dz], device=self.device).repeat(self.num_envs, 1)
 
         self._controller = SimpleQuadrotorController(
             num_envs=self.num_envs,
@@ -836,8 +807,6 @@ class QuadcopterEnv(DirectRLEnv):
             # Terminal Penalty
             terminal = (
                 self._numerical_is_unstable 
-                # (self._robot.data.root_pos_w[:, 2] < self.cfg.too_low) | 
-                # (self._robot.data.root_pos_w[:, 2] > self.cfg.too_high)
             )
             termination_penalty = terminal.float()
             
@@ -900,8 +869,6 @@ class QuadcopterEnv(DirectRLEnv):
 
         conditions = [
             self._numerical_is_unstable,  # Numerical instability
-            # self._robot.data.root_pos_w[:, 2] < self.cfg.too_low,  # Z position too low
-            # self._robot.data.root_pos_w[:, 2] > self.cfg.too_high,  # Z position too high
             position_exceeded_langevin,  # Distance from desired trajectory exceeds threshold
         ]
 
@@ -950,9 +917,6 @@ class QuadcopterEnv(DirectRLEnv):
                     self.extras["log"][f"Episode_Reward/{key}"] = mean_val
                     self._episode_sums[key][env_ids] = 0.0
 
-            # --- 2. 基础重置 ---
-            if self._wind_gen is not None:
-                self._wind_gen.reset(env_ids)
 
             died_mask = self.reset_terminated[env_ids]
             timed_out_mask = self.reset_time_outs[env_ids]
