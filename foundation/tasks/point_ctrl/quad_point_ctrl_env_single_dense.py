@@ -198,8 +198,8 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     angular_velocity_threshold = 35.0  # rad/s
 
     reward_coef_position_cost = 1.0
-    reward_coef_orientation_cost = 0.5
-    reward_coef_d_action_cost = 0.1
+    reward_coef_orientation_cost = 0.2
+    reward_coef_d_action_cost = 1.0
     reward_coef_termination_penalty = 100.0
     reward_constant = 1.5
 
