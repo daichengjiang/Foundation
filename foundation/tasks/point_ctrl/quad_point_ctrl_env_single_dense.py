@@ -353,36 +353,52 @@ class QuadcopterEnv(DirectRLEnv):
     #         self._numerical_is_unstable = torch.logical_or(self._numerical_is_unstable, state_is_unstable)
 
     def CHECK_state(self):
-        """
-        Check if any environment should terminate based on state thresholds.
-        
-        Episode terminates if ANY dimension (x, y, z) satisfies ANY of:
-        - distance from spawn point > position_threshold
-        - |linear_velocity[i]| > linear_velocity_threshold
-        - |angular_velocity[i]| > angular_velocity_threshold
-        
-        This function updates self._numerical_is_unstable flag.
-        """
-        # Get robot states
-        pos_w = self._robot.data.root_pos_w  # (num_envs, 3) - world position [x, y, z]
-        lin_vel_w = self._robot.data.root_lin_vel_w  # (num_envs, 3) - world linear velocity
-        ang_vel_b = self._robot.data.root_ang_vel_b  # (num_envs, 3) - body angular velocity
-        
-        # Check distance from spawn point
-        distance_from_spawn = torch.norm(pos_w - self._spawn_pos_w, dim=1)  # (num_envs,)
-        position_exceeded = distance_from_spawn > self.cfg.position_threshold
-        
-        # Check linear velocity threshold for any dimension
-        linear_velocity_exceeded = torch.any(torch.abs(lin_vel_w) > self.cfg.linear_velocity_threshold, dim=1)
-        
-        # Check angular velocity threshold for any dimension
-        angular_velocity_exceeded = torch.any(torch.abs(ang_vel_b) > self.cfg.angular_velocity_threshold, dim=1)
-        
-        # Combine all conditions: terminate if ANY condition is met
-        state_is_unstable = position_exceeded | linear_velocity_exceeded | angular_velocity_exceeded
-        
-        # Update the numerical instability flag
-        self._numerical_is_unstable = torch.logical_or(self._numerical_is_unstable, state_is_unstable)
+            """
+            Check if any environment should terminate based on state thresholds.
+            
+            Episode terminates if ANY dimension (x, y, z) satisfies ANY of:
+            - distance from spawn point > position_threshold
+            - |linear_velocity[i]| > linear_velocity_threshold
+            - |angular_velocity[i]| > angular_velocity_threshold
+            - Tilt angle > 90 degrees (Body Z-axis points downwards)
+            
+            This function updates self._numerical_is_unstable flag.
+            """
+            # Get robot states
+            pos_w = self._robot.data.root_pos_w  # (num_envs, 3)
+            lin_vel_w = self._robot.data.root_lin_vel_w  # (num_envs, 3)
+            ang_vel_b = self._robot.data.root_ang_vel_b  # (num_envs, 3)
+            quat_w = self._robot.data.root_quat_w # (num_envs, 4)
+            
+            # 1. Check distance from spawn point
+            distance_from_spawn = torch.norm(pos_w - self._spawn_pos_w, dim=1)
+            position_exceeded = distance_from_spawn > self.cfg.position_threshold
+            
+            # 2. Check linear velocity threshold
+            linear_velocity_exceeded = torch.any(torch.abs(lin_vel_w) > self.cfg.linear_velocity_threshold, dim=1)
+            
+            # 3. Check angular velocity threshold
+            angular_velocity_exceeded = torch.any(torch.abs(ang_vel_b) > self.cfg.angular_velocity_threshold, dim=1)
+
+            # 4. Check Tilt > 90 degrees (Roll/Pitch limit)
+            # 计算旋转矩阵 R_b->w
+            rot_matrix = matrix_from_quat(quat_w) 
+            # 取出矩阵的 (3,3) 元素 (索引 [2, 2])
+            # 这代表机体 Z 轴 (0,0,1) 在世界系 Z 轴上的投影分量
+            body_z_projected = rot_matrix[:, 2, 2]
+            # 如果投影 < 0，说明机体 Z 轴指向下方，即倾斜角 > 90度
+            tilt_exceeded = body_z_projected < 0.0
+            
+            # Combine all conditions
+            state_is_unstable = (
+                position_exceeded | 
+                linear_velocity_exceeded | 
+                angular_velocity_exceeded | 
+                tilt_exceeded
+            )
+            
+            # Update the numerical instability flag
+            self._numerical_is_unstable = torch.logical_or(self._numerical_is_unstable, state_is_unstable)
 
     def _generate_desired_trajectory_langevin(self, env_ids: torch.Tensor = None):
         """
@@ -604,8 +620,9 @@ class QuadcopterEnv(DirectRLEnv):
                 
             for prim_path in robot_prims:
                 # 修改物理属性 (如果需要)
-                prims_utils.set_prim_property(prim_path + "/body", "physics:mass", 0.049)
-                prims_utils.set_prim_property(prim_path + "/body", "physics:diagonalInertia", (1.3615e-5, 1.3615e-5, 3.257e-5))
+                prims_utils.set_prim_property(prim_path + "/body", "physics:mass", 0.0282)
+                prims_utils.set_prim_property(prim_path + "/body", "physics:diagonalInertia", (2.44864e-5, 2.44864e-5, 3.61504e-5))
+                prims_utils.set_prim_property(prim_path + "/body", "physics:centerOfMass", (0.0, 0.0, 0.0))
                 
                 # 设置可见性
                 if self.cfg.robot_vis == True:
