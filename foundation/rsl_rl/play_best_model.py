@@ -167,14 +167,24 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     position_errors_all = [[] for _ in range(env.num_envs)]
     velocity_errors_all = [[] for _ in range(env.num_envs)]
     
+    # Episode step counters for each environment (to skip first few steps after reset)
+    # NOTE: When an environment resets (episode_length reached), the robot position jumps to spawn point
+    # and the trajectory restarts. The first few steps after reset show artificially low errors because
+    # the robot is at the trajectory starting point. We skip these transient steps to get accurate statistics.
+    env_episode_steps = torch.zeros(env.num_envs, dtype=torch.long, device=env.unwrapped._robot.device)
+    skip_steps_after_reset = 10  # Skip first N steps after reset to avoid transients
+    
     print(f"\n{'=' * 80}")
     print(f"Trajectory Tracking Evaluation")
     print(f"Number of environments: {env.num_envs}")
     print(f"Maximum steps: {args_cli.max_steps}")
+    print(f"Episode length: {env_cfg.episode_length_s} seconds (~{int(env_cfg.episode_length_s / env.unwrapped.step_dt)} steps)")
+    print(f"Skip first {skip_steps_after_reset} steps after reset to avoid transients")
     print(f"{'=' * 80}\n")
     
     timestep = 0
     start_time = time.time()
+    prev_dones = torch.zeros(env.num_envs, dtype=torch.bool, device=env.unwrapped._robot.device)
     
     # simulate environment
     while simulation_app.is_running() and timestep < args_cli.max_steps:
@@ -214,11 +224,22 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             pos_error = torch.norm(current_pos - desired_pos, dim=1) 
             vel_error = torch.norm(current_vel - desired_vel, dim=1) 
             
-            # Store tracking errors for each environment
+            # Detect resets (when dones change from False to True)
+            reset_mask = dones & ~prev_dones
+            prev_dones = dones.clone()
+            
+            # Reset episode step counters for environments that just reset
+            env_episode_steps[reset_mask] = 0
+            
+            # Increment episode step counter
+            env_episode_steps += 1
+            
+            # Store tracking errors for each environment (skip first few steps after reset)
             for env_id in range(env.num_envs):
-                # 使用修正后的 pos_error/vel_error
-                position_errors_all[env_id].append(pos_error[env_id].item())
-                velocity_errors_all[env_id].append(vel_error[env_id].item())
+                # Only record errors if we're past the skip period after reset
+                if env_episode_steps[env_id] > skip_steps_after_reset:
+                    position_errors_all[env_id].append(pos_error[env_id].item())
+                    velocity_errors_all[env_id].append(vel_error[env_id].item())
             
             # Save trajectory data (only for environment 0 to reduce storage)
             if args_cli.save_trajectory:
@@ -234,13 +255,22 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                         
             timestep += 1
             
-            # Print periodic statistics
+            # Print periodic statistics (only for environments past the skip period)
             if timestep % 1000 == 0:
-                avg_pos_error = torch.mean(pos_error).item()
-                avg_vel_error = torch.mean(vel_error).item()
-                print(f"Step {timestep:5d} | "
-                    f"Avg Pos Error: {avg_pos_error:.4f}m | "
-                    f"Avg Vel Error: {avg_vel_error:.4f}m/s")
+                # Calculate average only from valid measurements (past skip period)
+                valid_pos_errors = []
+                valid_vel_errors = []
+                for env_id in range(env.num_envs):
+                    valid_pos_errors.extend(position_errors_all[env_id])
+                    valid_vel_errors.extend(velocity_errors_all[env_id])
+                
+                if len(valid_pos_errors) > 0:
+                    avg_pos_error = np.mean(valid_pos_errors)
+                    avg_vel_error = np.mean(valid_vel_errors)
+                    print(f"Step {timestep:5d} | "
+                        f"Avg Pos Error: {avg_pos_error:.4f}m | "
+                        f"Avg Vel Error: {avg_vel_error:.4f}m/s | "
+                        f"Valid Samples: {len(valid_pos_errors)}")
         
         # time delay for real-time evaluation
         if args_cli.realtime:
