@@ -295,6 +295,7 @@ class QuadcopterEnv(DirectRLEnv):
         self._figure8_scale_x = 1.0  # Scale of the figure-8 in x direction (meters)
         self._figure8_scale_y = 0.5  # Scale of the figure-8 in y direction (meters)
         self._figure8_height = 3.0  # Height of the figure-8 trajectory (meters)
+        self._figure8_warmup_duration = 5.0  # 热身阶段时长 (秒),在此期间保持初始位置
 
         # Logging
         # [修改] 键名必须与 _get_rewards 中的 reward_items 字典键名完全一致
@@ -507,6 +508,9 @@ class QuadcopterEnv(DirectRLEnv):
         - B: scale in y direction  
         - ω: angular frequency (2π * frequency)
         
+        In the warmup phase (initial _figure8_warmup_duration seconds), pos_des and vel_des 
+        remain at their initial states to allow the drone to stabilize.
+        
         Args:
             env_ids: Environments to update. If None, updates all environments.
         """
@@ -519,6 +523,11 @@ class QuadcopterEnv(DirectRLEnv):
         self._figure8_time[env_ids] += self.dt
         t = self._figure8_time[env_ids]
         
+        # Check if in warmup phase - if so, keep pos_des and vel_des unchanged
+        in_warmup = t < self._figure8_warmup_duration
+        if torch.all(in_warmup):
+            return  # All environments still in warmup, no update needed
+        
         # Angular frequency
         omega = 2 * math.pi * self._figure8_frequency
         
@@ -526,8 +535,10 @@ class QuadcopterEnv(DirectRLEnv):
         spawn_pos = self._spawn_pos_w[env_ids]
         
         # Calculate figure-8 position (relative to spawn point)
-        x_rel = self._figure8_scale_x * torch.sin(omega * t)
-        y_rel = self._figure8_scale_y * torch.sin(2 * omega * t)
+        # Adjust time to start from 0 after warmup
+        t_adjusted = t - self._figure8_warmup_duration
+        x_rel = self._figure8_scale_x * torch.sin(omega * t_adjusted)
+        y_rel = self._figure8_scale_y * torch.sin(2 * omega * t_adjusted)
         z_abs = self._figure8_height
         
         # Combine into position vector (world frame)
@@ -538,19 +549,21 @@ class QuadcopterEnv(DirectRLEnv):
         ], dim=1)
         
         # Calculate velocity by differentiating the trajectory
-        vx = self._figure8_scale_x * omega * torch.cos(omega * t)
-        vy = self._figure8_scale_y * 2 * omega * torch.cos(2 * omega * t)
+        vx = self._figure8_scale_x * omega * torch.cos(omega * t_adjusted)
+        vy = self._figure8_scale_y * 2 * omega * torch.cos(2 * omega * t_adjusted)
         vz = torch.zeros(n_envs, device=self.device)
         
         vel_des_new = torch.stack([vx, vy, vz], dim=1)
         
-        # Update desired states
-        self.pos_des[env_ids] = pos_des_new
-        self.vel_des[env_ids] = vel_des_new
+        # Only update environments that have passed warmup
+        # For envs still in warmup, keep their pos_des and vel_des unchanged
+        active_mask = ~in_warmup
+        self.pos_des[env_ids[active_mask]] = pos_des_new[active_mask]
+        self.vel_des[env_ids[active_mask]] = vel_des_new[active_mask]
         
         # Also update raw states for consistency
-        self.pos_des_raw[env_ids] = pos_des_new
-        self.vel_des_raw[env_ids] = vel_des_new
+        self.pos_des_raw[env_ids[active_mask]] = pos_des_new[active_mask]
+        self.vel_des_raw[env_ids[active_mask]] = vel_des_new[active_mask]
 
     def _calc_env_origins(self):
         # Generate group origins in a grid that ascends in rows and columns
@@ -1022,9 +1035,6 @@ class QuadcopterEnv(DirectRLEnv):
                 # 强制姿态水平 (Identity Quaternion: w=1, x=0, y=0, z=0)
                 quat = torch.zeros(num_resets, 4, device=self.device)
                 quat[:, 0] = 1.0 
-                
-                # Play 模式下不需要 perfect_start 标记，因为本身就是 perfect
-                is_perfect_start = torch.ones(num_resets, dtype=torch.bool, device=self.device)
 
             # --- 4. 设置仿真器状态 ---
             
