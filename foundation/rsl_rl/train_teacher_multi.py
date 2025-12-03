@@ -83,23 +83,16 @@ def run_training(teacher_id, dynamics, gpu_id=0):
     # 1. 准备惯量字符串
     inertia_str = f"[{dynamics['inertia'][0]:.10f},{dynamics['inertia'][1]:.10f},{dynamics['inertia'][2]:.10f}]"
 
-    # 2. 准备 Hydra Overrides (配置覆盖)
-    # 这些是 key=value 格式的参数
+    # 2. 准备 Hydra Overrides
     overrides = [
-        # --- 动力学参数 ---
         f"env.dynamics.mass={dynamics['mass']:.8f}",
         f"env.dynamics.arm_length={dynamics['arm_length']:.8f}",
         f"env.dynamics.inertia={inertia_str}",
         f"env.dynamics.thrust_to_weight={dynamics['thrust_to_weight']:.5f}",
         f"env.dynamics.motor_tau={dynamics['motor_tau']:.5f}",
         
-        # --- 训练日志/名称配置 ---
-        # 本地日志文件夹名
         f"agent.experiment_name=raptor_teachers",
-        # 具体的运行名称 (对应 WandB 的 Run Name)
         f"agent.run_name=teacher_{teacher_id:04d}",
-        
-        # --- [新增] 指定 USD 路径 ---
         'env.robot.spawn.usd_path="/home/nv/Foundation/USD/cf2x.usd"'
     ]
     
@@ -112,32 +105,31 @@ def run_training(teacher_id, dynamics, gpu_id=0):
             print(f"Error: Could not find {train_script}")
             return
 
-    # 4. 构建命令行参数 (CLI Flags)
-    # 这些是 --flag value 格式的参数
+    # 4. 构建命令行参数
     cmd = [
         sys.executable, train_script,
         "--task", "point_ctrl_single_dense",
-        "--num_envs", "1600",  # 你的原始命令是1600，这里用2048效率通常更高(2的幂次)，也可以改回1600
+        "--num_envs", "1600",
         "--max_iterations", "1000",
-        # "--headless",
+        # "--headless", # 如果需要 GUI 可以注释掉这行
         "--device", f"cuda:{gpu_id}",
-        
-        # --- [新增] WandB 配置 ---
         "--logger", "wandb",
         "--log_project_name", "Foundation"
-    ] + overrides  # 将 overrides 追加到列表末尾
+    ] + overrides
     
     # 5. 保存 CSV 记录
     save_params_to_csv(teacher_id, dynamics)
 
     print(f"==================================================")
     print(f"Starting training for Teacher {teacher_id} on GPU {gpu_id}")
-    print(f"Mass: {dynamics['mass']:.4f}, TWR: {dynamics['thrust_to_weight']:.2f}")
-    # print(f"CMD: {' '.join(cmd)}") # 调试用，可以取消注释查看完整命令
+    # [修改] 增加了 Arm Length 和 Motor Tau 的打印
+    print(f"Mass: {dynamics['mass']:.4f} kg")
+    print(f"Arm : {dynamics['arm_length']:.4f} m")
+    print(f"TWR : {dynamics['thrust_to_weight']:.2f}")
+    print(f"Tau : {dynamics['motor_tau']:.3f} s")
     print(f"==================================================")
     
     try:
-        # 启动子进程
         subprocess.run(cmd, check=True)
     except subprocess.CalledProcessError as e:
         print(f"!!! Error training Teacher {teacher_id} !!!")
