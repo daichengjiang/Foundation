@@ -89,6 +89,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # Force figure-8 trajectory for testing
     env_cfg.trajectory_type = "figure8"
     env_cfg.prob_null_trajectory = 0.0  # Disable null trajectory
+
+    env_cfg.train_or_play = False  # Set to Play mode
     
     # Enable debug visualization for trajectory tracking
     env_cfg.debug_vis = True
