@@ -323,6 +323,9 @@ class QuadcopterEnv(DirectRLEnv):
 
         self._last_angular_velocity= torch.zeros(self.num_envs, 3, device=self.device)
 
+        # 默认为 3.0，后续会在 reset 中更新
+        self._langevin_max_vel = torch.full((self.num_envs,), 3.0, device=self.device)
+
         # Episode tracking for trajectory following (no success criterion)
         self._history_window = 100
         self._episode_outcomes = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)  # For compatibility
@@ -448,14 +451,14 @@ class QuadcopterEnv(DirectRLEnv):
         v_next = v_prev + (-gamma * v_prev - omega * omega * x_prev_local) * dt + sigma * dW
         
         # ==================== [新增] 速度限幅 (Velocity Clamp) ====================
-        max_vel = 3.0  # 限制langevin轨迹最大速度
+        max_vel_limits = self._langevin_max_vel[env_ids].unsqueeze(1)
         
         # 计算当前速度模长 (N, 1)
         v_norm = torch.norm(v_next, dim=1, keepdim=True)
         
         # 如果模长 > max_vel，则缩放；否则保持原样 (使用 min(1.0, limit/norm))
         # 加上 1e-6 防止除以零
-        scale_factor = torch.clamp(max_vel / (v_norm + 1e-6), max=1.0)
+        scale_factor = torch.clamp(max_vel_limits / (v_norm + 1e-6), max=1.0)
         
         # 应用缩放，保持方向不变
         v_next = v_next * scale_factor
@@ -979,7 +982,7 @@ class QuadcopterEnv(DirectRLEnv):
             # 重置轨迹时间 (用于八字形轨迹)
             self._figure8_time[env_ids] = 0.0
 
-
+            self._langevin_max_vel[env_ids] = torch.rand(len(env_ids), device=self.device) * 2.0 + 1.0
             # --- 3. RAPTOR 初始化逻辑 ---
             
             # 定义物理参数
