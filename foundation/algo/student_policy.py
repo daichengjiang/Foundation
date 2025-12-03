@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 
 class RaptorStudent(nn.Module):
-    def __init__(self, num_inputs, num_actions, hidden_dim=16):
+    def __init__(self, num_inputs=22, num_actions=4, hidden_dim=16):
         super().__init__()
         # 论文结构: 
         # Input (26) -> Dense -> GRU (16) -> Dense -> Output (4)

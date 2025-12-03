@@ -26,7 +26,7 @@ class DistillRunner:
         
         # 3. 初始化 Student
         # Obs Dim = 26, Act Dim = 4
-        self.student = RaptorStudent(num_inputs=26, num_actions=4).to(device)
+        self.student = RaptorStudent(num_inputs=22, num_actions=4).to(device)
         self.optimizer = torch.optim.Adam(self.student.parameters(), lr=1e-3)
         
         # 4. 运行时变量
@@ -81,25 +81,29 @@ class DistillRunner:
 
     def learn(self, max_epochs=1000, steps_per_epoch=500):
         obs, _ = self.env.reset()
-        # 初始随机化
         self.randomize_envs(torch.arange(self.num_envs, device=self.device))
         
         for epoch in range(max_epochs):
             total_loss = 0
             
             for step in range(steps_per_epoch):
-                # 1. Student Forward
-                # GRU 需要处理 hidden state 的重置
-                # 如果是 step 0 或者是 reset 过的环境，hidden state 应该清零 (这里简化处理)
-                student_actions, self.hidden_state = self.student(obs, self.hidden_state)
-                # Detach hidden state to prevent backprop through time indefinitely
+                # 1. 准备输入数据
+                # Teacher (Oracle): 看到全状态 (26维: 含电机转速)
+                # Student (Deploy): 只能看到机载传感器数据 (22维: 不含电机转速)
+                
+                # 假设 obs 的最后 4 维是 motor_speeds
+                # obs shape: [Batch, 26]
+                student_obs = obs[:, :-4]  # [Batch, 22] <--- 关键切片操作
+                
+                # 2. Student Forward (用 22 维输入)
+                student_actions, self.hidden_state = self.student(student_obs, self.hidden_state)
                 self.hidden_state = self.hidden_state.detach()
                 
-                # 2. Teacher Forward (Oracle)
+                # 3. Teacher Forward (用 26 维输入)
                 with torch.no_grad():
                     teacher_actions = self.teachers(obs, self.current_teacher_indices)
                 
-                # 3. Loss Calculation (Imitation)
+                # 4. Loss Calculation
                 loss = F.mse_loss(student_actions, teacher_actions)
                 
                 # 4. Update Student

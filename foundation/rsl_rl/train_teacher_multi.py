@@ -4,86 +4,47 @@ import os
 import time
 import argparse
 import sys
+from datetime import datetime # [新增]
 
-# ... sample_raptor_dynamics 函数保持不变 ...
+# ... sample_raptor_dynamics 函数保持不变 (请保留你原来的代码) ...
 def sample_raptor_dynamics():
-    """
-    Strict implementation based on RAPTOR Supplementary Materials S5-S26
-    """
-    # 1. 采样推重比 (S5: Uniform 1.5 - 5)
+    # ... (这里不用变) ...
+    # 为了完整性，请确保这里是你之前修正过的包含正确惯量计算的版本
     twr = np.random.uniform(1.5, 5.0)
-    
-    # 2. 采样质量 (S6, S7: Cubic distribution 0.02 - 5.0)
     m_min = 0.02
     m_max = 5.0
     s = np.random.uniform(np.cbrt(m_min), np.cbrt(m_max))
     mass = s ** 3
     
-    # 3. 采样臂长 (S13 - S18)
-    # 论文提到 Crazyflie 的质量-尺寸比约为 7.90 (S13)，但实际分布均值约为 7.24
-    # 这里我们直接复用你原本的逻辑，因为你基于 0.032/0.04384 算出的比率正好对应 7.24，符合论文"实际情况"
-    m_cf = 0.032
-    l_cf = 0.04384
+    m_cf = 0.032 
+    l_cf = 0.04384 
     base_ratio = l_cf / (m_cf**(1/3)) 
-    
-    # 论文 S15-S18 使用正态分布扰动
-    # u ~ N(-0.1, 0.1) -> s_ms
-    u = np.random.normal(0.0, 0.1) # 注意这里用 Normal
-    # 限制范围防止极端值 (论文隐含)
+    u = np.random.normal(0.0, 0.1) 
     u = np.clip(u, -0.3, 0.3) 
-    
-    if u < 0:
-        s_ms = 1.0 / (1.0 - u)
-    else:
-        s_ms = 1.0 + u
-        
-    # 计算臂长: l_arm = mass^(1/3) * base_ratio / s_ms (逻辑上类似)
-    # 这里简化为你原本的乘法逻辑，但引入 s_ms 的分布特性
-    size_variation = s_ms # 使用论文的分布逻辑
+    if u < 0: s_ms = 1.0 / (1.0 - u)
+    else: s_ms = 1.0 + u
+    size_variation = s_ms 
     arm_length = base_ratio * (mass**(1/3)) * size_variation
     
-    # 4. 采样转矩惯量比 (S19: Uniform 40 - 1200)
     r_t2i = np.random.uniform(40, 1200)
-    
-    # 5. 计算惯量 (Strictly following S20-S22)
-    # S10: Total Thrust T = twr * 9.81 * m
     total_thrust = twr * 9.81 * mass
-    
-    # S20: Tau = T * sqrt(2) * l_arm  (注: 论文这里的 T 指总推力产生的最大力矩势能)
-    # 解释: 单电机最大推力 T/4。力臂 l_arm。对角线电机产生力矩。
-    # 论文公式直接给出了 tau 与 T_total 的关系，我们照搬公式
     tau = total_thrust * np.sqrt(2) * arm_length
-    
-    # S21: Jxx = Jyy = tau / r_t2i
     Ixx = tau / r_t2i
-    Iyy = Ixx
+    Iyy = Ixx 
+    Izz = Ixx * 1.832 
     
-    # S22: Jzz = (Jxx + Jyy)/2 * 1.832 -> Jxx * 1.832
-    Izz = Ixx * 1.832
-    
-    # 6. 电机时间常数 (Mapping delays to Tau)
-    # 论文 S25: 上升延迟 0.03-0.1, S26: 下降延迟 0.03-0.3
-    # 我们用一阶低通滤波 Tau 来近似这个延迟。
-    # 为了涵盖论文的恶劣情况，我们采样范围设为 0.02 到 0.15
-    # (平均值 0.085 对应约 80ms 的响应时间，比原来的 0.05 更"慢")
     motor_tau = np.random.uniform(0.02, 0.12)
-    
     return {
-        "mass": mass,
-        "arm_length": arm_length,
-        "inertia": (Ixx, Iyy, Izz),
-        "thrust_to_weight": twr,
-        "motor_tau": motor_tau
+        "mass": mass, "arm_length": arm_length, "inertia": (Ixx, Iyy, Izz),
+        "thrust_to_weight": twr, "motor_tau": motor_tau
     }
 
-def run_training(teacher_id, dynamics, gpu_id=0):
+def run_training(teacher_id, dynamics, timestamp, gpu_id=0):
     """
-    调用 train.py 并传入参数 (包含 WandB 和 USD 路径)
+    调用 train.py 并传入参数
     """
-    # 1. 准备惯量字符串
     inertia_str = f"[{dynamics['inertia'][0]:.10f},{dynamics['inertia'][1]:.10f},{dynamics['inertia'][2]:.10f}]"
 
-    # 2. 准备 Hydra Overrides
     overrides = [
         f"env.dynamics.mass={dynamics['mass']:.8f}",
         f"env.dynamics.arm_length={dynamics['arm_length']:.8f}",
@@ -96,7 +57,6 @@ def run_training(teacher_id, dynamics, gpu_id=0):
         'env.robot.spawn.usd_path="/home/nv/Foundation/USD/cf2x.usd"'
     ]
     
-    # 3. 检查脚本路径
     train_script = "foundation/rsl_rl/train.py"
     if not os.path.exists(train_script):
         if os.path.exists(os.path.join(os.getcwd(), train_script)):
@@ -105,28 +65,23 @@ def run_training(teacher_id, dynamics, gpu_id=0):
             print(f"Error: Could not find {train_script}")
             return
 
-    # 4. 构建命令行参数
     cmd = [
         sys.executable, train_script,
         "--task", "point_ctrl_single_dense",
         "--num_envs", "1600",
         "--max_iterations", "1000",
-        # "--headless", # 如果需要 GUI 可以注释掉这行
         "--device", f"cuda:{gpu_id}",
         "--logger", "wandb",
-        "--log_project_name", "Foundation"
+        "--log_project_name", "Foundation",
+        "--log_timestamp", timestamp 
     ] + overrides
     
-    # 5. 保存 CSV 记录
     save_params_to_csv(teacher_id, dynamics)
 
     print(f"==================================================")
-    print(f"Starting training for Teacher {teacher_id} on GPU {gpu_id}")
-    # [修改] 增加了 Arm Length 和 Motor Tau 的打印
-    print(f"Mass: {dynamics['mass']:.4f} kg")
-    print(f"Arm : {dynamics['arm_length']:.4f} m")
-    print(f"TWR : {dynamics['thrust_to_weight']:.2f}")
-    print(f"Tau : {dynamics['motor_tau']:.3f} s")
+    print(f"Starting Teacher {teacher_id} | GPU {gpu_id} | Dir: {timestamp}/teacher_{teacher_id:04d}")
+    print(f"Mass: {dynamics['mass']:.4f} kg | Arm: {dynamics['arm_length']:.4f} m")  # [已修复] 加回了 Arm
+    print(f"TWR : {dynamics['thrust_to_weight']:.2f}    | Tau: {dynamics['motor_tau']:.3f} s")   # [已修复] 加回了 Tau
     print(f"==================================================")
     
     try:
@@ -150,24 +105,33 @@ if __name__ == "__main__":
     parser.add_argument("--start_id", type=int, default=0)
     parser.add_argument("--num_teachers", type=int, default=1)
     parser.add_argument("--gpu_id", type=int, default=0)
+    # [可选] 允许手动传入时间戳，方便断点续训时保持目录一致
+    parser.add_argument("--timestamp", type=str, default=None) 
     args = parser.parse_args()
 
-    # === [新增逻辑] 自动清理旧文件 ===
-    # 只有当你是从第 0 号开始训练时，才视为"新的一轮"，删除旧表
+    # 1. 确定本次运行的统一时间戳
+    if args.timestamp:
+        batch_timestamp = args.timestamp
+    else:
+        batch_timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
+    # 2. 自动清理 (仅当 start_id=0 且没有手动指定时间戳时，视为全新训练)
     csv_filename = "teacher_dynamics.csv"
-    if args.start_id == 0:
+    if args.start_id == 0 and args.timestamp is None:
         if os.path.exists(csv_filename):
-            print(f"[Auto-Clean] Detected start_id=0. Removing existing '{csv_filename}' to start fresh.")
+            print(f"[Auto-Clean] Removing existing '{csv_filename}' to start fresh.")
             try:
                 os.remove(csv_filename)
             except OSError as e:
                 print(f"Warning: Could not remove file: {e}")
-        else:
-            print(f"[Auto-Clean] No existing '{csv_filename}' found. Creating new one.")
 
+    print(f"Batch Timestamp: {batch_timestamp}")
+
+    # 3. 循环训练
     for i in range(args.start_id, args.start_id + args.num_teachers):
         dyn_params = sample_raptor_dynamics()
-        run_training(i, dyn_params, gpu_id=args.gpu_id)
+        # 将时间戳传进去
+        run_training(i, dyn_params, timestamp=batch_timestamp, gpu_id=args.gpu_id)
         
-        # 可选：给一点冷却时间，确保显存完全释放
-        time.sleep(10)
+        # 冷却
+        time.sleep(2)
