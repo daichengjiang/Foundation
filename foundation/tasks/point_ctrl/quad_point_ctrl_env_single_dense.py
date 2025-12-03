@@ -859,7 +859,11 @@ class QuadcopterEnv(DirectRLEnv):
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Define terminations and timeouts."""
-        time_out = self.episode_length_buf >= self.max_episode_length - 1
+        if self.cfg.train_or_play:
+            time_out = self.episode_length_buf >= self.max_episode_length - 1
+        else:
+            # Disable timeouts: always false
+            time_out = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         
         self.CHECK_state()
 
