@@ -30,9 +30,9 @@ parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
 
 # Distillation hyperparameters
-parser.add_argument("--n_epochs", type=int, default=100, help="Number of training epochs")
-parser.add_argument("--num_episodes", type=int, default=100, help="Episodes per epoch for data collection")
-parser.add_argument("--batch_size", type=int, default=256, help="Batch size for training")
+parser.add_argument("--n_epochs", type=int, default=500, help="Number of training epochs")
+parser.add_argument("--num_episodes", type=int, default=10, help="Episodes per epoch for data collection")
+parser.add_argument("--batch_size", type=int, default=64, help="Batch size for training")
 parser.add_argument("--sequence_length", type=int, default=1, help="Sequence length for RNN (1 for MLP)")
 parser.add_argument("--learning_rate", type=float, default=1e-4, help="Learning rate")
 parser.add_argument("--epoch_teacher_forcing", type=int, default=50, help="Epochs to use teacher only")
@@ -156,41 +156,135 @@ class TeacherPolicyWrapper:
 
 
 class StudentPolicy(nn.Module):
-    """Student policy network (MLP architecture)."""
+    """Student policy network with GRU (matching C++ implementation).
     
-    def __init__(self, num_obs: int, num_actions: int, hidden_dims: list = [256, 256, 256], 
-                 activation: str = "elu"):
+    Architecture (from C++ config.h):
+    - INPUT_LAYER: Dense(obs_dim -> hidden_dim=16) + ReLU
+    - GRU: GRU(hidden_dim=16)
+    - OUTPUT_LAYER: Dense(hidden_dim=16 -> action_dim) + Identity
+    
+    Note: Student uses reduced observation (22D) without motor_speeds (last 4D),
+          while teacher uses full observation (26D).
+    """
+    
+    def __init__(self, num_obs: int, num_actions: int, hidden_dim: int = 16, 
+                 activation: str = "relu", obs_slice: tuple = None):
         super().__init__()
         
         self.num_obs = num_obs
         self.num_actions = num_actions
+        self.hidden_dim = hidden_dim
+        self.is_recurrent = True
+        self.obs_slice = obs_slice  # (start_idx, end_idx) to slice observations
         
-        # Build network
-        layers = []
-        in_dim = num_obs
+        # INPUT_LAYER: Dense + Activation
+        self.input_layer = nn.Linear(num_obs, hidden_dim)
+        if activation == "relu":
+            self.activation = nn.ReLU()
+        elif activation == "elu":
+            self.activation = nn.ELU()
+        else:
+            self.activation = nn.ReLU()
         
-        activation_fn = nn.ELU() if activation == "elu" else nn.ReLU()
+        # GRU layer
+        self.gru = nn.GRU(
+            input_size=hidden_dim,
+            hidden_size=hidden_dim,
+            num_layers=1,
+            batch_first=False  # (seq_len, batch, features)
+        )
         
-        for h_dim in hidden_dims:
-            layers.append(nn.Linear(in_dim, h_dim))
-            layers.append(activation_fn)
-            in_dim = h_dim
+        # OUTPUT_LAYER: Dense (no activation, identity)
+        self.output_layer = nn.Linear(hidden_dim, num_actions)
         
-        layers.append(nn.Linear(in_dim, num_actions))
+        # Hidden states for recurrent processing
+        self.hidden_states = None
         
-        self.network = nn.Sequential(*layers)
-        
-        # Initialize weights
+        # Initialize weights (matching rl-tools default initialization)
         self.apply(self._init_weights)
     
     def _init_weights(self, module):
+        """Initialize weights similar to rl-tools DefaultInitializer."""
         if isinstance(module, nn.Linear):
+            # Use orthogonal initialization for linear layers
             nn.init.orthogonal_(module.weight, gain=1.0)
             if module.bias is not None:
                 nn.init.constant_(module.bias, 0.0)
+        elif isinstance(module, nn.GRU):
+            # Initialize GRU weights
+            for name, param in module.named_parameters():
+                if 'weight_ih' in name:
+                    nn.init.xavier_uniform_(param)
+                elif 'weight_hh' in name:
+                    nn.init.orthogonal_(param)
+                elif 'bias' in name:
+                    nn.init.constant_(param, 0.0)
     
-    def forward(self, obs):
-        return self.network(obs)
+    def reset(self, batch_size: int = None, device: str = None):
+        """Reset hidden states."""
+        if batch_size is not None:
+            device = device or next(self.parameters()).device
+            self.hidden_states = torch.zeros(1, batch_size, self.hidden_dim, device=device)
+        else:
+            self.hidden_states = None
+    
+    def forward(self, obs, hidden_states=None):
+        """Forward pass.
+        
+        Args:
+            obs: Observations, shape (seq_len, batch, obs_dim) or (batch, obs_dim)
+            hidden_states: GRU hidden states, shape (1, batch, hidden_dim)
+        
+        Returns:
+            actions: Output actions, shape (seq_len, batch, action_dim) or (batch, action_dim)
+            hidden_states: Updated hidden states
+        """
+        # Apply observation slicing if configured
+        if self.obs_slice is not None:
+            start_idx, end_idx = self.obs_slice
+            obs = obs[..., start_idx:end_idx]
+        
+        # Handle both (batch, obs_dim) and (seq_len, batch, obs_dim) inputs
+        input_is_2d = obs.dim() == 2
+        if input_is_2d:
+            # Add sequence dimension: (batch, obs_dim) -> (1, batch, obs_dim)
+            obs = obs.unsqueeze(0)
+        
+        # INPUT_LAYER: obs -> hidden with activation
+        # Shape: (seq_len, batch, obs_dim) -> (seq_len, batch, hidden_dim)
+        x = self.input_layer(obs)
+        x = self.activation(x)
+        
+        # GRU: process sequence
+        # x: (seq_len, batch, hidden_dim)
+        # hidden_states: (1, batch, hidden_dim) or None
+        if hidden_states is None:
+            hidden_states = self.hidden_states
+        
+        x, new_hidden_states = self.gru(x, hidden_states)
+        
+        # OUTPUT_LAYER: hidden -> actions (no activation)
+        # Shape: (seq_len, batch, hidden_dim) -> (seq_len, batch, action_dim)
+        actions = self.output_layer(x)
+        
+        # Remove sequence dimension if input was 2D
+        if input_is_2d:
+            actions = actions.squeeze(0)
+        
+        # Update internal hidden states
+        self.hidden_states = new_hidden_states.detach()
+        
+        return actions
+    
+    def act(self, obs, hidden_states=None):
+        """Get actions from observations (inference mode)."""
+        with torch.no_grad():
+            return self.forward(obs, hidden_states)
+    
+    def detach_hidden_states(self):
+        """Detach hidden states from computation graph."""
+        if self.hidden_states is not None:
+            self.hidden_states = self.hidden_states.detach()
 
 
 class DistillationDataset:
@@ -234,7 +328,11 @@ class DistillationDataset:
         self.num_episodes = 0
     
     def get_batches(self, batch_size: int, sequence_length: int, shuffle: bool = True):
-        """Generate batches for training."""
+        """Generate batches for training with sequence support.
+        
+        For RNN training, generates batches of shape (sequence_length, batch_size, feature_dim).
+        For MLP training (sequence_length=1), generates batches of shape (batch_size, feature_dim).
+        """
         if self.num_episodes == 0:
             return
         
@@ -244,42 +342,98 @@ class DistillationDataset:
         if shuffle:
             episode_indices = episode_indices[torch.randperm(self.num_episodes)]
         
-        # Generate batches
-        batch_obs = []
-        batch_actions = []
-        
-        for ep_idx in episode_indices:
-            start_idx = self.episode_starts[ep_idx].item()
-            
-            # Find episode end
-            if ep_idx + 1 < self.num_episodes:
-                end_idx = self.episode_starts[ep_idx + 1].item()
-            else:
-                end_idx = self.size
-            
-            # Add samples from this episode
-            for i in range(start_idx, end_idx):
-                batch_obs.append(self.observations[i])
-                batch_actions.append(self.actions[i])
+        if sequence_length > 1:
+            # RNN mode: generate sequences
+            for ep_idx in episode_indices:
+                start_idx = self.episode_starts[ep_idx].item()
                 
-                if len(batch_obs) == batch_size:
-                    yield (
-                        torch.stack(batch_obs),
-                        torch.stack(batch_actions)
-                    )
-                    batch_obs = []
-                    batch_actions = []
-        
-        # Yield remaining samples
-        if len(batch_obs) > 0:
-            yield (
-                torch.stack(batch_obs),
-                torch.stack(batch_actions)
-            )
+                # Find episode end
+                if ep_idx + 1 < self.num_episodes:
+                    end_idx = self.episode_starts[ep_idx + 1].item()
+                else:
+                    end_idx = self.size
+                
+                episode_len = end_idx - start_idx
+                
+                # Split episode into sequences
+                num_sequences = max(1, episode_len // sequence_length)
+                
+                for seq_i in range(num_sequences):
+                    seq_start = start_idx + seq_i * sequence_length
+                    seq_end = min(seq_start + sequence_length, end_idx)
+                    actual_seq_len = seq_end - seq_start
+                    
+                    if actual_seq_len > 0:
+                        # Collect sequences until batch is full
+                        seq_obs = self.observations[seq_start:seq_end]
+                        seq_actions = self.actions[seq_start:seq_end]
+                        
+                        # Pad if needed
+                        if actual_seq_len < sequence_length:
+                            pad_len = sequence_length - actual_seq_len
+                            seq_obs = torch.cat([seq_obs, torch.zeros(pad_len, seq_obs.shape[1], device=self.device)])
+                            seq_actions = torch.cat([seq_actions, torch.zeros(pad_len, seq_actions.shape[1], device=self.device)])
+                        
+                        # Yield as (seq_len, 1, feature_dim) for single batch element
+                        # In practice, we'll accumulate these to form proper batches
+                        yield (
+                            seq_obs.unsqueeze(1),  # (seq_len, 1, obs_dim)
+                            seq_actions.unsqueeze(1)  # (seq_len, 1, action_dim)
+                        )
+        else:
+            # MLP mode: generate flat batches (original behavior)
+            batch_obs = []
+            batch_actions = []
+            
+            for ep_idx in episode_indices:
+                start_idx = self.episode_starts[ep_idx].item()
+                
+                # Find episode end
+                if ep_idx + 1 < self.num_episodes:
+                    end_idx = self.episode_starts[ep_idx + 1].item()
+                else:
+                    end_idx = self.size
+                
+                # Add samples from this episode
+                for i in range(start_idx, end_idx):
+                    batch_obs.append(self.observations[i])
+                    batch_actions.append(self.actions[i])
+                    
+                    if len(batch_obs) == batch_size:
+                        yield (
+                            torch.stack(batch_obs),
+                            torch.stack(batch_actions)
+                        )
+                        batch_obs = []
+                        batch_actions = []
+            
+            # Yield remaining samples
+            if len(batch_obs) > 0:
+                yield (
+                    torch.stack(batch_obs),
+                    torch.stack(batch_actions)
+                )
 
 
-def collect_episodes(env, policy, num_episodes: int, deterministic: bool = True):
-    """Collect episodes using a policy."""
+def collect_episodes(env, policy, num_episodes: int, deterministic: bool = True, 
+                    teacher_policy=None, student_obs_slice=None):
+    """Collect episodes using a policy.
+    
+    Supports both MLP and RNN policies. For RNN policies, resets hidden states at episode start.
+    
+    Args:
+        env: The environment
+        policy: The policy to use for action selection
+        num_episodes: Number of episodes to collect
+        deterministic: Whether to use deterministic actions
+        teacher_policy: Optional teacher policy to generate actions (for behavioral cloning)
+        student_obs_slice: Optional (start_idx, end_idx) to slice observations for student
+    
+    Returns:
+        all_observations: List of observation tensors (one per episode)
+        all_actions: List of action tensors (one per episode)
+        all_returns: List of episode returns
+    """
     all_observations = []
     all_actions = []
     all_returns = []
@@ -288,29 +442,39 @@ def collect_episodes(env, policy, num_episodes: int, deterministic: bool = True)
     
     # Reset environment
     obs, _ = env.reset()
+    batch_size = obs.shape[0]
+    
+    # Reset hidden states for RNN policies
+    if isinstance(policy, StudentPolicy) and policy.is_recurrent:
+        policy.reset(batch_size=batch_size, device=obs.device)
+    
     episode_obs = []
     episode_actions = []
     episode_reward = 0.0
     
     while episodes_collected < num_episodes:
-        # Get action from policy
-        action = policy.act(obs, deterministic=deterministic)
+        # Get action from policy (or teacher if provided)
+        if teacher_policy is not None:
+            # Use teacher to generate actions, but still collect full observations
+            action = teacher_policy.act(obs, deterministic=deterministic)
+        elif isinstance(policy, StudentPolicy):
+            action = policy.act(obs)
+        else:
+            action = policy.act(obs, deterministic=deterministic)
         
-        # Store transition
+        # Store transition (always store full observation from environment)
         episode_obs.append(obs.clone())
         episode_actions.append(action.clone())
         
         # Step environment
-        obs, reward, terminated, truncated, info = env.step(action)
-        episode_reward += reward.mean().item()
-        
-        # Check for episode end
-        done = terminated | truncated
-        
-        if done.any():
+        obs, rewards, dones, infos = env.step(action)
+        episode_reward += rewards.mean().item()
+
+
+        if dones.any():
             # Store complete episodes
-            for env_idx in range(len(done)):
-                if done[env_idx]:
+            for env_idx in range(len(dones)):
+                if dones[env_idx]:
                     all_observations.append(torch.stack([o[env_idx] for o in episode_obs]))
                     all_actions.append(torch.stack([a[env_idx] for a in episode_actions]))
                     all_returns.append(episode_reward / len(episode_obs))
@@ -320,21 +484,35 @@ def collect_episodes(env, policy, num_episodes: int, deterministic: bool = True)
                     if episodes_collected >= num_episodes:
                         break
             
-            # Reset episode buffers
+            # Reset episode buffers and hidden states
             episode_obs = []
             episode_actions = []
             episode_reward = 0.0
+            
+            # Reset hidden states for completed episodes (RNN)
+            if isinstance(policy, StudentPolicy) and policy.is_recurrent:
+                # For simplicity, reset all hidden states when any episode ends
+                policy.reset(batch_size=batch_size, device=obs.device)
     
     return all_observations, all_actions, all_returns
 
 
 def evaluate_policy(env, policy, num_episodes: int = 10):
-    """Evaluate a policy and return mean return."""
+    """Evaluate a policy and return mean return.
+    
+    Supports both MLP and RNN policies.
+    """
     returns = []
     episode_lengths = []
     
     for _ in range(num_episodes):
         obs, _ = env.reset()
+        batch_size = obs.shape[0]
+        
+        # Reset hidden states for RNN policies
+        if isinstance(policy, StudentPolicy) and policy.is_recurrent:
+            policy.reset(batch_size=batch_size, device=obs.device)
+        
         episode_reward = 0.0
         episode_length = 0
         done = False
@@ -342,14 +520,17 @@ def evaluate_policy(env, policy, num_episodes: int = 10):
         while not done:
             with torch.no_grad():
                 if isinstance(policy, StudentPolicy):
-                    action = policy(obs)
+                    action = policy.act(obs)
                 else:
                     action = policy.act(obs, deterministic=True)
+
+            obs, rewards, dones, infos = env.step(action)
             
-            obs, reward, terminated, truncated, _ = env.step(action)
-            episode_reward += reward.mean().item()
+            # rewards is a 1D tensor, use mean() for overall reward tracking
+            episode_reward += rewards.mean().item()
             episode_length += 1
-            done = (terminated | truncated).all()
+            # dones is the combined signal (terminated | truncated)
+            done = dones.all()
         
         returns.append(episode_reward / episode_length)
         episode_lengths.append(episode_length)
@@ -411,18 +592,27 @@ def train_distillation(
     
     # Get observation and action dimensions
     obs, _ = env.get_observations()
-    num_obs = obs.shape[1]
+    num_obs_teacher = obs.shape[1]  # Full observation for teacher (26D)
     num_actions = env.num_actions
     
-    print(f"[INFO] Observation dim: {num_obs}, Action dim: {num_actions}")
+    # Student uses reduced observation (without last 4D motor_speeds)
+    num_obs_student = num_obs_teacher - 4  # 22D = 26D - 4D
+    student_obs_slice = (0, num_obs_student)  # Slice first 22 dimensions
+    
+    print(f"[INFO] Teacher observation dim: {num_obs_teacher}, Student observation dim: {num_obs_student}, Action dim: {num_actions}")
     
     # Load teacher policy
     print(f"[INFO] Loading teacher policy from: {args_cli.teacher_checkpoint}")
     teacher = TeacherPolicyWrapper(args_cli.teacher_checkpoint, agent_cfg.device)
     
-    # Create student policy
-    print("[INFO] Creating student policy")
-    student = StudentPolicy(num_obs, num_actions).to(agent_cfg.device)
+    # Verify teacher observation dimension
+    if teacher.num_obs != num_obs_teacher:
+        print(f"[WARNING] Teacher checkpoint expects {teacher.num_obs}D observations, "
+              f"but environment provides {num_obs_teacher}D. This may cause issues.")
+    
+    # Create student policy with reduced observation dimension
+    print("[INFO] Creating student policy with reduced observation (no motor speeds)")
+    student = StudentPolicy(num_obs_student, num_actions, obs_slice=student_obs_slice).to(agent_cfg.device)
     
     # Setup optimizer
     optimizer = optim.Adam(student.parameters(), lr=args_cli.learning_rate)
@@ -447,8 +637,8 @@ def train_distillation(
     print(f"[INFO] Dataset size: {dataset_size} samples")
     print(f"[INFO] Episode length: {episode_length}")
     
-    # Create dataset
-    dataset = DistillationDataset(dataset_size, num_obs, num_actions, agent_cfg.device)
+    # Create dataset (stores teacher's full observations)
+    dataset = DistillationDataset(dataset_size, num_obs_teacher, num_actions, agent_cfg.device)
     
     # Training loop
     best_return = float('-inf')
@@ -465,16 +655,19 @@ def train_distillation(
         
         # Collect data
         if epoch < args_cli.epoch_teacher_forcing:
-            # Use teacher to collect data
+            # Use teacher to collect data (always use teacher for action generation)
             print(f"[INFO] Collecting {args_cli.num_episodes} episodes using teacher...")
-            policy_for_collection = teacher
+            policy_for_collection = student  # Use student's forward for collection loop
+            teacher_for_actions = teacher    # But use teacher for generating actions
         else:
             # Use student to collect data
             print(f"[INFO] Collecting {args_cli.num_episodes} episodes using student...")
             policy_for_collection = student
+            teacher_for_actions = None
         
         episode_obs_list, episode_actions_list, episode_returns = collect_episodes(
-            env, policy_for_collection, args_cli.num_episodes, args_cli.teacher_deterministic
+            env, policy_for_collection, args_cli.num_episodes, args_cli.teacher_deterministic,
+            teacher_policy=teacher_for_actions, student_obs_slice=student_obs_slice
         )
         
         # Add to dataset
@@ -493,13 +686,22 @@ def train_distillation(
         print(f"[INFO] Training on {dataset.size} samples...")
         student.train()
         
+        # Reset hidden states before training
+        if student.is_recurrent:
+            student.reset()
+        
         total_loss = 0.0
         num_batches = 0
         
         for batch_obs, batch_actions in dataset.get_batches(
             args_cli.batch_size, args_cli.sequence_length, args_cli.shuffle
         ):
-            # Forward pass
+            # Reset hidden states at the start of each batch (for RNN)
+            if student.is_recurrent:
+                batch_size_actual = batch_obs.shape[1] if batch_obs.dim() == 3 else batch_obs.shape[0]
+                student.reset(batch_size=batch_size_actual, device=batch_obs.device)
+            
+            # Forward pass (student will slice observations internally using obs_slice)
             predicted_actions = student(batch_obs)
             
             # Compute loss (MSE)
@@ -514,6 +716,10 @@ def train_distillation(
             
             optimizer.step()
             
+            # Detach hidden states for next iteration (RNN)
+            if student.is_recurrent:
+                student.detach_hidden_states()
+
             total_loss += loss.item()
             num_batches += 1
         

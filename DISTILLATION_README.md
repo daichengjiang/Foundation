@@ -13,6 +13,24 @@
 
 ## 主要特性
 
+### 网络架构（与 C++ 完全一致）
+
+**学生策略网络结构**（来自 `config.h`）：
+
+```
+INPUT_LAYER:  Dense(obs_dim -> hidden_dim=16) + ReLU
+GRU:          GRU(hidden_dim=16)  
+OUTPUT_LAYER: Dense(hidden_dim=16 -> action_dim) + Identity
+```
+
+这是一个 **循环神经网络（RNN）** 架构，使用 GRU 来处理序列信息，与 C++ rl-tools 实现完全匹配。
+
+**关键参数**：
+- `hidden_dim`: 16 (与 C++ 的 `HIDDEN_DIM` 一致)
+- 激活函数: ReLU (与 C++ 的 `RELU` 一致)
+- 序列长度: 500 (与 C++ 的 `SEQUENCE_LENGTH` 一致)
+- 批量大小: 64 (与 C++ 的 `BATCH_SIZE` 一致)
+
 ### 与 train.py 一致的环境管理
 
 脚本现在完全遵循 `train.py` 的环境创建和管理方式：
@@ -27,14 +45,20 @@
 
 ### 与 C++ 实现的对应关系
 
-| C++ 功能 | Python 实现 | 说明 |
+| C++ 代码 | Python 实现 | 说明 |
 |---------|------------|------|
 | `ACTOR_TEACHER` | `TeacherPolicyWrapper` | 教师策略加载和推理 |
-| `ACTOR` | `StudentPolicy` | 学生策略网络 |
+| `ACTOR` | `StudentPolicy` (GRU) | 学生策略网络（RNN架构） |
+| `INPUT_LAYER` | `student.input_layer` + ReLU | Dense + 激活层 |
+| `GRU` | `student.gru` | GRU 循环层 |
+| `OUTPUT_LAYER` | `student.output_layer` | 输出层（无激活） |
 | `dataset_*` tensors | `DistillationDataset` | 数据集管理 |
 | `gather_epoch` | `collect_episodes` | 数据收集 |
+| `SEQUENCE_LENGTH=500` | `--sequence_length 500` | 序列长度 |
+| `BATCH_SIZE=64` | `--batch_size 64` | 批量大小 |
+| `HIDDEN_DIM=16` | `StudentPolicy(hidden_dim=16)` | 隐藏层维度 |
 | `rlt::nn::loss_functions::mse` | `nn.functional.mse_loss` | MSE 损失函数 |
-| `EPOCH_TEACHER_FORCING` | `--epoch_teacher_forcing` | 教师强制学习的轮数 |
+| `EPOCH_TEACHER_FORCING=10` | `--epoch_teacher_forcing 10` | 教师强制学习的轮数 |
 
 ### 新增功能（相比初始版本）
 
@@ -47,9 +71,10 @@
 ### 简化的设计
 
 为简化实现，这个版本：
-- **单教师**: 只支持一个教师策略（C++ 版本支持多个）
-- **MLP架构**: 使用简单的多层感知机（未来可扩展到 RNN）
-- **批量训练**: 使用标准的批量梯度下降
+- **单教师**: 只支持一个教师策略（C++ 版本支持多个，`NUM_TEACHERS=1000`）
+- **GRU架构**: 使用 GRU 实现循环神经网络（与 C++ 一致）
+- **序列化训练**: 支持长序列训练（`sequence_length=500`）
+- **完整的RNN支持**: 包括隐藏状态管理和重置
 
 ## 使用方法
 
@@ -88,25 +113,28 @@ python foundation/rsl_rl/distillation.py \
 
 #### 蒸馏超参数
 
-- `--n_epochs`: 训练轮数（默认：100）
-- `--num_episodes`: 每轮收集的episodes数量（默认：100）
-- `--batch_size`: 训练批量大小（默认：256）
-- `--sequence_length`: 序列长度，用于RNN（默认：1，MLP不需要）
-- `--learning_rate`: 学习率（默认：1e-4）
-- `--epoch_teacher_forcing`: 仅使用教师收集数据的轮数（默认：50）
-- `--shuffle`: 是否打乱episodes顺序（默认：True）
-- `--on_policy`: 是否使用on-policy数据收集（默认：False）
-- `--teacher_deterministic`: 教师策略是否使用确定性动作（默认：True）
+- `--n_epochs`: 训练轮数（默认：100）（C++中为 `N_EPOCH=1000`）
+- `--num_episodes`: 每轮收集的episodes数量（默认：100）（C++中为 `NUM_EPISODES=10`）
+- `--batch_size`: 训练批量大小（默认：256）（**建议使用64以匹配C++**）
+- `--sequence_length`: 序列长度（默认：1）（**建议使用500以匹配C++的RNN训练**）
+- `--learning_rate`: 学习率（默认：1e-4）（C++中为 `ALPHA=0.0001`）
+- `--epoch_teacher_forcing`: 仅使用教师收集数据的轮数（默认：50）（C++中为 `EPOCH_TEACHER_FORCING=10`）
+- `--shuffle`: 是否打乱episodes顺序（默认：True）（C++中为 `SHUFFLE=true`）
+- `--on_policy`: 是否使用on-policy数据收集（默认：False）（C++中为 `ON_POLICY=true`）
+- `--teacher_deterministic`: 教师策略是否使用确定性动作（默认：True）（C++中为 `TEACHER_DETERMINISTIC=true`）
 
 ### 完整示例
 
 ```bash
-# 基础蒸馏（使用 Hydra 配置）
+# 基础蒸馏（使用 Hydra 配置，匹配 C++ 参数）
 python foundation/rsl_rl/distillation.py \
     --task Isaac-Quadcopter-Point-Ctrl-v0 \
     --teacher_checkpoint logs/rsl_rl/experiment_name/model_5000.pt \
     --num_envs 1024 \
-    --seed 123
+    --seed 123 \
+    --batch_size 64 \
+    --sequence_length 500 \
+    --epoch_teacher_forcing 10
 
 # 带视频录制的蒸馏
 python foundation/rsl_rl/distillation.py \
@@ -114,18 +142,21 @@ python foundation/rsl_rl/distillation.py \
     --teacher_checkpoint teacher.pt \
     --video \
     --video_interval 1000 \
-    --num_envs 512
+    --num_envs 512 \
+    --batch_size 64 \
+    --sequence_length 500
 
-# 高级配置 - On-policy 蒸馏
+# 高级配置 - On-policy 蒸馏（完全匹配 C++）
 python foundation/rsl_rl/distillation.py \
     --task Isaac-Quadcopter-Point-Ctrl-v0 \
     --teacher_checkpoint teacher.pt \
     --num_envs 1024 \
-    --n_epochs 200 \
-    --num_episodes 200 \
-    --batch_size 512 \
-    --learning_rate 5e-5 \
-    --epoch_teacher_forcing 100 \
+    --n_epochs 1000 \
+    --num_episodes 10 \
+    --batch_size 64 \
+    --sequence_length 500 \
+    --learning_rate 1e-4 \
+    --epoch_teacher_forcing 10 \
     --on_policy \
     --device cuda:0
 ```
@@ -143,6 +174,35 @@ python foundation/rsl_rl/distillation.py \
 ```
 
 ## 训练流程
+
+### 网络架构说明
+
+**为什么使用 GRU（循环神经网络）？**
+
+C++ 实现使用 GRU 而不是简单的 MLP，原因如下：
+
+1. **时序信息**: 无人机控制需要考虑历史信息和动态变化
+2. **序列建模**: GRU 可以捕获动作序列的依赖关系
+3. **更好的泛化**: 对于复杂的轨迹跟踪任务，RNN 通常优于 MLP
+
+**关键设计选择**：
+- `hidden_dim=16`: 紧凑的隐藏层，适合嵌入式部署
+- `sequence_length=500`: 长序列训练，捕获完整的episode动态
+- ReLU 激活: 比 tanh 更快，适合实时控制
+
+### 序列化训练
+
+使用 `--sequence_length 500` 时：
+```python
+# 输入形状: (sequence_length=500, batch_size=64, obs_dim)
+# GRU 处理整个序列，维护隐藏状态
+# 输出形状: (sequence_length=500, batch_size=64, action_dim)
+```
+
+这样训练的模型可以：
+- 理解时间依赖关系
+- 更好地预测长期行为
+- 适应动态变化的环境
 
 ### 1. 数据收集阶段
 
@@ -366,13 +426,17 @@ python foundation/rsl_rl/play.py \
 
 | 特性 | C++ 版本 | Python 版本 |
 |------|---------|------------|
-| 多教师支持 | ✓ | ✗（单教师）|
-| RNN 支持 | ✓ | ✗（MLP only）|
+| 多教师支持 | ✓ (1000个) | ✗（单教师）|
+| GRU 架构 | ✓ | ✓ |
+| 序列化训练 | ✓ (500) | ✓ (可配置) |
+| 隐藏层维度 | 16 | 16（匹配） |
+| 激活函数 | ReLU | ReLU（匹配） |
 | 位置偏移校正 | ✓ | ✗ |
 | 活跃教师选择 | ✓ | ✗ |
 | 动态参数加载 | ✓ | ✗ |
+| 批量大小 | 64 | 64（默认256，建议改为64） |
 
-未来可以根据需要添加这些功能。
+**核心网络架构完全一致** ✓
 
 ## 参考资料
 
