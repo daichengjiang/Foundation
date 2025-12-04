@@ -170,42 +170,6 @@ class SimpleQuadrotorController:
         
         return force, torque, None
 
-    def update_params(self, env_ids, mass, arm_length, inertia, thrust_to_weight):
-        """
-        Runtime update for RAPTOR distillation
-        """
-        # Update basic props
-        self.mass_[env_ids] = mass
-        self.arm_l_[env_ids] = arm_length
-        self.inertia_[env_ids] = inertia
-        
-        # Recalculate Thrust Map (TWR Scaling)
-        # Copy logic from __init__ but only for indices
-        base_coeffs = torch.tensor([9.96063125e-08, -2.55003087e-05, 5.84422691e-03], 
-                                device=self.device)
-        w_max = self.motor_omega_max_[env_ids]
-        base_thrust_max = (base_coeffs[0] * w_max**2 + 
-                        base_coeffs[1] * w_max + 
-                        base_coeffs[2])
-        
-        target_thrust_max = (mass * self.g * thrust_to_weight) / 4.0
-        thrust_scale = target_thrust_max / (base_thrust_max + 1e-8)
-        
-        self.thrust_map_[env_ids] = base_coeffs.unsqueeze(0) * thrust_scale.unsqueeze(1)
-        
-        # Recalculate Allocation Matrix
-        # Re-run _compute_allocation_matrix equivalent logic for specific indices
-        # Optimization: Just update the rows that depend on arm length
-        d = arm_length * 0.70710678
-        k = self.kappa_[env_ids]
-        
-        # Rebuild alloc matrix for these envs (simplified construction)
-        # [1, 1, 1, 1]
-        # [d, -d, -d, d] ...
-        # Assign back to self.alloc_matrix_[env_ids]
-        # (Implementing this fully requires ensuring tensor shapes match)
-        # ... (Refer to __init__ logic)
-
     @property
     def dynamics(self):
         """Property to access internal limits, used by some env wrappers."""
