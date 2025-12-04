@@ -183,6 +183,49 @@ class RolloutStorage:
                 i
             ].to(self.device), self.dones[i].to(self.device)
 
+    def recurrent_distillation_generator(self):
+        """Generator for distillation training with recurrent student networks.
+        
+        Splits trajectories at episode boundaries (done flags) and processes them sequentially
+        to maintain proper hidden state propagation in the student RNN.
+        """
+        if self.training_type != "distillation":
+            raise ValueError("This function is only available for distillation training.")
+
+        # Split trajectories at done indices and pad them
+        # Shape: [max_traj_length, num_trajectories, obs_dim]
+        padded_obs_trajectories, trajectory_masks = split_and_pad_trajectories(self.observations, self.dones)
+        
+        if self.privileged_observations is not None:
+            padded_privileged_obs_trajectories, _ = split_and_pad_trajectories(self.privileged_observations, self.dones)
+        else:
+            padded_privileged_obs_trajectories = padded_obs_trajectories
+
+        padded_action_trajectories, _ = split_and_pad_trajectories(self.actions, self.dones)
+        padded_privileged_action_trajectories, _ = split_and_pad_trajectories(self.privileged_actions, self.dones)
+        padded_dones_trajectories, _ = split_and_pad_trajectories(self.dones, self.dones)
+
+        # Get number of trajectories
+        num_trajectories = padded_obs_trajectories.shape[1]
+        max_traj_length = padded_obs_trajectories.shape[0]
+
+        # Yield trajectories one by one
+        # Each trajectory is a complete episode (or part of it)
+        for traj_idx in range(num_trajectories):
+            # Get the mask for this trajectory (indicates valid timesteps)
+            mask = trajectory_masks[:, traj_idx]  # [max_traj_length]
+            traj_length = mask.sum().item()
+            
+            # Extract this trajectory's data up to the actual length
+            obs_traj = padded_obs_trajectories[:traj_length, traj_idx].to(self.device)  # [traj_length, obs_dim]
+            privileged_obs_traj = padded_privileged_obs_trajectories[:traj_length, traj_idx].to(self.device)
+            action_traj = padded_action_trajectories[:traj_length, traj_idx].to(self.device)
+            privileged_action_traj = padded_privileged_action_trajectories[:traj_length, traj_idx].to(self.device)
+            dones_traj = padded_dones_trajectories[:traj_length, traj_idx].to(self.device)
+            
+            yield obs_traj, privileged_obs_traj, action_traj, privileged_action_traj, dones_traj, traj_length
+
+
     # for reinforcement learning with feedforward networks
     def mini_batch_generator(self, num_mini_batches, num_epochs=8):
         if self.training_type != "rl":

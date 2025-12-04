@@ -14,6 +14,7 @@ from .normalizer import EmpiricalNormalization
 from .rnd import RandomNetworkDistillation
 from .student_teacher import StudentTeacher
 from .student_teacher_recurrent import StudentTeacherRecurrent
+from .student_teacher_recurrent_custom import StudentTeacherRecurrentCustom
 
 __all__ = [
     "ActorCritic",
@@ -25,5 +26,6 @@ __all__ = [
     "RandomNetworkDistillation",
     "StudentTeacher",
     "StudentTeacherRecurrent",
+    "StudentTeacherRecurrentCustom",
 ]
 

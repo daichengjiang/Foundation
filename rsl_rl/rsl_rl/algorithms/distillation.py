@@ -9,14 +9,14 @@ import torch.nn as nn
 import torch.optim as optim
 
 # rsl-rl
-from rsl_rl.modules import StudentTeacher, StudentTeacherRecurrent
+from rsl_rl.modules import StudentTeacher, StudentTeacherRecurrent, StudentTeacherRecurrentCustom
 from rsl_rl.storage import RolloutStorage
 
 
 class Distillation:
     """Distillation algorithm for training a student model to mimic a teacher model."""
 
-    policy: StudentTeacher | StudentTeacherRecurrent
+    policy: StudentTeacher | StudentTeacherRecurrent | StudentTeacherRecurrentCustom
     """The student teacher model."""
 
     def __init__(
@@ -107,42 +107,107 @@ class Distillation:
         loss = 0
         cnt = 0
 
+        # Check if the policy is recurrent
+        is_recurrent = hasattr(self.policy, 'is_recurrent') and self.policy.is_recurrent
+
         for epoch in range(self.num_learning_epochs):
-            self.policy.reset(hidden_states=self.last_hidden_states)
-            self.policy.detach_hidden_states()
-            for obs, _, _, privileged_actions, dones in self.storage.generator():
+            if is_recurrent:
+                # For recurrent networks, use trajectory-based generator
+                generator = self.storage.recurrent_distillation_generator()
+            else:
+                # For non-recurrent networks, use simple timestep generator
+                generator = self.storage.generator()
 
-                # inference the student for gradient computation
-                actions = self.policy.act_inference(obs)
+            # Reset policy at the start of each epoch
+            if is_recurrent:
+                # For recurrent policies, always reset (don't use last_hidden_states from update)
+                self.policy.reset()
+            else:
+                # For non-recurrent policies, can restore hidden states from last update
+                self.policy.reset(hidden_states=self.last_hidden_states)
+                self.policy.detach_hidden_states()
 
-                # behavior cloning loss
-                behavior_loss = self.loss_fn(actions, privileged_actions)
+            if is_recurrent:
+                # Process complete trajectories for RNN
+                for obs_traj, privileged_obs_traj, _, privileged_action_traj, dones_traj, traj_length in generator:
+                    # Reset hidden states at the start of each trajectory
+                    self.policy.reset()
+                    
+                    # Process trajectory step by step
+                    for t in range(traj_length):
+                        obs = obs_traj[t:t+1]  # [1, obs_dim] - keep batch dimension
+                        privileged_actions = privileged_action_traj[t:t+1]  # [1, action_dim]
+                        
+                        # Student inference with RNN
+                        actions = self.policy.act_inference(obs)
+                        
+                        # Behavior cloning loss
+                        behavior_loss = self.loss_fn(actions, privileged_actions)
+                        
+                        # Accumulate loss
+                        loss = loss + behavior_loss
+                        mean_behavior_loss += behavior_loss.item()
+                        cnt += 1
+                        
+                        # Gradient step every gradient_length steps
+                        if cnt % self.gradient_length == 0:
+                            self.optimizer.zero_grad()
+                            loss.backward()
+                            if self.is_multi_gpu:
+                                self.reduce_parameters()
+                            if self.max_grad_norm:
+                                nn.utils.clip_grad_norm_(self.policy.student.parameters(), self.max_grad_norm)
+                            self.optimizer.step()
+                            self.policy.detach_hidden_states()
+                            loss = 0
+                        
+                        # Check if this timestep ends an episode
+                        if dones_traj[t].item():
+                            # Detach hidden states at episode boundary
+                            self.policy.detach_hidden_states()
+                            # Note: Don't reset here, we'll reset at the start of next trajectory
+            else:
+                # Process individual timesteps for non-recurrent networks
+                for obs, privileged_obs, _, privileged_actions, dones in generator:
+                    # inference the student for gradient computation
+                    actions = self.policy.act_inference(obs)
 
-                # total loss
-                loss = loss + behavior_loss
-                mean_behavior_loss += behavior_loss.item()
-                cnt += 1
+                    # behavior cloning loss
+                    behavior_loss = self.loss_fn(actions, privileged_actions)
 
-                # gradient step
-                if cnt % self.gradient_length == 0:
-                    self.optimizer.zero_grad()
-                    loss.backward()
-                    if self.is_multi_gpu:
-                        self.reduce_parameters()
-                    if self.max_grad_norm:
-                        nn.utils.clip_grad_norm_(self.policy.student.parameters(), self.max_grad_norm)
-                    self.optimizer.step()
-                    self.policy.detach_hidden_states()
-                    loss = 0
+                    # total loss
+                    loss = loss + behavior_loss
+                    mean_behavior_loss += behavior_loss.item()
+                    cnt += 1
 
-                # reset dones
-                self.policy.reset(dones.view(-1))
-                self.policy.detach_hidden_states(dones.view(-1))
+                    # gradient step
+                    if cnt % self.gradient_length == 0:
+                        self.optimizer.zero_grad()
+                        loss.backward()
+                        if self.is_multi_gpu:
+                            self.reduce_parameters()
+                        if self.max_grad_norm:
+                            nn.utils.clip_grad_norm_(self.policy.student.parameters(), self.max_grad_norm)
+                        self.optimizer.step()
+                        self.policy.detach_hidden_states()
+                        loss = 0
+
+                    # reset dones
+                    self.policy.reset(dones.view(-1))
+                    self.policy.detach_hidden_states(dones.view(-1))
 
         mean_behavior_loss /= cnt
         self.storage.clear()
-        self.last_hidden_states = self.policy.get_hidden_states()
-        self.policy.detach_hidden_states()
+        
+        # Only save hidden states for non-recurrent policies
+        # For recurrent policies, hidden states from update (batch_size=1) don't match act() (batch_size=num_envs)
+        if not is_recurrent:
+            self.last_hidden_states = self.policy.get_hidden_states()
+            self.policy.detach_hidden_states()
+        else:
+            # For recurrent policies, reset hidden states after update
+            self.policy.reset()
+            self.last_hidden_states = None
 
         # construct the loss dictionary
         loss_dict = {"behavior": mean_behavior_loss}
