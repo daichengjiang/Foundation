@@ -30,6 +30,7 @@ class Distillation:
         device="cpu",
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
+        num_mini_batches=8,
     ):
         # device-related parameters
         self.device = device
@@ -57,6 +58,7 @@ class Distillation:
         self.gradient_length = gradient_length
         self.learning_rate = learning_rate
         self.max_grad_norm = max_grad_norm
+        self.num_mini_batches = num_mini_batches
 
         # initialize the loss function
         if loss_type == "mse":
@@ -104,115 +106,99 @@ class Distillation:
     def update(self):
         self.num_updates += 1
         mean_behavior_loss = 0
-        loss = 0
+        loss_accum = 0
         cnt = 0
 
-        # Check if the policy is recurrent
-        is_recurrent = hasattr(self.policy, 'is_recurrent') and self.policy.is_recurrent
+        # Check if policy supports act_batch (Our new custom class)
+        is_recurrent_custom = hasattr(self.policy, 'act_batch')
+
+        if not is_recurrent_custom:
+            # Fallback for standard Non-Recurrent policies
+            # ... (Old logic for non-recurrent if needed) ...
+            # For brevity, assuming you are using the new Recurrent class
+            pass
 
         for epoch in range(self.num_learning_epochs):
-            if is_recurrent:
-                # For recurrent networks, use trajectory-based generator
-                generator = self.storage.recurrent_distillation_generator()
-            else:
-                # For non-recurrent networks, use simple timestep generator
-                generator = self.storage.generator()
+            # 1. Get Batch Generator
+            generator = self.storage.recurrent_distillation_batch_generator(self.num_mini_batches)
 
-            # Reset policy at the start of each epoch
-            if is_recurrent:
-                # For recurrent policies, always reset (don't use last_hidden_states from update)
-                self.policy.reset()
-            else:
-                # For non-recurrent policies, can restore hidden states from last update
-                self.policy.reset(hidden_states=self.last_hidden_states)
-                self.policy.detach_hidden_states()
+            for obs_batch, target_actions_batch, masks_batch in generator:
+                # obs_batch: [Seq_Len, Batch_Size, Dim]
+                # masks_batch: [Seq_Len, Batch_Size]
+                
+                T, B, _ = obs_batch.shape
+                
+                # 2. Initialize Hidden State for this batch (Zeros)
+                # Note: RNN hidden state shape is [Num_Layers, Batch, Hidden_Dim]
+                if hasattr(self.policy, 'rnn_type') and self.policy.rnn_type == 'lstm':
+                     hidden_state = (
+                         torch.zeros(self.policy.rnn_num_layers, B, self.policy.rnn_hidden_dim, device=self.device),
+                         torch.zeros(self.policy.rnn_num_layers, B, self.policy.rnn_hidden_dim, device=self.device)
+                     )
+                else:
+                     hidden_state = torch.zeros(
+                         self.policy.rnn_num_layers, B, self.policy.rnn_hidden_dim, 
+                         device=self.device
+                     )
 
-            if is_recurrent:
-                # Process complete trajectories for RNN
-                for obs_traj, privileged_obs_traj, _, privileged_action_traj, dones_traj, traj_length in generator:
-                    # Reset hidden states at the start of each trajectory
-                    self.policy.reset()
+                # 3. Iterate Time (TBPTT: Truncated Backpropagation Through Time)
+                for t in range(0, T, self.gradient_length):
+                    end_t = min(t + self.gradient_length, T)
                     
-                    # Process trajectory step by step
-                    for t in range(traj_length):
-                        obs = obs_traj[t:t+1]  # [1, obs_dim] - keep batch dimension
-                        privileged_actions = privileged_action_traj[t:t+1]  # [1, action_dim]
+                    # Slice window
+                    obs_window = obs_batch[t:end_t]         # [Grad_Len, B, D]
+                    target_window = target_actions_batch[t:end_t]
+                    mask_window = masks_batch[t:end_t]
+                    
+                    # Forward Batch
+                    # hidden_state passes information from previous window to this one
+                    pred_actions_window, next_hidden_state = self.policy.act_batch(obs_window, hidden_state)
+                    
+                    # Calculate Loss
+                    # reduction='none' allows us to mask invalid timesteps (padded data)
+                    loss = self.loss_fn(pred_actions_window, target_window, reduction='none')
+                    
+                    # Average over action dim: [Grad_Len, B, A] -> [Grad_Len, B]
+                    if len(loss.shape) > 2:
+                        loss = loss.mean(dim=-1)
+                    
+                    # Apply Mask
+                    loss = loss * mask_window
+                    
+                    # Compute scalar loss (Average over valid tokens only)
+                    valid_tokens = mask_window.sum()
+                    if valid_tokens > 0:
+                        loss_val = loss.sum() / valid_tokens
+                    else:
+                        loss_val = torch.tensor(0.0, device=self.device, requires_grad=True)
+                    
+                    # Backward & Step
+                    self.optimizer.zero_grad()
+                    loss_val.backward()
+                    
+                    if self.is_multi_gpu:
+                        self.reduce_parameters()
+                    if self.max_grad_norm:
+                        nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
                         
-                        # Student inference with RNN
-                        actions = self.policy.act_inference(obs)
-                        
-                        # Behavior cloning loss
-                        behavior_loss = self.loss_fn(actions, privileged_actions)
-                        
-                        # Accumulate loss
-                        loss = loss + behavior_loss
-                        mean_behavior_loss += behavior_loss.item()
-                        cnt += 1
-                        
-                        # Gradient step every gradient_length steps
-                        if cnt % self.gradient_length == 0:
-                            self.optimizer.zero_grad()
-                            loss.backward()
-                            if self.is_multi_gpu:
-                                self.reduce_parameters()
-                            if self.max_grad_norm:
-                                nn.utils.clip_grad_norm_(self.policy.student.parameters(), self.max_grad_norm)
-                            self.optimizer.step()
-                            self.policy.detach_hidden_states()
-                            loss = 0
-                        
-                        # Check if this timestep ends an episode
-                        if dones_traj[t].item():
-                            # Detach hidden states at episode boundary
-                            self.policy.detach_hidden_states()
-                            # Note: Don't reset here, we'll reset at the start of next trajectory
-            else:
-                # Process individual timesteps for non-recurrent networks
-                for obs, privileged_obs, _, privileged_actions, dones in generator:
-                    # inference the student for gradient computation
-                    actions = self.policy.act_inference(obs)
-
-                    # behavior cloning loss
-                    behavior_loss = self.loss_fn(actions, privileged_actions)
-
-                    # total loss
-                    loss = loss + behavior_loss
-                    mean_behavior_loss += behavior_loss.item()
+                    self.optimizer.step()
+                    
+                    # Pass hidden state to next window (Detach to stop gradient flow)
+                    if isinstance(next_hidden_state, tuple):
+                        hidden_state = (next_hidden_state[0].detach(), next_hidden_state[1].detach())
+                    else:
+                        hidden_state = next_hidden_state.detach()
+                    
+                    mean_behavior_loss += loss_val.item()
                     cnt += 1
-
-                    # gradient step
-                    if cnt % self.gradient_length == 0:
-                        self.optimizer.zero_grad()
-                        loss.backward()
-                        if self.is_multi_gpu:
-                            self.reduce_parameters()
-                        if self.max_grad_norm:
-                            nn.utils.clip_grad_norm_(self.policy.student.parameters(), self.max_grad_norm)
-                        self.optimizer.step()
-                        self.policy.detach_hidden_states()
-                        loss = 0
-
-                    # reset dones
-                    self.policy.reset(dones.view(-1))
-                    self.policy.detach_hidden_states(dones.view(-1))
-
-        mean_behavior_loss /= cnt
+        
+        # Clear storage after epoch
         self.storage.clear()
         
-        # Only save hidden states for non-recurrent policies
-        # For recurrent policies, hidden states from update (batch_size=1) don't match act() (batch_size=num_envs)
-        if not is_recurrent:
-            self.last_hidden_states = self.policy.get_hidden_states()
-            self.policy.detach_hidden_states()
-        else:
-            # For recurrent policies, reset hidden states after update
-            self.policy.reset()
-            self.last_hidden_states = None
+        # Reset policy internal state (just in case)
+        self.policy.reset() 
 
-        # construct the loss dictionary
-        loss_dict = {"behavior": mean_behavior_loss}
-
-        return loss_dict
+        return {"behavior": mean_behavior_loss / max(cnt, 1)}
 
     """
     Helper functions

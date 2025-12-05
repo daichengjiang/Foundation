@@ -146,6 +146,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # get inference policy
     policy = runner.get_inference_policy(device=agent_cfg.device)
+    policy_model = runner.alg.policy
 
     # simulation timestep
     dt = env.unwrapped.step_dt
@@ -202,6 +203,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             # 在 env.step() 内部，机器人实际位置变为 current_pos_t
             # 且环境的期望位置 pos_des/vel_des 可能会更新为下一时刻 t+1 的值
             obs, rewards, dones, extras = env.step(actions)
+
+            if hasattr(policy_model, "reset"):
+                policy_model.reset(dones)
             
             # -----------------------------------------------------------------
             # --- 4. 获取 t 步的实际状态 ---

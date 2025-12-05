@@ -183,49 +183,46 @@ class RolloutStorage:
                 i
             ].to(self.device), self.dones[i].to(self.device)
 
-    def recurrent_distillation_generator(self):
-        """Generator for distillation training with recurrent student networks.
-        
-        Splits trajectories at episode boundaries (done flags) and processes them sequentially
-        to maintain proper hidden state propagation in the student RNN.
+    def recurrent_distillation_batch_generator(self, num_mini_batches):
+        """
+        [FIXED] Generator for distillation training with recurrent student networks using BATCH processing.
+        Fix: Handles device placement correctly (Indices on CPU, Batches moved to GPU).
         """
         if self.training_type != "distillation":
             raise ValueError("This function is only available for distillation training.")
 
-        # Split trajectories at done indices and pad them
-        # Shape: [max_traj_length, num_trajectories, obs_dim]
-        padded_obs_trajectories, trajectory_masks = split_and_pad_trajectories(self.observations, self.dones)
+        # 1. Split and Pad Trajectories (Data is on self.storage_device, typically 'cpu')
+        # padded_obs: [max_traj_len, num_trajs, dim]
+        padded_obs, masks = split_and_pad_trajectories(self.observations, self.dones)
         
-        if self.privileged_observations is not None:
-            padded_privileged_obs_trajectories, _ = split_and_pad_trajectories(self.privileged_observations, self.dones)
-        else:
-            padded_privileged_obs_trajectories = padded_obs_trajectories
-
-        padded_action_trajectories, _ = split_and_pad_trajectories(self.actions, self.dones)
-        padded_privileged_action_trajectories, _ = split_and_pad_trajectories(self.privileged_actions, self.dones)
-        padded_dones_trajectories, _ = split_and_pad_trajectories(self.dones, self.dones)
-
-        # Get number of trajectories
-        num_trajectories = padded_obs_trajectories.shape[1]
-        max_traj_length = padded_obs_trajectories.shape[0]
-
-        # Yield trajectories one by one
-        # Each trajectory is a complete episode (or part of it)
-        for traj_idx in range(num_trajectories):
-            # Get the mask for this trajectory (indicates valid timesteps)
-            mask = trajectory_masks[:, traj_idx]  # [max_traj_length]
-            traj_length = mask.sum().item()
+        # Handle privileged actions
+        padded_priv_actions, _ = split_and_pad_trajectories(self.privileged_actions, self.dones)
+        
+        # 2. Prepare Batches
+        num_trajs = padded_obs.shape[1]
+        batch_size = num_trajs // num_mini_batches
+        
+        # [CRITICAL FIX] Generate indices on the SAME device as the data (storage_device/cpu)
+        # 不要使用 self.device，因为 data 在 CPU 上
+        indices = torch.randperm(num_trajs, device=self.storage_device)
+        
+        for i in range(num_mini_batches):
+            start = i * batch_size
+            end = (i + 1) * batch_size
             
-            # Extract this trajectory's data up to the actual length
-            obs_traj = padded_obs_trajectories[:traj_length, traj_idx].to(self.device)  # [traj_length, obs_dim]
-            privileged_obs_traj = padded_privileged_obs_trajectories[:traj_length, traj_idx].to(self.device)
-            action_traj = padded_action_trajectories[:traj_length, traj_idx].to(self.device)
-            privileged_action_traj = padded_privileged_action_trajectories[:traj_length, traj_idx].to(self.device)
-            dones_traj = padded_dones_trajectories[:traj_length, traj_idx].to(self.device)
+            if i == num_mini_batches - 1:
+                end = num_trajs
+                
+            batch_idx = indices[start:end]
             
-            yield obs_traj, privileged_obs_traj, action_traj, privileged_action_traj, dones_traj, traj_length
-
-
+            # 3. Yield Batch (Move to GPU here)
+            # Indexing happens on CPU (fast & memory efficient), then transfer small batch to GPU
+            yield (
+                padded_obs[:, batch_idx].to(self.device),           
+                padded_priv_actions[:, batch_idx].to(self.device),  
+                masks[:, batch_idx].to(self.device)                 
+            )
+            
     # for reinforcement learning with feedforward networks
     def mini_batch_generator(self, num_mini_batches, num_epochs=8):
         if self.training_type != "rl":
