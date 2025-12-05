@@ -48,7 +48,7 @@ import itertools
 
 from dataclasses import dataclass
 
-MAP_SIZE = (500, 500) 
+MAP_SIZE = (250, 250) 
 
 # 手动定义球体标记配置
 SPHERE_MARKER_CFG = VisualizationMarkersCfg(
@@ -152,10 +152,10 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
 
     map_size = MAP_SIZE
 
-    grid_rows = 40 # 12
-    grid_cols = 40 # 1
-    terrain_width = 10
-    terrain_length = 10
+    grid_rows = 80 
+    grid_cols = 80 
+    terrain_width = 3
+    terrain_length = 3
     robots_per_env = 1
 
     # terrain and robot
@@ -183,11 +183,6 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     )
 
     dynamics: QuadcopterDynamicsCfg = QuadcopterDynamicsCfg()
-
-    # Controller parameters
-    controller_Kang = [8.0, 8.0, 8.0]  # Roll and pitch angle controller gains   #15 15 20
-    controller_Kdang = [1.0, 1.0, 1.0]                                            #0.8 0.8 1.2
-    controller_Kang_vel = [15.0, 15.0, 15.0]  # Roll, pitch, and yaw angular velocity controller gains
 
     # scene
     scene: InteractiveSceneCfg = QuadcopterSceneCfg()

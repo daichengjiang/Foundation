@@ -4,12 +4,10 @@ import os
 import time
 import argparse
 import sys
-from datetime import datetime # [新增]
+from datetime import datetime
 
-# ... sample_raptor_dynamics 函数保持不变 (请保留你原来的代码) ...
 def sample_raptor_dynamics():
-    # ... (这里不用变) ...
-    # 为了完整性，请确保这里是你之前修正过的包含正确惯量计算的版本
+    # ... (保持原有的动力学采样逻辑不变) ...
     twr = np.random.uniform(1.5, 5.0)
     m_min = 0.02
     m_max = 5.0
@@ -39,7 +37,7 @@ def sample_raptor_dynamics():
         "thrust_to_weight": twr, "motor_tau": motor_tau
     }
 
-def run_training(teacher_id, dynamics, timestamp, gpu_id=0):
+def run_training(teacher_id, dynamics, timestamp, gpu_id=0, csv_path="teacher_dynamics.csv", headless=False):
     """
     调用 train.py 并传入参数
     """
@@ -54,13 +52,16 @@ def run_training(teacher_id, dynamics, timestamp, gpu_id=0):
         
         f"agent.experiment_name=raptor_teachers",
         f"agent.run_name=teacher_{teacher_id:04d}",
+        # 注意：请根据你的实际路径确认 USD 路径
         'env.robot.spawn.usd_path="/home/nv/Foundation/USD/cf2x.usd"'
     ]
     
+    # 假设你的 train.py 就在 foundation/rsl_rl 下，或者根据你的项目结构调整
     train_script = "foundation/rsl_rl/train.py"
     if not os.path.exists(train_script):
-        if os.path.exists(os.path.join(os.getcwd(), train_script)):
-            pass
+        # 尝试相对路径回退
+        if os.path.exists("train.py"):
+            train_script = "train.py"
         else:
             print(f"Error: Could not find {train_script}")
             return
@@ -68,7 +69,7 @@ def run_training(teacher_id, dynamics, timestamp, gpu_id=0):
     cmd = [
         sys.executable, train_script,
         "--task", "point_ctrl_single_dense",
-        "--num_envs", "1600",
+        "--num_envs", "6400",
         "--max_iterations", "1000",
         "--device", f"cuda:{gpu_id}",
         "--logger", "wandb",
@@ -76,12 +77,19 @@ def run_training(teacher_id, dynamics, timestamp, gpu_id=0):
         "--log_timestamp", timestamp 
     ] + overrides
     
-    save_params_to_csv(teacher_id, dynamics)
+    # [新增] 如果 headless 为 True，则添加该参数
+    if headless:
+        cmd.append("--headless")
+
+    # 保存参数到指定的 CSV 路径
+    save_params_to_csv(csv_path, teacher_id, dynamics)
 
     print(f"==================================================")
-    print(f"Starting Teacher {teacher_id} | GPU {gpu_id} | Dir: {timestamp}/teacher_{teacher_id:04d}")
-    print(f"Mass: {dynamics['mass']:.4f} kg | Arm: {dynamics['arm_length']:.4f} m")  # [已修复] 加回了 Arm
-    print(f"TWR : {dynamics['thrust_to_weight']:.2f}    | Tau: {dynamics['motor_tau']:.3f} s")   # [已修复] 加回了 Tau
+    print(f"Starting Teacher {teacher_id} | GPU {gpu_id} | Headless: {headless}")
+    print(f"Dir: .../{timestamp}/teacher_{teacher_id:04d}")
+    print(f"Mass: {dynamics['mass']:.4f} kg | Arm: {dynamics['arm_length']:.4f} m") 
+    print(f"TWR : {dynamics['thrust_to_weight']:.2f}    | Tau: {dynamics['motor_tau']:.3f} s")
+    print(f"CSV Saved to: {csv_path}")
     print(f"==================================================")
     
     try:
@@ -90,9 +98,16 @@ def run_training(teacher_id, dynamics, timestamp, gpu_id=0):
         print(f"!!! Error training Teacher {teacher_id} !!!")
         print(e)
 
-def save_params_to_csv(teacher_id, dynamics):
-    file_exists = os.path.isfile("teacher_dynamics.csv")
-    with open("teacher_dynamics.csv", "a") as f:
+def save_params_to_csv(file_path, teacher_id, dynamics):
+    """
+    将参数追加写入到指定路径的 CSV 文件
+    """
+    file_exists = os.path.isfile(file_path)
+    
+    # 确保目录存在
+    os.makedirs(os.path.dirname(file_path), exist_ok=True)
+    
+    with open(file_path, "a") as f:
         if not file_exists:
             f.write("id,mass,arm_length,Ixx,Iyy,Izz,twr,motor_tau\n")
         
@@ -105,8 +120,10 @@ if __name__ == "__main__":
     parser.add_argument("--start_id", type=int, default=0)
     parser.add_argument("--num_teachers", type=int, default=1)
     parser.add_argument("--gpu_id", type=int, default=0)
-    # [可选] 允许手动传入时间戳，方便断点续训时保持目录一致
     parser.add_argument("--timestamp", type=str, default=None) 
+    # [新增] headless 参数
+    parser.add_argument("--headless", action="store_true", default=False, help="Run without rendering (Headless mode)")
+
     args = parser.parse_args()
 
     # 1. 确定本次运行的统一时间戳
@@ -115,23 +132,38 @@ if __name__ == "__main__":
     else:
         batch_timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
-    # 2. 自动清理 (仅当 start_id=0 且没有手动指定时间戳时，视为全新训练)
-    csv_filename = "teacher_dynamics.csv"
-    if args.start_id == 0 and args.timestamp is None:
-        if os.path.exists(csv_filename):
-            print(f"[Auto-Clean] Removing existing '{csv_filename}' to start fresh.")
+    # 2. 构建目标 CSV 路径
+    # 路径格式: logs/rsl_rl/raptor_teachers/{timestamp}/teacher_dynamics.csv
+    log_root_dir = os.path.join("logs", "rsl_rl", "raptor_teachers", batch_timestamp)
+    
+    # 确保日志目录先被创建 (虽然 train.py 也会创建，但我们要先写 CSV)
+    os.makedirs(log_root_dir, exist_ok=True)
+    
+    csv_path = os.path.join(log_root_dir, "teacher_dynamics.csv")
+
+    # 3. 自动清理 (仅当 start_id=0 时，删除该目录下可能已存在的 CSV)
+    if args.start_id == 0:
+        if os.path.exists(csv_path):
+            print(f"[Auto-Clean] Removing existing '{csv_path}' to start fresh.")
             try:
-                os.remove(csv_filename)
+                os.remove(csv_path)
             except OSError as e:
                 print(f"Warning: Could not remove file: {e}")
 
     print(f"Batch Timestamp: {batch_timestamp}")
+    print(f"Dynamics CSV will be saved to: {csv_path}")
 
-    # 3. 循环训练
+    # 4. 循环训练
     for i in range(args.start_id, args.start_id + args.num_teachers):
         dyn_params = sample_raptor_dynamics()
-        # 将时间戳传进去
-        run_training(i, dyn_params, timestamp=batch_timestamp, gpu_id=args.gpu_id)
         
-        # 冷却
+        run_training(
+            teacher_id=i, 
+            dynamics=dyn_params, 
+            timestamp=batch_timestamp, 
+            gpu_id=args.gpu_id,
+            csv_path=csv_path, # 传入完整路径
+            headless=args.headless # [新增] 传入 headless 参数
+        )
+        
         time.sleep(2)
