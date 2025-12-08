@@ -61,6 +61,7 @@ from foundation.tasks.point_ctrl.quad_point_ctrl_env_single_dense import Quadcop
 
 # Helper for vmap
 from torch.func import functional_call, vmap
+import isaacsim.core.utils.prims as prims_utils  # [新增] 用于修改物理属性
 
 # ---------------------------------------------------------------------------
 # 2. Student Policy Architecture (RAPTOR Paper Fig 7B)
@@ -237,8 +238,11 @@ class DistillationEnv(QuadcopterEnv):
         # Ensure cfg matches the number of teachers
         cfg.scene.num_envs = self.num_teachers
         
+        # Call parent init (This applies default physics)
         super().__init__(cfg, render_mode=None)
         
+        print(f"[Distill] Overwriting dynamics from CSV for {self.num_teachers} envs...")
+
         # Pre-load dynamics tensors
         self.mass_tensor = torch.tensor(self.dynamics_df['mass'].values, device=device, dtype=torch.float32)
         self.arm_tensor = torch.tensor(self.dynamics_df['arm_length'].values, device=device, dtype=torch.float32)
@@ -260,6 +264,21 @@ class DistillationEnv(QuadcopterEnv):
         self.motor_tau = self.tau_tensor.view(self.num_envs, 1) # Ensure correct shape
         self.dt = self.cfg.sim.dt
         self.motor_alpha = self.dt / (self.dt + self.motor_tau)
+
+        # [NEW] Force Update Physics Engine (USD) parameters
+        # This overrides the defaults set by super().__init__
+        for i in range(self.num_envs):
+            # Assumes standard structure: /World/envs/env_{i}/Robot/body
+            env_prim_path = f"/World/envs/env_{i}/Robot/body"
+            
+            m = self.mass_tensor[i].item()
+            inertia = (self.inertia_tensor[i, 0].item(), self.inertia_tensor[i, 1].item(), self.inertia_tensor[i, 2].item())
+            
+            prims_utils.set_prim_property(env_prim_path, "physics:mass", m)
+            prims_utils.set_prim_property(env_prim_path, "physics:diagonalInertia", inertia)
+            
+            if i == 0:
+                print(f"  > Env 0 Physics Updated: Mass={m:.4f}, Inertia={inertia}")
 
 
     def _reset_idx(self, env_ids):
@@ -288,6 +307,10 @@ def main():
     os.makedirs(student_save_dir, exist_ok=True)
     final_save_path = os.path.join(student_save_dir, "student_policy.pt")
     
+    # 定义 Best Model 保存路径
+    best_save_path = os.path.join(student_save_dir, "student_policy_best.pt")
+    min_loss = float('inf') # 初始化最小 Loss 为无穷大
+
     print(f"==================================================")
     print(f"[Distill] Student models will be saved to:")
     print(f"          {student_save_dir}")
@@ -399,13 +422,14 @@ def main():
         torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0)
         optimizer.step()
         
+        # [Fix] Define current_loss
+        current_loss = loss.item()
+
         # C. Logging
         # ----------
         epoch_time = time.time() - epoch_start
         mode = "Teacher (Warmup)" if epoch < args.warmup_epochs else "Student (On-Policy)"
         
-        # [新增] 只有在 On-Policy 阶段（Student 自己飞的时候）才开始评选 Best Model
-        # 因为 Warmup 阶段数据是 Teacher 产生的，Loss 低不代表 Student 能力强
         is_best = ""
         if epoch >= args.warmup_epochs:
             if current_loss < min_loss:
@@ -415,14 +439,14 @@ def main():
 
         print(f"Epoch {epoch+1}/{args.epochs} | Loss: {current_loss:.6f}{is_best} | Mode: {mode} | Time: {epoch_time:.2f}s")
         
-        # Save Checkpoint periodically (每100轮存一个备份)
+        # Save Checkpoint periodically
         if (epoch + 1) % 100 == 0:
             ckpt_filename = f"student_policy_ep{epoch+1}.pt"
             ckpt_path = os.path.join(student_save_dir, ckpt_filename)
             torch.save(student.state_dict(), ckpt_path)
             print(f"Saved checkpoint: {ckpt_path}")
 
-    # Final Save (这是最后一轮的)
+    # Final Save
     torch.save(student.state_dict(), final_save_path)
     print("Distillation Complete!")
     print(f"Last policy saved to: {final_save_path}")
