@@ -77,8 +77,8 @@ class QuadcopterDistillationRunnerCfg(RslRlOnPolicyRunnerCfg):
     
     # *** 算法配置保持不变 ***
     algorithm = RslRlDistillationAlgorithmCfg(
-        num_learning_epochs=1,  
-        learning_rate=5.0e-4,
+        num_learning_epochs=4, 
+        learning_rate=1e-3,
         max_grad_norm=1.0,
         gradient_length=15,
         class_name="Distillation",

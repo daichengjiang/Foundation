@@ -364,6 +364,13 @@ class OnPolicyRunner:
         self.writer.add_scalar("Perf/collection time", locs["collection_time"], locs["it"])
         self.writer.add_scalar("Perf/learning_time", locs["learn_time"], locs["it"])
 
+        # -- Distillation phase info (for two-stage training)
+        if self.training_type == "distillation" and hasattr(self.alg, 'get_training_phase_info'):
+            phase_info = self.alg.get_training_phase_info()
+            if phase_info["use_two_stage_training"]:
+                self.writer.add_scalar("Distillation/training_phase", phase_info["training_phase"], locs["it"])
+                self.writer.add_scalar("Distillation/current_iteration", phase_info["current_iteration"], locs["it"])
+
         # -- Training
         if len(locs["rewbuffer"]) > 0:
             # separate logging for intrinsic and extrinsic rewards
@@ -414,6 +421,17 @@ class OnPolicyRunner:
                 log_string += f"""{f'{key}:':>{pad}} {value:.4f}\n"""
 
         log_string += ep_string
+        
+        # Add distillation phase info for two-stage training
+        if self.training_type == "distillation" and hasattr(self.alg, 'get_training_phase_info'):
+            phase_info = self.alg.get_training_phase_info()
+            if phase_info["use_two_stage_training"]:
+                log_string += (
+                    f"""{'-' * width}\n"""
+                    f"""{'Training Phase:':>{pad}} Phase {phase_info['training_phase']} ({phase_info['action_source']} actions)\n"""
+                    f"""{'Phase Iteration:':>{pad}} {phase_info['current_iteration']}/{phase_info['phase1_iterations']} (Phase 1)\n"""
+                )
+        
         log_string += (
             f"""{'-' * width}\n"""
             f"""{'Total timesteps:':>{pad}} {self.tot_timesteps}\n"""

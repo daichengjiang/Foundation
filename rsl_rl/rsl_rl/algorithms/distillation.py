@@ -30,7 +30,15 @@ class Distillation:
         device="cpu",
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
+
+        # additional parameters
         num_mini_batches=8,
+        # Two-stage training parameters
+        use_two_stage_training=True,
+        phase1_iterations=10,
+        # DAgger parameters
+        use_dagger=True,
+        max_buffer_size=1000000,
     ):
         # device-related parameters
         self.device = device
@@ -60,6 +68,17 @@ class Distillation:
         self.max_grad_norm = max_grad_norm
         self.num_mini_batches = num_mini_batches
 
+        # Two-stage training parameters
+        self.use_two_stage_training = use_two_stage_training
+        self.phase1_iterations = phase1_iterations
+        self.training_phase = 1 if use_two_stage_training else 2  # Phase 1: use teacher actions, Phase 2: use student actions
+        self.current_iteration = 0
+
+        # DAgger parameters: aggregated dataset for historical data
+        self.use_dagger = use_dagger
+        self.dagger_buffer = None  # Will store all historical data
+        self.max_buffer_size = max_buffer_size
+
         # initialize the loss function
         if loss_type == "mse":
             self.loss_fn = nn.functional.mse_loss
@@ -73,7 +92,7 @@ class Distillation:
     def init_storage(
         self, training_type, num_envs, num_transitions_per_env, student_obs_shape, teacher_obs_shape, actions_shape
     ):
-        # create rollout storage
+        # create rollout storage for current rollout
         self.storage = RolloutStorage(
             training_type,
             num_envs,
@@ -84,15 +103,45 @@ class Distillation:
             None,
             self.device,
         )
+        
+        # Initialize DAgger aggregated buffer for historical data
+        if self.use_dagger:
+            # Start with capacity for multiple rollouts
+            initial_capacity = num_transitions_per_env * num_envs * 10  # Start with 10x rollout size
+            self.dagger_buffer = {
+                'observations': torch.zeros(initial_capacity, *student_obs_shape, device=self.device),
+                'teacher_actions': torch.zeros(initial_capacity, actions_shape[0], device=self.device),
+                'masks': torch.zeros(initial_capacity, device=self.device),  # For valid data marking
+                'size': 0,  # Current number of valid transitions
+                'capacity': initial_capacity,
+            }
+            print(f"[DAgger] Initialized aggregated buffer with capacity: {initial_capacity} transitions")
+            print(f"[DAgger] Maximum buffer size: {self.max_buffer_size} transitions")
 
     def act(self, obs, teacher_obs):
         # compute the actions
-        self.transition.actions = self.policy.act(obs).detach()
-        self.transition.privileged_actions = self.policy.evaluate(teacher_obs).detach()
+        student_action = self.policy.act(obs).detach()
+        teacher_action = self.policy.evaluate(teacher_obs).detach()
+        
+        # store both actions in transition for dataset
+        self.transition.actions = student_action
+        self.transition.privileged_actions = teacher_action
+        
         # record the observations
         self.transition.observations = obs
         self.transition.privileged_observations = teacher_obs
-        return self.transition.actions
+        
+        # Return appropriate action based on training phase
+        if self.use_two_stage_training:
+            if self.training_phase == 1:
+                # Phase 1: Use teacher action to update environment
+                return teacher_action
+            else:
+                # Phase 2: Use student action to update environment
+                return student_action
+        else:
+            # Default behavior: use student action
+            return student_action
 
     def process_env_step(self, rewards, dones, infos):
         # record the rewards and dones
@@ -103,10 +152,117 @@ class Distillation:
         self.transition.clear()
         self.policy.reset(dones)
 
+    def aggregate_current_rollout_to_buffer(self):
+        """Aggregate current rollout data into the DAgger historical buffer."""
+        if not self.use_dagger or self.dagger_buffer is None:
+            return
+        
+        # Get data from current rollout storage
+        # Shape: [num_steps, num_envs, obs_dim] -> flatten to [num_steps * num_envs, obs_dim]
+        current_obs = self.storage.observations[:self.storage.step].reshape(-1, self.storage.observations.shape[-1])
+        current_teacher_actions = self.storage.privileged_actions[:self.storage.step].reshape(-1, self.storage.actions.shape[-1])
+        
+        num_new_transitions = current_obs.shape[0]
+        
+        # Check if we need to expand the buffer
+        if self.dagger_buffer['size'] + num_new_transitions > self.dagger_buffer['capacity']:
+            self._expand_dagger_buffer(num_new_transitions)
+        
+        # Add new data to buffer
+        start_idx = self.dagger_buffer['size']
+        end_idx = start_idx + num_new_transitions
+        
+        # Ensure we don't exceed max buffer size
+        if end_idx > self.max_buffer_size:
+            # Use reservoir sampling or simply keep most recent data
+            # Here we keep the most recent data
+            overflow = end_idx - self.max_buffer_size
+            # Shift old data
+            self.dagger_buffer['observations'][:-overflow] = self.dagger_buffer['observations'][overflow:self.max_buffer_size]
+            self.dagger_buffer['teacher_actions'][:-overflow] = self.dagger_buffer['teacher_actions'][overflow:self.max_buffer_size]
+            self.dagger_buffer['masks'][:-overflow] = self.dagger_buffer['masks'][overflow:self.max_buffer_size]
+            # Update indices
+            start_idx = self.max_buffer_size - num_new_transitions
+            end_idx = self.max_buffer_size
+            self.dagger_buffer['size'] = self.max_buffer_size
+        else:
+            self.dagger_buffer['size'] = end_idx
+        
+        # Copy data to buffer
+        self.dagger_buffer['observations'][start_idx:end_idx] = current_obs.to(self.device)
+        self.dagger_buffer['teacher_actions'][start_idx:end_idx] = current_teacher_actions.to(self.device)
+        self.dagger_buffer['masks'][start_idx:end_idx] = 1.0  # Mark as valid
+        
+        print(f"[DAgger] Aggregated {num_new_transitions} transitions. Total buffer size: {self.dagger_buffer['size']}/{self.max_buffer_size}")
+    
+    def _expand_dagger_buffer(self, min_additional_space):
+        """Expand the DAgger buffer capacity."""
+        old_capacity = self.dagger_buffer['capacity']
+        # Double the capacity or add enough space for new data, whichever is larger
+        new_capacity = min(max(old_capacity * 2, old_capacity + min_additional_space), self.max_buffer_size)
+        
+        print(f"[DAgger] Expanding buffer from {old_capacity} to {new_capacity} transitions")
+        
+        # Create new larger buffers
+        new_obs = torch.zeros(new_capacity, *self.dagger_buffer['observations'].shape[1:], device=self.device)
+        new_actions = torch.zeros(new_capacity, *self.dagger_buffer['teacher_actions'].shape[1:], device=self.device)
+        new_masks = torch.zeros(new_capacity, device=self.device)
+        
+        # Copy old data
+        new_obs[:old_capacity] = self.dagger_buffer['observations']
+        new_actions[:old_capacity] = self.dagger_buffer['teacher_actions']
+        new_masks[:old_capacity] = self.dagger_buffer['masks']
+        
+        # Update buffer
+        self.dagger_buffer['observations'] = new_obs
+        self.dagger_buffer['teacher_actions'] = new_actions
+        self.dagger_buffer['masks'] = new_masks
+        self.dagger_buffer['capacity'] = new_capacity
+
     def update(self):
         self.num_updates += 1
+        self.current_iteration += 1
+        
+        # Check if we should switch from phase 1 to phase 2
+        if self.use_two_stage_training and self.training_phase == 1:
+            if self.current_iteration >= self.phase1_iterations:
+                self.switch_to_phase2()
+        
+        # DAgger: Aggregate current rollout data to historical buffer
+        if self.use_dagger:
+            self.aggregate_current_rollout_to_buffer()
+        
         mean_behavior_loss = 0
         loss_accum = 0
+        cnt = 0
+
+        # Check if policy supports act_batch (Our new custom class)
+        is_recurrent_custom = hasattr(self.policy, 'act_batch')
+
+        if not is_recurrent_custom:
+            # Fallback for standard Non-Recurrent policies
+            # ... (Old logic for non-recurrent if needed) ...
+            # For brevity, assuming you are using the new Recurrent class
+            pass
+
+        # DAgger: Train on entire historical dataset instead of just current rollout
+        if self.use_dagger and self.dagger_buffer is not None and self.dagger_buffer['size'] > 0:
+            mean_behavior_loss = self._train_on_aggregated_buffer()
+        else:
+            # Fallback to original training on current rollout only
+            mean_behavior_loss = self._train_on_current_rollout()
+        
+        # Clear current rollout storage after aggregation and training
+        self.storage.clear()
+        
+        # Reset policy internal state (just in case)
+        self.policy.reset() 
+
+        return {"behavior": mean_behavior_loss}
+    
+    def _train_on_current_rollout(self):
+        """Original training method: train only on current rollout."""
+        mean_behavior_loss = 0
         cnt = 0
 
         # Check if policy supports act_batch (Our new custom class)
@@ -192,17 +348,101 @@ class Distillation:
                     mean_behavior_loss += loss_val.item()
                     cnt += 1
         
-        # Clear storage after epoch
-        self.storage.clear()
+        return mean_behavior_loss / max(cnt, 1)
+    
+    def _train_on_aggregated_buffer(self):
+        """DAgger training: train on entire historical aggregated dataset."""
+        mean_behavior_loss = 0
+        cnt = 0
         
-        # Reset policy internal state (just in case)
-        self.policy.reset() 
-
-        return {"behavior": mean_behavior_loss / max(cnt, 1)}
+        buffer_size = self.dagger_buffer['size']
+        batch_size = min(512, buffer_size // self.num_mini_batches)  # Adjust batch size based on buffer
+        
+        # Train for multiple epochs on the aggregated dataset
+        for epoch in range(self.num_learning_epochs):
+            # Shuffle indices for random sampling
+            indices = torch.randperm(buffer_size, device=self.device)
+            
+            # Mini-batch training
+            for start_idx in range(0, buffer_size, batch_size):
+                end_idx = min(start_idx + batch_size, buffer_size)
+                batch_indices = indices[start_idx:end_idx]
+                
+                # Sample batch from aggregated buffer
+                obs_batch = self.dagger_buffer['observations'][batch_indices]  # [Batch, Obs_Dim]
+                target_actions_batch = self.dagger_buffer['teacher_actions'][batch_indices]  # [Batch, Action_Dim]
+                
+                # For recurrent policy: need to handle sequences
+                # For simplicity, treat each sample independently (no temporal relationship)
+                if hasattr(self.policy, 'act_batch'):
+                    # Reshape to [Seq_Len=1, Batch, Dim] for recurrent interface
+                    obs_batch = obs_batch.unsqueeze(0)  # [1, Batch, Obs_Dim]
+                    target_actions_batch = target_actions_batch.unsqueeze(0)  # [1, Action_Dim]
+                    
+                    # Initialize hidden state
+                    B = obs_batch.shape[1]
+                    if hasattr(self.policy, 'rnn_type') and self.policy.rnn_type == 'lstm':
+                        hidden_state = (
+                            torch.zeros(self.policy.rnn_num_layers, B, self.policy.rnn_hidden_dim, device=self.device),
+                            torch.zeros(self.policy.rnn_num_layers, B, self.policy.rnn_hidden_dim, device=self.device)
+                        )
+                    else:
+                        hidden_state = torch.zeros(
+                            self.policy.rnn_num_layers, B, self.policy.rnn_hidden_dim, 
+                            device=self.device
+                        )
+                    
+                    # Forward pass
+                    pred_actions, _ = self.policy.act_batch(obs_batch, hidden_state)
+                    pred_actions = pred_actions.squeeze(0)  # [Batch, Action_Dim]
+                    target_actions_batch = target_actions_batch.squeeze(0)
+                else:
+                    # Non-recurrent policy
+                    pred_actions = self.policy.act(obs_batch)
+                
+                # Compute loss
+                loss = self.loss_fn(pred_actions, target_actions_batch, reduction='mean')
+                
+                # Backward pass
+                self.optimizer.zero_grad()
+                loss.backward()
+                
+                if self.is_multi_gpu:
+                    self.reduce_parameters()
+                if self.max_grad_norm:
+                    nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+                
+                self.optimizer.step()
+                
+                mean_behavior_loss += loss.item()
+                cnt += 1
+        
+        return mean_behavior_loss / max(cnt, 1)
 
     """
     Helper functions
     """
+
+    def switch_to_phase2(self):
+        """Switch from phase 1 (teacher actions) to phase 2 (student actions)."""
+        if self.training_phase == 1:
+            self.training_phase = 2
+            print(f"\n{'='*80}")
+            print(f"{'='*80}")
+            print(f"  SWITCHING TO PHASE 2: Now using STUDENT actions to update environment")
+            print(f"  Iteration: {self.current_iteration}")
+            print(f"{'='*80}")
+            print(f"{'='*80}\n")
+
+    def get_training_phase_info(self):
+        """Get information about current training phase."""
+        return {
+            "use_two_stage_training": self.use_two_stage_training,
+            "training_phase": self.training_phase,
+            "current_iteration": self.current_iteration,
+            "phase1_iterations": self.phase1_iterations,
+            "action_source": "teacher" if self.training_phase == 1 else "student"
+        }
 
     def broadcast_parameters(self):
         """Broadcast model parameters to all GPUs."""
