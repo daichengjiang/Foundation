@@ -219,7 +219,7 @@ class QuadcopterEnv(DirectRLEnv):
         self.render_mode = "human"
         
         #  从 cfg 读取电机时间常数
-        self.motor_tau = self.cfg.dynamics.motor_tau 
+        self.motor_tau = torch.full((self.num_envs, 1), self.cfg.dynamics.motor_tau, device=self.device)
         self.dt = self.cfg.sim.dt
         self.motor_alpha = self.dt / (self.dt + self.motor_tau)
         self._current_motor_speeds = torch.zeros(self.num_envs, 4, device=self.device)
@@ -228,35 +228,22 @@ class QuadcopterEnv(DirectRLEnv):
         # Controller
 
         # ... 获取动力学参数 ...
-        mass_tensor = torch.full((self.num_envs,), self.cfg.dynamics.mass, device=self.device)
-        arm_l_tensor = torch.full((self.num_envs,), self.cfg.dynamics.arm_length, device=self.device)
-        inertia_tensor = torch.tensor(self.cfg.dynamics.inertia, device=self.device).repeat(self.num_envs, 1)
-
-        # [关键] 获取 TWR
-        twr_tensor = torch.full((self.num_envs,), self.cfg.dynamics.thrust_to_weight, device=self.device)
-
+        # [修改] 将这些变量保存为 self.xxx，方便 DistillationEnv 继承后直接覆盖
+        self.mass_tensor = torch.full((self.num_envs,), self.cfg.dynamics.mass, device=self.device)
+        self.arm_l_tensor = torch.full((self.num_envs,), self.cfg.dynamics.arm_length, device=self.device)
+        self.inertia_tensor = torch.tensor(self.cfg.dynamics.inertia, device=self.device).repeat(self.num_envs, 1)
+        self.twr_tensor = torch.full((self.num_envs,), self.cfg.dynamics.thrust_to_weight, device=self.device)
 
         # Store the robot mass for wind force calculation
-        self._robot_mass = mass_tensor
-
-        # [关键] 根据推重比重新计算控制器的参数
-        # RAPTOR 的做法是：网络输出的动作通常是电机转速的映射。
-        # 如果控制器需要 thrust_constant (kf)，需要根据 TWR 和 Mass 调整。
-        # 在 SimpleQuadrotorController 内部，通常有一个 max_thrust 或 kf。
-        # 如果 SimpleQuadrotorController 是基于推力系数计算力的，你需要在这里传入调整后的系数。
-        
-        # 假设 SimpleQuadrotorController 内部根据 kf * omega^2 = thrust
-        # Max Thrust (4 motors) = Mass * Gravity * TWR
-        # Max Thrust per motor = (Mass * 9.81 * TWR) / 4
-        # 假设最大转速 max_omega 固定 (或者也需要缩放)，则 kf 需要调整
+        self._robot_mass = self.mass_tensor # Update reference
 
         self._controller = SimpleQuadrotorController(
             num_envs=self.num_envs,
             device=self.device,
-            mass=mass_tensor,
-            arm_length=arm_l_tensor,
-            inertia=inertia_tensor,
-            thrust_to_weight=twr_tensor  # <--- 传入这个关键参数
+            mass=self.mass_tensor,        # Pass self.var
+            arm_length=self.arm_l_tensor, # Pass self.var
+            inertia=self.inertia_tensor,  # Pass self.var
+            thrust_to_weight=self.twr_tensor  # Pass self.var
         )
 
         self._is_langevin_task = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
@@ -680,9 +667,16 @@ class QuadcopterEnv(DirectRLEnv):
         # 目标转速 (Target Omega)
         target_motor_speeds = omega_min + action_setpoint_normalized * (omega_max - omega_min)
         
+        # [修改] 确保 motor_alpha 根据当前的 motor_tau 动态计算 (如果是 Variable Delay)
+        # 即使 motor_tau 是常量，这也保证了如果在外部被修改了，这里能生效
+        # 确保 motor_tau 是 (N, 1) 形状以支持与 (N, 4) 的 speeds 进行广播
+        if self.motor_tau.shape != (self.num_envs, 1):
+            self.motor_tau = self.motor_tau.view(self.num_envs, 1)
+
+        self.motor_alpha = self.dt / (self.dt + self.motor_tau)
+
         # 更新当前电机转速 (Current Omega)
-        # formula: current = alpha * target + (1 - alpha) * previous
-        # 注意：RAPTOR 论文中上升和下降的延迟可能不同 (Tm_up, Tm_down)
+        # 这里的乘法现在是 (N, 1) * (N, 4)，PyTorch 会自动广播
         self._current_motor_speeds = (self.motor_alpha * target_motor_speeds + 
                                       (1.0 - self.motor_alpha) * self._current_motor_speeds)
 
