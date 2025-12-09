@@ -52,7 +52,7 @@ class QuadcopterDistillationPolicyCfg(RslRlPpoActorCriticCfg):
     teacher_recurrent: bool = False               # 教师为MLP (非循环网络)
     
     # *** 学生网络/策略通用参数 ***
-    init_noise_std = 1.0
+    init_noise_std = 0.0
     activation = "elu"
     class_name = "StudentTeacherRecurrentCustom"  # 核心：指定自定义的策略实现类
     
@@ -66,7 +66,7 @@ class QuadcopterDistillationPolicyCfg(RslRlPpoActorCriticCfg):
 
 @configclass
 class QuadcopterDistillationRunnerCfg(RslRlOnPolicyRunnerCfg):
-    num_steps_per_env = 100
+    num_steps_per_env = 400
     max_iterations = 1500
     save_interval = 100
     experiment_name = "distillation"

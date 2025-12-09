@@ -133,39 +133,56 @@ class StudentTeacherRecurrentCustom(StudentTeacher):
                  else:
                      self.hidden_state[:, env_ids, :] = 0.0
 
-    def act(self, observations):
-        # Inference: [Batch, Dim]
+    # =================================================================
+    # [新增] 核心前向传播：只负责计算 Mean 和更新 RNN 状态
+    # =================================================================
+    def _forward_head(self, observations):
         batch_size = observations.shape[0]
-        
-        # Init hidden state if needed
+        device = observations.device
+
+        # 1. 初始化隐状态 (保持原有逻辑，处理 LSTM/GRU 差异)
         if self.hidden_state is None or self.hidden_state.shape[1] != batch_size:
-             device = observations.device
              if self.rnn_type.lower() == 'lstm':
                  self.hidden_state = (torch.zeros(self.rnn_num_layers, batch_size, self.rnn_hidden_dim, device=device),
                                       torch.zeros(self.rnn_num_layers, batch_size, self.rnn_hidden_dim, device=device))
              else:
                  self.hidden_state = torch.zeros(self.rnn_num_layers, batch_size, self.rnn_hidden_dim, device=device)
 
+        # 2. 网络计算 (保持原有逻辑)
         x = self.pre_rnn_mlp(observations)
-        x = x.unsqueeze(0) # [Seq=1, Batch, Dim]
-        
-        # Forward RNN
+        x = x.unsqueeze(0)  # [Seq=1, Batch, Dim]
         x, self.hidden_state = self.rnn(x, self.hidden_state)
-        
         x = x.squeeze(0)
         x = self.post_rnn_mlp(x)
         mean = self.student(x)
+        return mean
+
+    # =================================================================
+    # [修正] 推理模式：严格确定性，不涉及概率分布
+    # =================================================================
+    def act_inference(self, observations):
+        # 你的 distillation.py Phase 2 应该调用这个
+        return self._forward_head(observations)
+
+    # =================================================================
+    # [修正] 训练模式：兼容 std=0 的情况
+    # =================================================================
+    def act(self, observations):
+        mean = self._forward_head(observations)
         
+        # 安全网：如果方差极小（例如设为0），跳过分布构建，防止报错
+        # 这保证了代码的健壮性
+        if self.std.mean() < 1e-6:
+            self.distribution = None
+            return mean
+            
+        # 正常情况：构建分布并采样
         self.distribution = Normal(mean, self.std.expand_as(mean))
         return self.distribution.sample()
     
-    def act_inference(self, observations):
-        # Similar to act but returns mean
-        return self.act(observations) # act() updates self.distribution, we can just return mean from there if needed, but here let's reuse logic. 
-        # Actually standard rsl_rl act_inference returns just mean actions.
-        # Let's just call act and return mean to be safe and consistent
-        _ = self.act(observations)
-        return self.distribution.mean
+    @property
+    def action_std(self):
+        return self.std
 
     def act_batch(self, observations, hidden_states):
         """
@@ -200,7 +217,7 @@ class StudentTeacherRecurrentCustom(StudentTeacher):
     # Keep compatibility with existing code
     def evaluate(self, teacher_observations):
         # return super().evaluate(teacher_observations)
-        
+
         # 获取 Teacher 的原始输出 (Logits)
         raw_actions = super().evaluate(teacher_observations)
         # 加上 Tanh 激活，使其范围限制在 (-1, 1)，与 PPO 训练时保持一致

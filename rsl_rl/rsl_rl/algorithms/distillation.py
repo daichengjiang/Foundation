@@ -160,6 +160,17 @@ class Distillation:
             for obs_batch, target_actions_batch, masks_batch in generator:
                 # obs_batch: [Seq_Len, Batch_Size, Dim]
                 # masks_batch: [Seq_Len, Batch_Size]
+
+                # ================= [新增: Burn-in 策略] =================
+                # 定义预热步数，通常 10-20 步足够让 GRU 恢复记忆
+                burn_in_steps = 20 
+                
+                # 复制一份 mask，以免修改原始数据
+                # 注意：obs_batch 形状是 [Seq_Len, Batch, Dim]
+                # 我们要屏蔽前 burn_in_steps 行
+                if masks_batch.shape[0] > burn_in_steps:
+                    masks_batch[:burn_in_steps, :] = 0.0
+                # =======================================================
                 
                 T, B, _ = obs_batch.shape
                 
