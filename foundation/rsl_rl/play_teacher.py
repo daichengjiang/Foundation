@@ -21,7 +21,7 @@ parser = argparse.ArgumentParser(description="Play and evaluate trajectory track
 parser.add_argument("--video", action="store_true", default=False, help="Record videos during playing.")
 parser.add_argument("--video_length", type=int, default=2000, help="Length of the recorded video (in steps).")
 parser.add_argument("--video_interval", type=int, default=10000, help="Interval between video recordings (in steps).")
-parser.add_argument("--num_envs", type=int, default=4, help="Number of environments to simulate.")
+parser.add_argument("--num_envs", type=int, default=1, help="Number of environments to simulate.")
 parser.add_argument("--task", type=str, default=None, required=True, help="Name of the task.")
 parser.add_argument("--seed", type=int, default=42, help="Seed used for the environment")
 parser.add_argument("--max_steps", type=int, default=10000, help="Maximum steps to run for trajectory tracking.")
@@ -30,6 +30,10 @@ parser.add_argument(
     "--disable_fabric", action="store_true", default=False, help="Disable fabric and use USD I/O operations."
 )
 parser.add_argument("--realtime", action="store_true", default=False, help="Run in real-time, if possible.")
+
+# [新增] 动力学 CSV 参数
+parser.add_argument("--dynamics_csv", type=str, default=None, help="Path to teacher_dynamics.csv to overwrite env physics.")
+
 # append RSL-RL cli arguments (this includes --checkpoint)
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -54,7 +58,11 @@ import os
 import time
 import torch
 import numpy as np
+import pandas as pd  # [新增]
 from datetime import datetime
+
+# [修正] 使用正确的 Isaac Sim Core 路径
+import isaacsim.core.utils.prims as prims_utils
 
 from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper
 from rsl_rl.runners import OnPolicyRunner
@@ -133,6 +141,97 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # wrap around environment for rsl-rl
     env = RslRlVecEnvWrapper(env)
+
+    # =======================================================================
+    # [关键修改] 覆盖动力学参数 (Dynamics Overwrite)
+    # 逻辑与 play_student.py 保持一致，确保 Teacher 在熟悉的物理参数下飞行
+    # =======================================================================
+    if args_cli.dynamics_csv and os.path.exists(args_cli.dynamics_csv):
+        print(f"\n[INFO] Loading dynamics from CSV: {args_cli.dynamics_csv}")
+        df = pd.read_csv(args_cli.dynamics_csv)
+        total_rows = len(df)
+        
+        # 使用取模运算进行循环分配
+        sampled_indices = [i % total_rows for i in range(env.num_envs)]
+        sampled_df = df.iloc[sampled_indices]
+        
+        print(f"[INFO] Assigned dynamics cyclically to {env.num_envs} envs.")
+        
+        device = torch.device(env.unwrapped.device)
+
+        # 提取参数并转为 Tensor
+        mass_t = torch.tensor(sampled_df['mass'].values, device=device, dtype=torch.float32)
+        arm_t = torch.tensor(sampled_df['arm_length'].values, device=device, dtype=torch.float32)
+        twr_t = torch.tensor(sampled_df['twr'].values, device=device, dtype=torch.float32)
+        tau_t = torch.tensor(sampled_df['motor_tau'].values, device=device, dtype=torch.float32)
+        
+        ixx = torch.tensor(sampled_df['Ixx'].values, device=device, dtype=torch.float32)
+        iyy = torch.tensor(sampled_df['Iyy'].values, device=device, dtype=torch.float32)
+        izz = torch.tensor(sampled_df['Izz'].values, device=device, dtype=torch.float32)
+        inertia_t = torch.stack([ixx, iyy, izz], dim=1) # (N, 3)
+        
+        print(f"  > Env 0 Dynamics (Row {sampled_indices[0]}): Mass={mass_t[0]:.4f}, TWR={twr_t[0]:.2f}")
+
+        # 强制覆盖 Environment 内部变量
+        unwrapped_env = env.unwrapped
+        
+        # 1. 覆盖环境 Tensor
+        unwrapped_env.mass_tensor = mass_t
+        unwrapped_env.arm_l_tensor = arm_t
+        unwrapped_env.inertia_tensor = inertia_t
+        unwrapped_env.twr_tensor = twr_t
+        unwrapped_env.motor_tau = tau_t.view(-1, 1)
+        
+        # 2. 覆盖控制器 Controller 参数
+        # (Teacher 策略通常依赖控制器参数来做归一化或重力补偿，这步非常关键)
+        # 注意：这里我们手动赋值给 controller 的内部变量
+        unwrapped_env._controller.mass_ = mass_t
+        if not hasattr(unwrapped_env._controller, 'thrust_to_weight_'):
+             # 如果 Controller 之前没存 TWR，这里手动加上
+             unwrapped_env._controller.thrust_to_weight_ = twr_t
+        else:
+             unwrapped_env._controller.thrust_to_weight_ = twr_t
+
+        # [关键] 调用 Controller 的更新函数，重新计算推力系数！
+        # 请确保你在 simple_controller.py 中实现了 update_dependent_params 方法
+        if hasattr(unwrapped_env._controller, 'update_dependent_params'):
+            unwrapped_env._controller.update_dependent_params()
+        else:
+            print("\n[WARNING] Controller missing 'update_dependent_params' method!")
+            print("          Thrust curves WILL NOT be updated, likely causing Z-axis drift.")
+
+        # 3. 覆盖 Physics (USD/PhysX)
+        print(f"[Override Check] Syncing physics properties to USD/PhysX...")
+        for i in range(env.num_envs):
+            # 获取 CSV 中的具体数值
+            m_val = mass_t[i].item()
+            Ixx_val = inertia_t[i, 0].item()
+            Iyy_val = inertia_t[i, 1].item()
+            Izz_val = inertia_t[i, 2].item()
+            
+            # 找到对应的 Prim 路径 (假设标准路径结构)
+            # 可以在 Isaac Sim GUI 的 Stage 树里确认一下 "body" 的名字
+            prim_path = f"/World/envs/env_{i}/Robot/body"
+            
+            # 修改质量
+            prims_utils.set_prim_property(prim_path, "physics:mass", m_val)
+            
+            # 修改惯性张量 (Isaac Sim 需要 (Ixx, Iyy, Izz))
+            prims_utils.set_prim_property(prim_path, "physics:diagonalInertia", (Ixx_val, Iyy_val, Izz_val))
+            
+            if i == 0:
+                print(f"  > PhysX Env 0 Updated: Mass={m_val:.4f}, Inertia={Ixx_val:.2e}, {Iyy_val:.2e}, {Izz_val:.2e}")
+
+        # 4. 重新计算派生参数
+        unwrapped_env.motor_alpha = unwrapped_env.dt / (unwrapped_env.dt + unwrapped_env.motor_tau)
+        
+    else:
+        print("\n[WARNING] No dynamics CSV provided. Using DEFAULT Crazyflie dynamics!")
+        print("          If your Teacher was trained on specific dynamics, expect biases (Z-offset).")
+
+    # =======================================================================
+    # [修改结束]
+    # =======================================================================
 
     # create runner from rsl-rl
     runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)

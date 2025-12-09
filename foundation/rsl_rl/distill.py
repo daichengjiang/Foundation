@@ -5,9 +5,11 @@
 Usage:
     python distill.py \
       --teacher_dir logs/rsl_rl/raptor_teachers/2025-XX-XX_XX-XX-XX \
-      --num_teachers 2 \
-      --epochs 50 \
-      --headless  # (Optional) Run without GUI
+      --num_teachers 100 \
+      --epochs 1000 \
+      --headless \
+      --wandb_project "RAPTOR-Distillation" \
+      --wandb_entity "your_entity_name"  # Optional
 """
 
 import argparse
@@ -28,11 +30,16 @@ AppLauncher.add_app_launcher_args(parser)
 # Add RAPTOR specific args
 parser.add_argument("--teacher_dir", type=str, required=True, help="Path to timestamp folder containing teacher_XXXX folders and csv")
 parser.add_argument("--epochs", type=int, default=1000)
-parser.add_argument("--steps_per_epoch", type=int, default=500, help="Sequence length (5s @ 100Hz)")
-parser.add_argument("--warmup_epochs", type=int, default=10, help="Epochs where teacher drives")
+parser.add_argument("--steps_per_epoch", type=int, default=2000, help="Sequence length (Higher is better for GRU stability)")
+parser.add_argument("--warmup_epochs", type=int, default=10, help="Epochs where teacher drives (DAgger-like)")
 parser.add_argument("--student_hidden", type=int, default=16)
-# Note: --save_path is now optional/ignored as we auto-generate the path inside teacher_dir
 parser.add_argument("--num_teachers", type=int, default=None, help="Number of teachers to use (default: use all in CSV)")
+
+# [新增] WandB Arguments
+parser.add_argument("--wandb_project", type=str, default="RAPTOR-Distillation", help="WandB Project Name")
+parser.add_argument("--wandb_entity", type=str, default=None, help="WandB Entity (Username or Team)")
+parser.add_argument("--wandb_group", type=str, default=None, help="WandB Group Name")
+parser.add_argument("--no_wandb", action="store_true", help="Disable WandB logging")
 
 # Parse args
 args = parser.parse_args()
@@ -53,6 +60,7 @@ import time
 from tqdm import tqdm
 import gymnasium as gym
 import torch.nn.functional as F
+import wandb  # [新增] Import WandB
 
 # Isaac Lab imports
 from isaaclab.envs import DirectRLEnvCfg
@@ -61,7 +69,6 @@ from foundation.tasks.point_ctrl.quad_point_ctrl_env_single_dense import Quadcop
 
 # Helper for vmap
 from torch.func import functional_call, vmap
-import isaacsim.core.utils.prims as prims_utils  # [新增] 用于修改物理属性
 
 # ---------------------------------------------------------------------------
 # 2. Student Policy Architecture (RAPTOR Paper Fig 7B)
@@ -89,8 +96,8 @@ class StudentPolicy(nn.Module):
         
         x = F.tanh(self.input_layer(x))
         x, new_hidden = self.gru(x, hidden_state)
+        # Output is Linear (No Tanh), managed by MSE Loss and clamping during inference
         x = self.output_layer(x)
-        # Output shape is always (Batch, Seq_Len, Action_Dim)
         return x, new_hidden
 
 # ---------------------------------------------------------------------------
@@ -104,6 +111,7 @@ class EnsembleTeacherPolicy:
         print(f"[Distill] Loading first {num_teachers} teachers from {teacher_log_dir}...")
 
         # Define the teacher architecture (Must match what RSL-RL trained)
+        # Assuming empirical_normalization=False, so no RunningMeanStd needed.
         self.base_model = nn.Sequential(
             nn.Linear(obs_dim, 64),
             nn.ELU(), 
@@ -138,25 +146,19 @@ class EnsembleTeacherPolicy:
             
             for sub in possible_subs:
                 if not os.path.exists(sub): continue
-                
-                # Priority 1: User requested 'best_model.pt'
+                # Priority: best_model.pt -> model.pt -> numbered.pt
                 if os.path.exists(os.path.join(sub, "best_model.pt")):
                     model_path = os.path.join(sub, "best_model.pt")
                     break
-                
-                # Priority 2: Standard RSL-RL 'model.pt'
                 if os.path.exists(os.path.join(sub, "model.pt")):
                     model_path = os.path.join(sub, "model.pt")
                     break
-                
-                # Priority 3: Parse numbered files
                 files = [f for f in os.listdir(sub) if f.endswith('.pt')]
                 numbered_files = []
                 for f in files:
                     parts = f.replace(".pt", "").split("_")
                     if len(parts) > 1 and parts[-1].isdigit():
                         numbered_files.append((int(parts[-1]), f))
-                
                 if numbered_files:
                     numbered_files.sort(key=lambda x: x[0])
                     model_path = os.path.join(sub, numbered_files[-1][1])
@@ -171,34 +173,25 @@ class EnsembleTeacherPolicy:
             # Extract Actor Weights
             full_dict = ckpt['model_state_dict']
             actor_dict = {}
-            
             target_keys = set(self.base_model.state_dict().keys())
             
             for key, val in full_dict.items():
                 if 'actor' in key and 'critic' not in key and 'std' not in key:
                     new_key = key
-                    prefixes = [
-                        "actor_architecture.actor.layers.", 
-                        "actor.layers.", 
-                        "actor."
-                    ]
+                    prefixes = ["actor_architecture.actor.layers.", "actor.layers.", "actor."]
                     for p in prefixes:
                         if new_key.startswith(p):
                             new_key = new_key[len(p):]
                             break
-                    
                     if new_key in target_keys:
                         actor_dict[new_key] = val
             
             if len(actor_dict) == 0:
-                print(f"\n[Error] Failed to map weights for Teacher {i} from {model_path}")
-                print(f"Expected keys: {list(target_keys)[:3]}...")
-                print(f"Found keys in ckpt (first 5): {list(full_dict.keys())[:5]}...")
-                raise ValueError(f"Could not map actor weights for teacher {i}.")
+                raise ValueError(f"Could not map actor weights for teacher {i} from {model_path}.")
             
             models_state_dicts.append(actor_dict)
 
-        # Manually stack weights
+        # Manually stack weights for vmap
         print("[Distill] Stacking teacher weights for vmap...")
         self.stacked_params = {}
         if len(models_state_dicts) > 0:
@@ -223,6 +216,9 @@ class EnsembleTeacherPolicy:
 
 class DistillationEnv(QuadcopterEnv):
     def __init__(self, cfg, dynamics_csv_path, device, target_num_teachers=None):
+        # [局部导入以避免加载顺序问题]
+        import isaacsim.core.utils.prims as prims_utils
+        
         # Read CSV
         self.dynamics_df = pd.read_csv(dynamics_csv_path)
         
@@ -254,19 +250,30 @@ class DistillationEnv(QuadcopterEnv):
         izz = torch.tensor(self.dynamics_df['Izz'].values, device=device, dtype=torch.float32)
         self.inertia_tensor = torch.stack([ixx, iyy, izz], dim=1) # (N, 3)
 
-        # Force Update Controller parameters
-        self._controller.mass = self.mass_tensor
-        self._controller.arm_length = self.arm_tensor
-        self._controller.inertia = self.inertia_tensor
-        self._controller.thrust_to_weight = self.twr_tensor
+        # ================= [参数覆盖逻辑] =================
         
-        # Update motor tau
+        # 1. Force Update Controller parameters (Python Layer)
+        self._controller.mass_ = self.mass_tensor
+        self._controller.arm_l_ = self.arm_tensor 
+        self._controller.inertia_ = self.inertia_tensor
+        
+        # 手动注入 TWR
+        self._controller.thrust_to_weight_ = self.twr_tensor
+        
+        # 2. 触发控制器内部重新计算推力系数
+        if hasattr(self._controller, 'update_dependent_params'):
+            self._controller.update_dependent_params()
+            print("[Distill] Controller thrust maps updated successfully.")
+        else:
+            print("\n[WARNING] Controller missing 'update_dependent_params' method!")
+
+        # 3. Update motor tau (Env Layer)
         self.motor_tau = self.tau_tensor.view(self.num_envs, 1) # Ensure correct shape
         self.dt = self.cfg.sim.dt
         self.motor_alpha = self.dt / (self.dt + self.motor_tau)
 
-        # [NEW] Force Update Physics Engine (USD) parameters
-        # This overrides the defaults set by super().__init__
+        # 4. Force Update Physics Engine (USD/PhysX Layer)
+        print("[Distill] Syncing physics properties to USD/PhysX...")
         for i in range(self.num_envs):
             # Assumes standard structure: /World/envs/env_{i}/Robot/body
             env_prim_path = f"/World/envs/env_{i}/Robot/body"
@@ -277,15 +284,23 @@ class DistillationEnv(QuadcopterEnv):
             prims_utils.set_prim_property(env_prim_path, "physics:mass", m)
             prims_utils.set_prim_property(env_prim_path, "physics:diagonalInertia", inertia)
             
+            # [DEBUG CHECK for Env 0]
             if i == 0:
                 print(f"  > Env 0 Physics Updated: Mass={m:.4f}, Inertia={inertia}")
-
+                
+                # 再次确认 Controller 的状态
+                ctrl_mass = self._controller.mass_[0].item()
+                ctrl_twr = self._controller.thrust_to_weight_[0].item()
+                print(f"  > Env 0 Controller Check: Mass={ctrl_mass:.4f}, TWR={ctrl_twr:.2f}")
+                
+                if abs(m - ctrl_mass) > 1e-5:
+                    print("!!! CRITICAL ERROR: Physics Mass != Controller Mass !!!")
 
     def _reset_idx(self, env_ids):
         # Call parent reset to handle physics/state reset
         super()._reset_idx(env_ids)
         pass
-
+    
 # ---------------------------------------------------------------------------
 # 5. Main Training Logic
 # ---------------------------------------------------------------------------
@@ -302,7 +317,19 @@ def main():
         print(f"Error: CSV not found at {csv_path}")
         return
 
-    # [新增] 自动设置保存路径: {teacher_dir}/student/
+    # [新增] WandB 初始化
+    if not args.no_wandb:
+        run_name = f"distill_{time.strftime('%Y-%m-%d_%H-%M-%S')}"
+        wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            group=args.wandb_group,
+            name=run_name,
+            config=vars(args)
+        )
+        print(f"[WandB] Initialized run: {run_name}")
+
+    # 自动设置保存路径: {teacher_dir}/student/
     student_save_dir = os.path.join(args.teacher_dir, "student")
     os.makedirs(student_save_dir, exist_ok=True)
     final_save_path = os.path.join(student_save_dir, "student_policy.pt")
@@ -318,7 +345,7 @@ def main():
 
     # 1. Setup Environment
     env_cfg = QuadcopterEnvCfg()
-    env_cfg.train_or_play = True 
+    env_cfg.train_or_play = True # Training mode (random recovery)
     env_cfg.sim.device = str(device) 
     env_cfg.seed = 42
     
@@ -348,6 +375,7 @@ def main():
     )
 
     # 4. Initialize Student (With MASKED observation dimension)
+    # Output is Linear, no Tanh
     student = StudentPolicy(obs_dim=student_obs_dim, action_dim=action_dim, hidden_dim=args.student_hidden).to(device)
     optimizer = optim.Adam(student.parameters(), lr=1e-3) 
     mse_loss = nn.MSELoss()
@@ -372,42 +400,52 @@ def main():
         traj_student_obs = [] # Store masked observations
         traj_teacher_actions = []
         
+        # [新增] 统计本 Epoch 的总 Reward
+        epoch_reward_sum = 0.0
+        step_count = 0
+        
         student.train() 
         
         with torch.no_grad():
             for step in range(args.steps_per_epoch):
-                # 1. Get Teacher Actions (Uses Full Obs)
+                # 1. Get Teacher Actions (Uses Full Obs) -> Tanh output
                 teacher_actions = teachers.get_actions(full_obs)
-                
+
                 # 2. Prepare Student Obs (Mask Motor Speeds)
                 student_obs = full_obs[:, :-4] 
                 
-                # 3. Get Student Actions
-                # Output shape: (N, 1, Action)
+                # 3. Get Student Actions -> Linear output
                 student_actions_seq, hidden_state = student(student_obs, hidden_state)
-                # [Fix] Squeeze to (N, Action) for environment step
-                student_actions = student_actions_seq.squeeze(1)
+                student_actions_linear = student_actions_seq.squeeze(1)
+                
+                # IMPORTANT: For environment stepping, clamp the linear output
+                student_actions_env = torch.clamp(student_actions_linear, -1.0, 1.0)
                 
                 # 4. Select Action to Drive Environment
+                # Warmup: Teacher drives. On-Policy: Student drives.
                 if epoch < args.warmup_epochs:
                     env_actions = teacher_actions
                 else:
-                    env_actions = student_actions
+                    env_actions = student_actions_env
                 
-                # Store data for training (Use Student's view)
+                # Store data for training
                 traj_student_obs.append(student_obs.clone())
-                traj_teacher_actions.append(teacher_actions.clone())
+                traj_teacher_actions.append(teacher_actions.clone()) # Targets are Tanh'd (-1, 1)
                 
                 # 5. Step Environment
                 obs_dict, rewards, dones, timeouts, extras = env.step(env_actions)
                 full_obs = obs_dict['policy']
+                
+                # [新增] 累加 Reward
+                epoch_reward_sum += rewards.mean().item()
+                step_count += 1
                 
                 if dones.any():
                      hidden_state[:, dones, :] = 0.0
 
         # B. Training Phase (BPTT)
         # ------------------------
-        # Stack trajectories: (Seq_Len, Batch, Dim) -> (Batch, Seq_Len, Dim)
+        # Stack: (Seq_Len, Batch, Dim) -> (Batch, Seq_Len, Dim)
         batch_obs = torch.stack(traj_student_obs).permute(1, 0, 2) 
         batch_targets = torch.stack(traj_teacher_actions).permute(1, 0, 2)
         
@@ -416,14 +454,17 @@ def main():
         # Forward pass Student on WHOLE trajectory using Masked Obs
         pred_actions, _ = student(batch_obs)
         
+        # MSE Loss: Minimize (Student_Linear - Teacher_Tanh)^2
         loss = mse_loss(pred_actions, batch_targets)
         loss.backward()
         
         torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0)
         optimizer.step()
         
-        # [Fix] Define current_loss
         current_loss = loss.item()
+        
+        # 计算平均 Reward
+        mean_reward = epoch_reward_sum / step_count if step_count > 0 else 0.0
 
         # C. Logging
         # ----------
@@ -437,7 +478,16 @@ def main():
                 torch.save(student.state_dict(), best_save_path)
                 is_best = " [New Best!]"
 
-        print(f"Epoch {epoch+1}/{args.epochs} | Loss: {current_loss:.6f}{is_best} | Mode: {mode} | Time: {epoch_time:.2f}s")
+        print(f"Epoch {epoch+1}/{args.epochs} | Loss: {current_loss:.6f}{is_best} | Reward: {mean_reward:.2f} | Mode: {mode} | Time: {epoch_time:.2f}s")
+        
+        # [新增] WandB Log
+        if not args.no_wandb:
+            wandb.log({
+                "Loss/MSE": current_loss,
+                "Reward/Mean": mean_reward,
+                "Epoch": epoch,
+                "Warmup Phase": 1 if epoch < args.warmup_epochs else 0
+            })
         
         # Save Checkpoint periodically
         if (epoch + 1) % 100 == 0:
@@ -451,6 +501,10 @@ def main():
     print("Distillation Complete!")
     print(f"Last policy saved to: {final_save_path}")
     print(f"Best policy saved to: {best_save_path} (Loss: {min_loss:.6f})")
+    
+    if not args.no_wandb:
+        wandb.finish()
+    
     env.close()
 
 if __name__ == "__main__":

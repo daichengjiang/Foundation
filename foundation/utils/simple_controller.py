@@ -31,6 +31,21 @@ class SimpleQuadrotorController:
                  thrust_to_weight: torch.Tensor, # Shape: [num_envs] (Crucial for RAPTOR)
                  gravity: float = 9.81):
         
+        # ================= [DEBUG START: 检查控制器接收到的参数] =================
+        print(f"\n{'='*20} [DEBUG: SimpleController Init] {'='*20}")
+        print(f"Controller Device: {device}")
+        print(f"Received Mass[0] (Expected random): {mass[0].item():.6f}")
+        print(f"Received TWR[0]  (Expected random): {thrust_to_weight[0].item():.6f}")
+        print(f"Received Arm[0]  (Expected random): {arm_length[0].item():.6f}")
+        
+        # 简单检查是否是 Crazyflie 的默认值 (0.028 / 2.25)
+        if abs(mass[0].item() - 0.0282) < 1e-5:
+            print("!!! WARNING: Mass looks like Default Crazyflie Mass! Override might have failed!")
+        else:
+            print(">>> CHECK PASS: Mass is NOT default.")
+        print(f"{'='*60}\n")
+        # ================= [DEBUG END] =================
+
         self.num_envs = num_envs
         self.device = device
         self.g = gravity
@@ -39,6 +54,7 @@ class SimpleQuadrotorController:
         self.mass_ = mass.to(device)
         self.arm_l_ = arm_length.to(device)
         self.inertia_ = inertia.to(device)
+        self.thrust_to_weight = thrust_to_weight.to(device)        
 
         # --- 2. Motor Limits (Baseline: Crazyflie 2.1) ---
         # Used for normalization/denormalization
@@ -87,6 +103,34 @@ class SimpleQuadrotorController:
         print(f"[Dynamics] Mass Range: [{self.mass_.min():.3f}, {self.mass_.max():.3f}] kg")
         print(f"[Dynamics] Arm Range:  [{self.arm_l_.min():.3f}, {self.arm_l_.max():.3f}] m")
         print(f"[Dynamics] TWR Range:  [{thrust_to_weight.min():.2f}, {thrust_to_weight.max():.2f}]")
+
+        # [建议] 在最后重新计算一次参数，确保依赖项（如 thrust_map_）被更新
+        self.update_dependent_params()
+
+    # [新增] 用于更新依赖参数的方法
+    def update_dependent_params(self):
+        # 当外部修改了 self.mass_ 或 self.thrust_to_weight_ 后，必须重新计算推力曲线！
+        # 否则只改 mass 不改 thrust_map，推力依然是错的
+        
+        # 1. 重新计算最大推力
+        base_coeffs = torch.tensor([9.96063125e-08, -2.55003087e-05, 5.84422691e-03], 
+                                   device=self.device).expand(self.num_envs, 3)
+        w_max = self.motor_omega_max_
+        base_thrust_max = (base_coeffs[:, 0] * w_max**2 + 
+                           base_coeffs[:, 1] * w_max + 
+                           base_coeffs[:, 2])
+        
+        # 使用当前的 mass_ 和 thrust_to_weight_
+        # 注意：这里需要确保你已经把传入的 thrust_to_weight 存为了 self.thrust_to_weight_
+        # 如果你原代码没存，请在 init 里加上 self.thrust_to_weight_ = thrust_to_weight
+        if hasattr(self, 'thrust_to_weight_'):
+            target_thrust_max = (self.mass_ * self.g * self.thrust_to_weight_) / 4.0
+            thrust_scale = target_thrust_max / (base_thrust_max + 1e-8)
+            self.thrust_map_ = base_coeffs * thrust_scale.unsqueeze(1)
+            
+            print(f"[Controller UPDATE] Recalculated Thrust Map for Mass={self.mass_[0]:.4f}, TWR={self.thrust_to_weight_[0]:.2f}")
+        else:
+            print("[Controller UPDATE] Warning: thrust_to_weight_ not found in controller.")
 
     def _compute_allocation_matrix(self):
         """

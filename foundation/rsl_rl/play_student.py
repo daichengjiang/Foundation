@@ -93,7 +93,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg, agent_cfg: RslRlOnPolic
     
     # 1. Configure Environment
     env_cfg.scene.num_envs = args_cli.num_envs
-    env_cfg.trajectory_type = "figure8"
+    # env_cfg.trajectory_type = "figure8"
+    env_cfg.trajectory_type = "langevin"
     env_cfg.prob_null_trajectory = 0.0
     env_cfg.train_or_play = False
     env_cfg.debug_vis = True

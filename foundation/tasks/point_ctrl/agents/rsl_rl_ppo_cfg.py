@@ -17,7 +17,7 @@ class QuadcopterPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     max_iterations = 5000
     save_interval = 25
     experiment_name = "point_ctrl_direct"
-    empirical_normalization = True
+    empirical_normalization = False
     policy = RslRlPpoActorCriticCfg(
         init_noise_std=1.0,
         actor_hidden_dims=[64, 64, 64],
