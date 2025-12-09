@@ -90,8 +90,10 @@ class StudentTeacherRecurrentCustom(StudentTeacher):
                 student_layers.append(nn.Linear(student_hidden_dims[i], student_hidden_dims[i + 1]))
                 student_layers.append(activation_fn)
             student_layers.append(nn.Linear(student_hidden_dims[-1], num_actions))
+            student_layers.append(nn.Tanh())  # Add tanh activation to output layer
         else:
             student_layers.append(nn.Linear(input_dim, num_actions))
+            student_layers.append(nn.Tanh())  # Add tanh activation to output layer
         
         self.student = nn.Sequential(*student_layers)
         
@@ -197,7 +199,12 @@ class StudentTeacherRecurrentCustom(StudentTeacher):
 
     # Keep compatibility with existing code
     def evaluate(self, teacher_observations):
-        return super().evaluate(teacher_observations)
+        # return super().evaluate(teacher_observations)
+        
+        # 获取 Teacher 的原始输出 (Logits)
+        raw_actions = super().evaluate(teacher_observations)
+        # 加上 Tanh 激活，使其范围限制在 (-1, 1)，与 PPO 训练时保持一致
+        return torch.tanh(raw_actions)
     
     def get_hidden_states(self):
         return self.hidden_state

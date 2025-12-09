@@ -527,8 +527,13 @@ class OnPolicyRunner:
             self.alg.rnd.train()
         # -- Normalization
         if self.empirical_normalization:
-            self.obs_normalizer.train()
-            self.privileged_obs_normalizer.train()
+            self.obs_normalizer.train() # Student 的 normalizer 可以更新
+            
+            # [修改] 如果是蒸馏任务，Teacher 的 Normalizer 必须冻结(eval模式)！
+            if self.training_type == "distillation":
+                self.privileged_obs_normalizer.eval() 
+            else:
+                self.privileged_obs_normalizer.train()
 
     def eval_mode(self):
         # -- PPO
