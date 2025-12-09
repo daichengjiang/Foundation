@@ -158,12 +158,35 @@ class StudentTeacherRecurrentCustom(StudentTeacher):
         return self.distribution.sample()
     
     def act_inference(self, observations):
-        # Similar to act but returns mean
-        return self.act(observations) # act() updates self.distribution, we can just return mean from there if needed, but here let's reuse logic. 
-        # Actually standard rsl_rl act_inference returns just mean actions.
-        # Let's just call act and return mean to be safe and consistent
-        _ = self.act(observations)
-        return self.distribution.mean
+        # Deterministic forward pass (no sampling) for inference/rollout
+        batch_size = observations.shape[0]
+
+        # Initialize hidden state if shape changed or not set
+        if self.hidden_state is None or self.hidden_state.shape[1] != batch_size:
+            device = observations.device
+            if self.rnn_type.lower() == 'lstm':
+                self.hidden_state = (
+                    torch.zeros(self.rnn_num_layers, batch_size, self.rnn_hidden_dim, device=device),
+                    torch.zeros(self.rnn_num_layers, batch_size, self.rnn_hidden_dim, device=device),
+                )
+            else:
+                self.hidden_state = torch.zeros(
+                    self.rnn_num_layers, batch_size, self.rnn_hidden_dim, device=device
+                )
+
+        x = self.pre_rnn_mlp(observations)
+        x = x.unsqueeze(0)  # [Seq=1, Batch, Dim]
+
+        # Forward RNN deterministically
+        x, self.hidden_state = self.rnn(x, self.hidden_state)
+
+        x = x.squeeze(0)
+        x = self.post_rnn_mlp(x)
+        mean = self.student(x)
+
+        # Keep distribution for compatibility with logging utilities
+        self.distribution = Normal(mean, self.std.expand_as(mean))
+        return mean
 
     def act_batch(self, observations, hidden_states):
         """
@@ -208,3 +231,4 @@ class StudentTeacherRecurrentCustom(StudentTeacher):
                  self.hidden_state = (self.hidden_state[0].detach(), self.hidden_state[1].detach())
              else:
                  self.hidden_state = self.hidden_state.detach()
+

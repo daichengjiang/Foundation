@@ -98,7 +98,8 @@ class Distillation:
 
     def act(self, obs, teacher_obs):
         # compute the actions
-        student_action = self.policy.act(obs).detach()
+        # use deterministic student outputs to avoid exploration noise during distillation
+        student_action = self.policy.act_inference(obs).detach()
         teacher_action = self.policy.evaluate(teacher_obs).detach()
         
         # store both actions in transition for dataset
