@@ -25,6 +25,7 @@ parser.add_argument("--num_envs", type=int, default=None, help="Number of enviro
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
 parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
+parser.add_argument("--log_timestamp", type=str, default=None, help="Fixed timestamp folder name.")
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -94,13 +95,47 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
     log_root_path = os.path.abspath(log_root_path)
     print(f"[INFO] Logging experiment in directory: {log_root_path}")
-    # specify directory for logging runs: {time-stamp}_{run_name}
-    log_dir = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    # This way, the Ray Tune workflow can extract experiment name.
-    print(f"Exact experiment name requested from command line: {log_dir}")
-    if agent_cfg.run_name:
-        log_dir += f"_{agent_cfg.run_name}"
-    log_dir = os.path.join(log_root_path, log_dir)
+
+    agent_cfg_dict = agent_cfg.to_dict()
+
+    # [修改开始] 修正且健壮的 WandB 命名逻辑
+    if args_cli.log_timestamp:
+        # 1. 构造新的运行名称 (长名字，用于 WandB)
+        # 例如: 2025-12-03_20-39-44_teacher_0000
+        new_run_name = f"{args_cli.log_timestamp}_{agent_cfg.run_name}"
+        
+        # 2. 更新配置字典中的 run_name
+        agent_cfg_dict["run_name"] = new_run_name
+        agent_cfg.run_name = new_run_name
+        
+        # 3. 确保 logger 依然是字符串 (修复 AttributeError 的关键)
+        # 不要在这里把它改成字典！
+        if agent_cfg_dict.get("logger") == "wandb":
+            # 尝试添加 RSL-RL 可能读取的扁平化参数 (作为额外保险)
+            agent_cfg_dict["wandb_name"] = new_run_name
+            agent_cfg_dict["wandb_id"] = new_run_name
+            agent_cfg_dict["wandb_group"] = agent_cfg_dict.get("experiment_name")
+        
+        # 4. 计算本地日志路径 (保持短名字，用于文件存储)
+        # 获取 teacher_xxxx 的后缀，例如 0000
+        # 假设原始 run_name 是 teacher_0000，或者在上面已经被改成了长名字，我们需要小心处理
+        # 这里最安全的做法是用 new_run_name (它是 ..._teacher_0000) 取最后一部分
+        teacher_suffix = new_run_name.split('_')[-1] # 得到 "0000"
+        local_run_folder = f"teacher_{teacher_suffix}" # 得到 "teacher_0000"
+        
+        log_dir = os.path.join(log_root_path, args_cli.log_timestamp, local_run_folder)
+        
+        print(f"[INFO] Using fixed timestamp: {args_cli.log_timestamp}")
+        print(f"[INFO] Local Log Dir: {log_dir}")
+        print(f"[INFO] WandB Run Name (Target): {new_run_name}")
+        
+    else:
+        # 默认逻辑
+        log_dir = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        if agent_cfg.run_name:
+            log_dir += f"_{agent_cfg.run_name}"
+        log_dir = os.path.join(log_root_path, log_dir)
+
 
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
@@ -131,7 +166,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env = RslRlVecEnvWrapper(env)
 
     # create runner from rsl-rl
-    runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
+    runner = OnPolicyRunner(env, agent_cfg_dict, log_dir=log_dir, device=agent_cfg.device)
+    
+    # [新增关键代码] 强制覆盖 Runner 内部的 run_name
+    # RSL-RL 在初始化时会根据 log_dir 把 run_name 设为 teacher_0000
+    # 我们在这里将其改回带时间戳的长名字，这样 learn() 里的 wandb.init 就会用这个名字
+    if args_cli.log_timestamp:
+        runner.run_name = new_run_name
     # write git state to logs
     runner.add_git_repo_to_log(__file__)
     # load the checkpoint
