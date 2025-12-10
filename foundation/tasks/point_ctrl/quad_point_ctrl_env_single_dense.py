@@ -42,14 +42,13 @@ import csv
 
 from foundation.utils.simple_controller import SimpleQuadrotorController
 
-from foundation.utils.wind_gen import WindGustGenerator
-
 from enum import IntEnum
 import collections
 import itertools
 
+from dataclasses import dataclass
 
-MAP_SIZE = (500, 500) 
+MAP_SIZE = (250, 250) 
 
 # 手动定义球体标记配置
 SPHERE_MARKER_CFG = VisualizationMarkersCfg(
@@ -60,6 +59,23 @@ SPHERE_MARKER_CFG = VisualizationMarkersCfg(
         ),
     }
 )
+
+@configclass
+class QuadcopterDynamicsCfg:
+    # 默认值 (Crazyflie 2.1 参数作为默认)
+    mass: float = 0.0282
+    arm_length: float = 0.04384
+    # Inertia: Ixx, Iyy, Izz
+    inertia: tuple[float, float, float] = (2.44864e-5, 2.44864e-5, 3.61504e-5)
+    
+    # 推力系数相关 (km/kf ratio for torque, or specific coefficients)
+    # 在你的控制器中，这通常体现为 max_thrust 或 thrust_coefficient
+    # RAPTOR 论文是通过调整 controller 的参数或归一化映射来实现的
+    # 这里我们通过推重比来反推 max_thrust
+    thrust_to_weight: float = 2.25  # 示例默认值
+
+    # 电机参数
+    motor_tau: float = 0.05 
 
 # [0, 2pi] -> [-pi, pi]
 def normallize_angle(angle: torch.Tensor):
@@ -136,10 +152,10 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
 
     map_size = MAP_SIZE
 
-    grid_rows = 40 # 12
-    grid_cols = 40 # 1
-    terrain_width = 10
-    terrain_length = 10
+    grid_rows = 80 
+    grid_cols = 80 
+    terrain_width = 3
+    terrain_length = 3
     robots_per_env = 1
 
     # terrain and robot
@@ -166,27 +182,13 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
         )
     )
 
-    # Controller parameters
-    controller_Kang = [8.0, 8.0, 8.0]  # Roll and pitch angle controller gains   #15 15 20
-    controller_Kdang = [1.0, 1.0, 1.0]                                            #0.8 0.8 1.2
-    controller_Kang_vel = [15.0, 15.0, 15.0]  # Roll, pitch, and yaw angular velocity controller gains
-
-    enable_aero_drag = False
-    drag_coeffs = (0.003, 0.003, 0.003)   # dx, dy, dz，机体系“转子/气动阻力系数”，可按机架调
-    drag_rand_scale = 0.5              # 域随机化幅度：±50%（论文设置）
-    drag_v_clip = 8.0                 # 可选：速度范数上限，避免数值爆
+    dynamics: QuadcopterDynamicsCfg = QuadcopterDynamicsCfg()
 
     # scene
     scene: InteractiveSceneCfg = QuadcopterSceneCfg()
 
     # robot
     robot: ArticulationCfg = CRAZYFLIE_CFG.replace(prim_path="/World/envs/env_.*/Robot")
-
-    # thresholds
-    too_low = 0.3
-    too_high = 1.7
-    desired_low = 0.5  
-    desired_high = 1.5
 
     height = 3.0
     
@@ -198,12 +200,11 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     angular_velocity_threshold = 35.0  # rad/s
 
     reward_coef_position_cost = 1.0
-    reward_coef_orientation_cost = 0.2
-    reward_coef_d_action_cost = 1.0
+    reward_coef_orientation_cost = 0.5
+    reward_coef_d_action_cost = 0.1
     reward_coef_termination_penalty = 100.0
     reward_constant = 1.5
 
-    enable_wind_generator = False
 
 class QuadcopterEnv(DirectRLEnv):
     """A quadcopter environment adapted to use the reward logic from the training code."""
@@ -216,46 +217,33 @@ class QuadcopterEnv(DirectRLEnv):
         self.start_time = time.time()
 
         self.render_mode = "human"
-
-        # Initialize wind generator
-        if self.cfg.enable_wind_generator:
-            self._wind_gen = WindGustGenerator(
-                num_envs=self.num_envs,
-                device=self.device,
-                dt=self.cfg.sim.dt,
-                tau=1.0,
-                sigma=0.5
-            )
-        else:
-            self._wind_gen = None
-
-        self.motor_tau = 0.05 # 假设值，RAPTOR中是采样的
+        
+        #  从 cfg 读取电机时间常数
+        self.motor_tau = torch.full((self.num_envs, 1), self.cfg.dynamics.motor_tau, device=self.device)
         self.dt = self.cfg.sim.dt
         self.motor_alpha = self.dt / (self.dt + self.motor_tau)
         self._current_motor_speeds = torch.zeros(self.num_envs, 4, device=self.device)
         
+
         # Controller
 
-        mass_tensor = torch.full((self.num_envs,), 0.0282, device=self.device)       
-        arm_l_tensor = torch.full((self.num_envs,), 0.04384, device=self.device)
-        inertia_tensor = torch.tensor([2.44864e-5, 2.44864e-5, 3.61504e-5], device=self.device).repeat(self.num_envs, 1)
-        
+        # ... 获取动力学参数 ...
+        # [修改] 将这些变量保存为 self.xxx，方便 DistillationEnv 继承后直接覆盖
+        self.mass_tensor = torch.full((self.num_envs,), self.cfg.dynamics.mass, device=self.device)
+        self.arm_l_tensor = torch.full((self.num_envs,), self.cfg.dynamics.arm_length, device=self.device)
+        self.inertia_tensor = torch.tensor(self.cfg.dynamics.inertia, device=self.device).repeat(self.num_envs, 1)
+        self.twr_tensor = torch.full((self.num_envs,), self.cfg.dynamics.thrust_to_weight, device=self.device)
+
         # Store the robot mass for wind force calculation
-        self._robot_mass = mass_tensor
-        # --- Aerodynamic drag setup (paper model) ---
-        dx, dy, dz = self.cfg.drag_coeffs
-        self._drag_D = torch.tensor([dx, dy, dz], device=self.device).repeat(self.num_envs, 1)
+        self._robot_mass = self.mass_tensor # Update reference
 
         self._controller = SimpleQuadrotorController(
             num_envs=self.num_envs,
             device=self.device,
-            attitude_p_gain=torch.tensor(self.cfg.controller_Kang, device=self.device, dtype=torch.float32),
-            attitude_d_gain=torch.tensor(self.cfg.controller_Kdang, device=self.device, dtype=torch.float32),
-            rate_p_gain=torch.tensor(self.cfg.controller_Kang_vel, device=self.device, dtype=torch.float32),
-            # 新增参数传递
-            mass=mass_tensor,
-            arm_length=arm_l_tensor,
-            inertia=inertia_tensor
+            mass=self.mass_tensor,        # Pass self.var
+            arm_length=self.arm_l_tensor, # Pass self.var
+            inertia=self.inertia_tensor,  # Pass self.var
+            thrust_to_weight=self.twr_tensor  # Pass self.var
         )
 
         self._is_langevin_task = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
@@ -335,6 +323,9 @@ class QuadcopterEnv(DirectRLEnv):
 
         self.set_debug_vis(self.cfg.debug_vis)
 
+        # [新增] 标志位：记录是否已经根据悬停位置重置了轨迹原点
+        # 初始为 True，避免在 __init__ 时出错，具体会在 _reset_idx 中设为 False
+        self._traj_origin_adjusted = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
 
         self._calc_env_origins()
 
@@ -365,6 +356,8 @@ class QuadcopterEnv(DirectRLEnv):
         lin_vel_w = self._robot.data.root_lin_vel_w 
         ang_vel_b = self._robot.data.root_ang_vel_b 
         quat_w = self._robot.data.root_quat_w
+
+        # print(quat_w)
         
         # 1. Check distance from spawn point
         distance_from_spawn = torch.norm(pos_w - self._spawn_pos_w, dim=1)
@@ -498,75 +491,104 @@ class QuadcopterEnv(DirectRLEnv):
         # # ======================================================
 
     def _generate_desired_trajectory_figure8(self, env_ids: torch.Tensor = None):
-        """
-        Generate desired position and velocity following a figure-8 (lemniscate) trajectory.
-        
-        The trajectory is parametrically defined as:
-        x(t) = A * sin(ωt)
-        y(t) = B * sin(2ωt)
-        z(t) = constant height
-        
-        where:
-        - A: scale in x direction
-        - B: scale in y direction  
-        - ω: angular frequency (2π * frequency)
-        
-        In the warmup phase (initial _figure8_warmup_duration seconds), pos_des and vel_des 
-        remain at their initial states to allow the drone to stabilize.
-        
-        Args:
-            env_ids: Environments to update. If None, updates all environments.
-        """
-        if env_ids is None:
-            env_ids = torch.arange(self.num_envs, device=self.device)
-        
-        n_envs = len(env_ids)
-        
-        # Update time variable
-        self._figure8_time[env_ids] += self.dt
-        t = self._figure8_time[env_ids]
-        
-        # Check if in warmup phase - if so, keep pos_des and vel_des unchanged
-        in_warmup = t < self._figure8_warmup_duration
-        if torch.all(in_warmup):
-            return  # All environments still in warmup, no update needed
-        
-        # Angular frequency
-        omega = 2 * math.pi * self._figure8_frequency
-        
-        # Get spawn positions as trajectory centers
-        spawn_pos = self._spawn_pos_w[env_ids]
-        
-        # Calculate figure-8 position (relative to spawn point)
-        # Adjust time to start from 0 after warmup
-        t_adjusted = t - self._figure8_warmup_duration
-        x_rel = self._figure8_scale_x * torch.sin(omega * t_adjusted)
-        y_rel = self._figure8_scale_y * torch.sin(2 * omega * t_adjusted)
-        z_abs = self._figure8_height
-        
-        # Combine into position vector (world frame)
-        pos_des_new = torch.stack([
-            spawn_pos[:, 0] + x_rel,
-            spawn_pos[:, 1] + y_rel,
-            torch.full((n_envs,), z_abs, device=self.device)
-        ], dim=1)
-        
-        # Calculate velocity by differentiating the trajectory
-        vx = self._figure8_scale_x * omega * torch.cos(omega * t_adjusted)
-        vy = self._figure8_scale_y * 2 * omega * torch.cos(2 * omega * t_adjusted)
-        vz = torch.zeros(n_envs, device=self.device)
-        
-        vel_des_new = torch.stack([vx, vy, vz], dim=1)
-        
-        # Only update environments that have passed warmup
-        # For envs still in warmup, keep their pos_des and vel_des unchanged
-        active_mask = ~in_warmup
-        self.pos_des[env_ids[active_mask]] = pos_des_new[active_mask]
-        self.vel_des[env_ids[active_mask]] = vel_des_new[active_mask]
-        
-        # Also update raw states for consistency
-        self.pos_des_raw[env_ids[active_mask]] = pos_des_new[active_mask]
-        self.vel_des_raw[env_ids[active_mask]] = vel_des_new[active_mask]
+            """
+            Generate desired position and velocity following a figure-8 (lemniscate) trajectory.
+            Includes a logic to RE-CENTER the trajectory origin to the drone's actual hovering position
+            after the warm-up phase.
+            """
+            if env_ids is None:
+                env_ids = torch.arange(self.num_envs, device=self.device)
+            
+            n_envs = len(env_ids)
+            
+            # 1. Update time variable
+            self._figure8_time[env_ids] += self.dt
+            t = self._figure8_time[env_ids]
+            
+            # 2. [新增] 重定中心逻辑 (Re-centering Logic)
+            # 检查哪些环境：时间刚刚超过预热时间 AND 还没有调整过原点
+            # 只有在 Play 模式 (train_or_play=False) 或者你需要这个功能时生效
+            needs_recenter = (t >= self._figure8_warmup_duration) & (~self._traj_origin_adjusted[env_ids])
+            
+            if needs_recenter.any():
+                # 获取需要调整的全局环境索引
+                recenter_indices = env_ids[needs_recenter]
+                
+                # A. 读取当前机器人的真实位置 (这就是它下坠后稳定的位置)
+                current_robot_pos = self._robot.data.root_pos_w[recenter_indices].clone()
+                
+                # B. 将这个位置设置为新的轨迹原点 (Spawn Pos)
+                # 之后的 Figure-8 就会以这个点为中心画圈
+                self._spawn_pos_w[recenter_indices] = current_robot_pos
+                
+                # C. 同时更新当前的期望位置，防止下一帧跳变
+                self.pos_des[recenter_indices] = current_robot_pos
+                self.pos_des_raw[recenter_indices] = current_robot_pos
+                
+                # D. 标记为已调整，防止重复执行
+                self._traj_origin_adjusted[recenter_indices] = True
+                
+                # (可选) 打印调试信息
+                if 0 in recenter_indices:
+                    print(f"[Trajectory] Warmup done. Re-centered origin to: {current_robot_pos[0].cpu().numpy()}")
+
+            # 3. Calculate Figure-8 Path
+            # Check if in warmup phase - if so, keep pos_des and vel_des unchanged
+            in_warmup = t < self._figure8_warmup_duration
+            
+            # 如果所有环境都在预热中，直接返回，保持 pos_des 不变 (即保持在 self._spawn_pos_w 或重置后的位置)
+            if torch.all(in_warmup):
+                return 
+            
+            # Angular frequency
+            omega = 2 * math.pi * self._figure8_frequency
+            
+            # Get spawn positions (NOTE: These might have been updated by the logic above!)
+            spawn_pos = self._spawn_pos_w[env_ids]
+            
+            # Calculate figure-8 position (relative to spawn point)
+            # Adjust time to start from 0 after warmup
+            t_adjusted = t - self._figure8_warmup_duration
+            
+            x_rel = self._figure8_scale_x * torch.sin(omega * t_adjusted)
+            y_rel = self._figure8_scale_y * torch.sin(2 * omega * t_adjusted)
+            z_abs = self._figure8_height # 注意：这里的 z_abs 是相对于 spawn_pos 还是绝对高度？
+            # 原代码逻辑：z_abs 是绝对高度 (self._figure8_height = 3.0)
+            # 问题：如果 spawn_pos 的 Z 变成了 2.5 (掉下来了)，而这里强行设为 3.0，那无人机还是会往上冲。
+            # 修正：应该让 Z 也保持在 spawn_pos 的高度 (即 Z_rel = 0)
+            
+            # [关键修正] Z轴逻辑
+            # 我们希望轨迹维持在重置后的高度层面上
+            z_target = spawn_pos[:, 2] # 取 spawn_pos 的 Z 轴作为目标 Z
+            
+            # Combine into position vector (world frame)
+            pos_des_new = torch.stack([
+                spawn_pos[:, 0] + x_rel,
+                spawn_pos[:, 1] + y_rel,
+                z_target # 使用调整后的 Z 高度
+            ], dim=1)
+            
+            # Calculate velocity by differentiating the trajectory
+            vx = self._figure8_scale_x * omega * torch.cos(omega * t_adjusted)
+            vy = self._figure8_scale_y * 2 * omega * torch.cos(2 * omega * t_adjusted)
+            vz = torch.zeros(n_envs, device=self.device)
+            
+            vel_des_new = torch.stack([vx, vy, vz], dim=1)
+            
+            # Only update environments that have passed warmup
+            active_mask = ~in_warmup
+            
+            # 只有过了预热期的环境才更新轨迹
+            # 注意：env_ids 是局部索引，需要用 active_mask 筛选
+            active_env_ids = env_ids[active_mask]
+            
+            if len(active_env_ids) > 0:
+                self.pos_des[active_env_ids] = pos_des_new[active_mask]
+                self.vel_des[active_env_ids] = vel_des_new[active_mask]
+                
+                # Also update raw states for consistency
+                self.pos_des_raw[active_env_ids] = pos_des_new[active_mask]
+                self.vel_des_raw[active_env_ids] = vel_des_new[active_mask]
 
     def _calc_env_origins(self):
         # Generate group origins in a grid that ascends in rows and columns
@@ -607,40 +629,85 @@ class QuadcopterEnv(DirectRLEnv):
             col = group_id % grid_cols
             grid_linear_idx = row * grid_cols + col
             self.grid_idx[grid_linear_idx].append(env_id)
-        print(f"Grid indices: {self.grid_idx}")
+        # print(f"Grid indices: {self.grid_idx}")
 
     def _setup_scene(self):
             """Create and clone the environment scene."""
-            # Set up the robot
+            # 1. Set up the robot articulation
             self._robot = Articulation(self.cfg.robot)
             
-            # 1. 先克隆环境 (此时 USD 里的 /World/envs/env_X/Robot 才会被创建)
-            # Clone the scene
+            # 2. Clone the scene (Create N environments)
             self.scene.clone_environments(copy_from_source=False)
-
-            # 2. Add the robot to the scene
+            
+            # 3. Register articulation to scene
             self.scene.articulations["robot"] = self._robot
 
-            # 3. 环境存在后，再去查找路径并设置可见性
+            # 4. Find all robot prim paths (e.g., /World/envs/env_0/Robot, /World/envs/env_1/Robot...)
             robot_prims = find_matching_prim_paths("/World/envs/env_.*/Robot")
-            
-            # 检查是否找到了 Prim，方便调试
+
             if len(robot_prims) == 0:
-                print("[Warning] No robot prims found! Check your prim_path regex.")
+                print("[ERROR] No robot prims found! Check your prim_path regex in the config.")
+                return
+
+            # ================= [DEBUG START: 验证并应用动力学参数到物理引擎] =================
+            # 从 Hydra Config 中读取当前训练设定的动力学参数
+            # 注意：在 train_teacher_multi.py 中，这些值是被 override 传入的随机值
+            cfg_mass = self.cfg.dynamics.mass
+            cfg_inertia = self.cfg.dynamics.inertia
+            
+            print(f"\n{'='*20} [DEBUG: Environment Setup] {'='*20}")
+            print(f"Num Envs             : {self.num_envs}")
+            print(f"Hydra Config Mass    : {cfg_mass:.6f}")
+            print(f"Hydra Config Inertia : {cfg_inertia}")
+            
+            # 遍历所有环境，强制修改底层 USD/PhysX 属性
+            for i, prim_path in enumerate(robot_prims):
+                # 获取刚体(Rigid Body)的路径。
+                # 对于 Crazyflie 资产，刚体通常名为 "body"。如果是其他机器人，可能是 "base_link"。
+                body_path = f"{prim_path}/body"
                 
-            for prim_path in robot_prims:
-                # 修改物理属性 (如果需要)
-                prims_utils.set_prim_property(prim_path + "/body", "physics:mass", 0.0282)
-                prims_utils.set_prim_property(prim_path + "/body", "physics:diagonalInertia", (2.44864e-5, 2.44864e-5, 3.61504e-5))
-                prims_utils.set_prim_property(prim_path + "/body", "physics:centerOfMass", (0.0, 0.0, 0.0))
+                # --- 关键步骤：将 Python 配置写入底层 PhysX ---
+                # 1. 修改质量
+                prims_utils.set_prim_property(body_path, "physics:mass", cfg_mass)
                 
-                # 设置可见性
-                if self.cfg.robot_vis == True:
+                # 2. 修改惯性张量 (Isaac Sim 接受 (Ixx, Iyy, Izz) 对角形式)
+                prims_utils.set_prim_property(body_path, "physics:diagonalInertia", cfg_inertia)
+                
+                # 3. (可选) 强制将重心设为几何中心，避免偏心导致的额外力矩
+                prims_utils.set_prim_property(body_path, "physics:centerOfMass", (0.0, 0.0, 0.0))
+
+                # --- 设置可见性 ---
+                if self.cfg.robot_vis:
                     prims_utils.set_prim_property(prim_path, "visibility", "visible")
                 else:
                     prims_utils.set_prim_property(prim_path, "visibility", "invisible")
 
-            # Add lights
+                # --- 读回验证 (Read-back Verification) ---
+                # 仅对第 0 个环境进行读回检查，避免刷屏
+                if i == 0:
+                    actual_mass_usd = prims_utils.get_prim_property(body_path, "physics:mass")
+                    actual_inertia_usd = prims_utils.get_prim_property(body_path, "physics:diagonalInertia")
+                    
+                    print(f"-------- PhysX Layer Check (Env 0) --------")
+                    print(f"Target Body Path : {body_path}")
+                    print(f"PhysX Mass Read  : {actual_mass_usd:.6f}")
+                    print(f"PhysX Inertia    : {actual_inertia_usd}")
+                    
+                    # 检查 Mass 是否一致
+                    if abs(actual_mass_usd - cfg_mass) < 1e-5:
+                        print(">>> CHECK PASS: PhysX Mass matches Config Mass.")
+                    else:
+                        print(f"!!! FAILURE: PhysX Mass ({actual_mass_usd:.6f}) != Config ({cfg_mass:.6f})")
+                        print("!!! Warning: Physics engine might be using default USD values instead of randomized ones.")
+
+                    # 检查默认值风险 (Crazyflie 默认约为 0.028)
+                    if abs(actual_mass_usd - 0.028) < 0.001:
+                        print("!!! ALERT: Mass is very close to Crazyflie default (0.028). Ensure randomization is working.")
+
+            print(f"{'='*60}\n")
+            # ================= [DEBUG END] =================
+
+            # 5. Add lights
             light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
             light_cfg.func("/World/Light", light_cfg)
 
@@ -667,27 +734,34 @@ class QuadcopterEnv(DirectRLEnv):
         # 保存 Action 用于 Observation 的 "Last Action"
         self._actions = action_setpoint_normalized.clone()
 
-        # 2. [新增] 模拟电机一阶低通滤波 (First-order Low-pass Filter)
-        # 将归一化的 Setpoint 转换为 真实的 RPM/Rad/s 范围
-        omega_min = self._controller.dynamics.motor_omega_min_.unsqueeze(1)
-        omega_max = self._controller.dynamics.motor_omega_max_.unsqueeze(1)
+        # # 2. [新增] 模拟电机一阶低通滤波 (First-order Low-pass Filter)
+        # # 将归一化的 Setpoint 转换为 真实的 RPM/Rad/s 范围
+        # omega_min = self._controller.dynamics.motor_omega_min_.unsqueeze(1)
+        # omega_max = self._controller.dynamics.motor_omega_max_.unsqueeze(1)
         
-        # 目标转速 (Target Omega)
-        target_motor_speeds = omega_min + action_setpoint_normalized * (omega_max - omega_min)
+        # # 目标转速 (Target Omega)
+        # target_motor_speeds = omega_min + action_setpoint_normalized * (omega_max - omega_min)
         
+        # [修改] 确保 motor_alpha 根据当前的 motor_tau 动态计算 (如果是 Variable Delay)
+        # 即使 motor_tau 是常量，这也保证了如果在外部被修改了，这里能生效
+        # 确保 motor_tau 是 (N, 1) 形状以支持与 (N, 4) 的 speeds 进行广播
+        if self.motor_tau.shape != (self.num_envs, 1):
+            self.motor_tau = self.motor_tau.view(self.num_envs, 1)
+
+        self.motor_alpha = self.dt / (self.dt + self.motor_tau)
+
         # 更新当前电机转速 (Current Omega)
-        # formula: current = alpha * target + (1 - alpha) * previous
-        # 注意：RAPTOR 论文中上升和下降的延迟可能不同 (Tm_up, Tm_down)
-        self._current_motor_speeds = (self.motor_alpha * target_motor_speeds + 
-                                      (1.0 - self.motor_alpha) * self._current_motor_speeds)
+        # 这里的乘法现在是 (N, 1) * (N, 4)，PyTorch 会自动广播
+        # self._current_motor_speeds = (self.motor_alpha * target_motor_speeds + 
+        #                               (1.0 - self.motor_alpha) * self._current_motor_speeds)
+        
+        self._current_motor_speeds = (self.motor_alpha * action_setpoint_normalized + 
+                                      (1.0 - self.motor_alpha) * self._current_motor_speeds)      
 
         # 3. 计算力 (使用带有延迟的 _current_motor_speeds)
         # 注意：这里不需要 normalized=True 了，因为我们已经反归一化了
         # 或者你修改 motor_speeds_to_wrench 让它接受非归一化输入
-        force_b, torque_b, px4info = self._controller.motor_speeds_to_wrench(
-            self._current_motor_speeds, 
-            normalized=False # 传入的是真实 rad/s
-        )
+        force_b, torque_b, px4info = self._controller.motor_speeds_to_wrench(self._current_motor_speeds)
 
         # # [新增调试打印] 检查物理可行性
         # with torch.no_grad():
@@ -737,6 +811,23 @@ class QuadcopterEnv(DirectRLEnv):
 
     def _apply_action(self):
         """Apply thrust/moment to the quadcopter."""
+        
+        # [DEBUG PRINT 3] 运行时检查
+        # 为了不刷屏，只在特定 step 打印，或者只打印一次
+        if self.common_step_counter % 100 == 0: 
+            # 注意：common_step_counter 是 IsaacLab Env 的属性，如果没有可以用 self.episode_length_buf[0]
+            
+            # 检查控制器当前认为的质量
+            ctrl_mass = self._controller.mass_[0].item()
+            
+            # 检查当前施加的力 (Z轴)
+            current_force_z = self._forces[0, 0, 2].item()
+            
+            # 检查当前动作
+            current_action = self._actions[0].mean().item()
+            
+            # print(f"[Step {self.common_step_counter} Apply] Ctrl Mass: {ctrl_mass:.4f} | Action Mean: {current_action:.2f} | Force Z: {current_force_z:.4f}")
+
         self._robot.set_external_force_and_torque(self._forces, self._torques, body_ids=self._body_id)
 
     def _get_observations(self) -> dict:
@@ -779,11 +870,13 @@ class QuadcopterEnv(DirectRLEnv):
         #     print("===========================")
         # [修改] 使用手动维护的、带有物理延迟的电机速度
         # 为了让网络好训练，通常需要归一化回 [-1, 1] 或 [0, 1]
-        omega_min = self._controller.dynamics.motor_omega_min_.unsqueeze(1)
-        omega_max = self._controller.dynamics.motor_omega_max_.unsqueeze(1)
+        # omega_min = self._controller.dynamics.motor_omega_min_.unsqueeze(1)
+        # omega_max = self._controller.dynamics.motor_omega_max_.unsqueeze(1)
         
         # 归一化当前电机速度 [0, 1]
-        motor_speeds_obs = (self._current_motor_speeds - omega_min) / (omega_max - omega_min)
+        # motor_speeds_obs = (self._current_motor_speeds - omega_min) / (omega_max - omega_min)
+
+        motor_speeds_obs = self._current_motor_speeds
 
         obs = torch.cat([
             pos_error_b,            
@@ -836,8 +929,6 @@ class QuadcopterEnv(DirectRLEnv):
             # Terminal Penalty
             terminal = (
                 self._numerical_is_unstable 
-                # (self._robot.data.root_pos_w[:, 2] < self.cfg.too_low) | 
-                # (self._robot.data.root_pos_w[:, 2] > self.cfg.too_high)
             )
             termination_penalty = terminal.float()
             
@@ -900,8 +991,6 @@ class QuadcopterEnv(DirectRLEnv):
 
         conditions = [
             self._numerical_is_unstable,  # Numerical instability
-            # self._robot.data.root_pos_w[:, 2] < self.cfg.too_low,  # Z position too low
-            # self._robot.data.root_pos_w[:, 2] > self.cfg.too_high,  # Z position too high
             position_exceeded_langevin,  # Distance from desired trajectory exceeds threshold
         ]
 
@@ -950,9 +1039,6 @@ class QuadcopterEnv(DirectRLEnv):
                     self.extras["log"][f"Episode_Reward/{key}"] = mean_val
                     self._episode_sums[key][env_ids] = 0.0
 
-            # --- 2. 基础重置 ---
-            if self._wind_gen is not None:
-                self._wind_gen.reset(env_ids)
 
             died_mask = self.reset_terminated[env_ids]
             timed_out_mask = self.reset_time_outs[env_ids]
@@ -977,10 +1063,43 @@ class QuadcopterEnv(DirectRLEnv):
             self._died_tilt_limit[env_ids] = False
             self._died_nan[env_ids] = False
 
-            self._current_motor_speeds[env_ids] = 0.0
+            # ================= [修改开始：电机热启动 Warm Start] =================
+            
+            # # 1. 计算悬停需要的油门 (Hover PWM, 0~1)
+            # # 假设推力与转速的平方成正比 (F ~ omega^2), 且 F_max = Mass * G * TWR
+            # # F_hover = Mass * G
+            # # 所以 Ratio = F_hover / F_max = 1 / TWR
+            # # Hover PWM ~ sqrt(Ratio)
+            
+            # # 注意：如果 TWR 刚好是 Teacher 训练时的 TWR，这个计算是准确的。
+            # # 如果不匹配，这个计算也能提供一个很好的初值，大大减少下坠幅度。
+            # hover_pwm = torch.sqrt(1.0 / self.twr_tensor[env_ids])
+            # hover_pwm = torch.clamp(hover_pwm, 0.0, 1.0).unsqueeze(1) # (N, 1)
 
+            # # 2. 计算对应的动作值 Action (-1 ~ 1)
+            # # Action = 2 * PWM - 1
+            # hover_action = (hover_pwm * 2.0) - 1.0
+            
+            # # 初始化动作 Buffer，让 Policy 以为上一帧就是悬停油门
+            # self._actions[env_ids] = hover_action.repeat(1, 4)
+            # self._last_actions[env_ids] = hover_action.repeat(1, 4)
+            
+            # # 3. 计算对应的物理转速 Omega (rad/s)
+            # omega_min = self._controller.dynamics.motor_omega_min_[env_ids].unsqueeze(1)
+            # omega_max = self._controller.dynamics.motor_omega_max_[env_ids].unsqueeze(1)
+            
+            # hover_omega = omega_min + hover_pwm * (omega_max - omega_min)
+            
+            # # 直接设置电机转速，消除启动延迟
+            # self._current_motor_speeds[env_ids] = hover_omega.repeat(1, 4)
+            
+            # ================= [修改结束]电机热启动 Warm Start] =================
+            
             # 重置轨迹时间 (用于八字形轨迹)
             self._figure8_time[env_ids] = 0.0
+
+            # [新增] 重置标志位：新的一轮还没进行过重定中心
+            self._traj_origin_adjusted[env_ids] = False
 
             self._langevin_max_vel[env_ids] = torch.rand(len(env_ids), device=self.device) * 2.0 + 1.0
             # --- 3. RAPTOR 初始化逻辑 ---
@@ -1030,7 +1149,7 @@ class QuadcopterEnv(DirectRLEnv):
             else:
                 # ================= [PLAY MODE] =================
                 # 强制全部归零，不进行随机化
-                
+                # print("???????????????????????")
                 pos_offset = torch.zeros(num_resets, 3, device=self.device)
                 lin_vel = torch.zeros(num_resets, 3, device=self.device)
                 ang_vel = torch.zeros(num_resets, 3, device=self.device)
@@ -1049,7 +1168,7 @@ class QuadcopterEnv(DirectRLEnv):
             spawn_center = self.env_origins[env_ids].clone()
             spawn_center[:, 0] += self.cfg.terrain_length / 2.0
             spawn_center[:, 1] += self.cfg.terrain_width / 2.0
-            spawn_center[:, 2] += self.cfg.height
+            spawn_center[:, 2] = self.cfg.height
 
             # 记录出生点 (Spawn Position = Center + Offset)
             # 注意：这里的 Offset 是随机扰动
