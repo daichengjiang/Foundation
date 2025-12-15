@@ -50,11 +50,13 @@ class StudentTeacherRecurrentCustom(StudentTeacher):
         self.rnn_num_layers = rnn_num_layers
         self.rnn_type = rnn_type
 
+        base_student_dims = student_hidden_dims if len(student_hidden_dims) > 0 else [64]
+
         super().__init__(
             num_student_obs=post_rnn_dim, 
             num_teacher_obs=rnn_hidden_dim if teacher_recurrent else num_teacher_obs,
             num_actions=num_actions,
-            student_hidden_dims=student_hidden_dims,
+            student_hidden_dims=base_student_dims,
             teacher_hidden_dims=teacher_hidden_dims,
             activation=activation,
             init_noise_std=init_noise_std,

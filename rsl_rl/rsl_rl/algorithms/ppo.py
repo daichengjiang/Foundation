@@ -37,7 +37,8 @@ class PPO:
         use_clipped_value_loss=True,
         schedule="fixed",
         desired_kl=0.01,
-        device="cpu",
+        # device="cpu",
+        device="cuda",
         normalize_advantage_per_mini_batch=False,
         # RND parameters
         rnd_cfg: dict | None = None,

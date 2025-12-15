@@ -27,7 +27,8 @@ class Distillation:
         learning_rate=1e-3,
         max_grad_norm=None,
         loss_type="mse",
-        device="cpu",
+        # device="cpu",
+        device="cuda",
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
 
@@ -35,7 +36,7 @@ class Distillation:
         num_mini_batches=8,
         # Two-stage training parameters
         use_two_stage_training=True,
-        phase1_iterations=10,
+        phase1_iterations=300,
     ):
         # device-related parameters
         self.device = device

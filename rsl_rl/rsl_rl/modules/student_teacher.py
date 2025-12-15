@@ -70,7 +70,8 @@ class StudentTeacher(nn.Module):
         self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
         self.distribution = None
         # disable args validation for speedup
-        Normal.set_default_validate_args = False
+        # Normal.set_default_validate_args = False
+        Normal.set_default_validate_args(False)
 
     def reset(self, dones=None, hidden_states=None):
         pass

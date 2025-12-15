@@ -312,7 +312,7 @@ class QuadcopterEnv(DirectRLEnv):
         self._last_angular_velocity= torch.zeros(self.num_envs, 3, device=self.device)
 
         # 默认为 3.0，后续会在 reset 中更新
-        self._langevin_max_vel = torch.full((self.num_envs,), 3.0, device=self.device)
+        self._langevin_max_vel = torch.full((self.num_envs,), 1.5, device=self.device)
 
         # Episode tracking for trajectory following (no success criterion)
         self._history_window = 100
@@ -1101,7 +1101,7 @@ class QuadcopterEnv(DirectRLEnv):
             # [新增] 重置标志位：新的一轮还没进行过重定中心
             self._traj_origin_adjusted[env_ids] = False
 
-            self._langevin_max_vel[env_ids] = torch.rand(len(env_ids), device=self.device) * 2.0 + 1.0
+            self._langevin_max_vel[env_ids] = torch.rand(len(env_ids), device=self.device) * 1.0 + 0.5
             # --- 3. RAPTOR 初始化逻辑 ---
             
             # 定义物理参数
