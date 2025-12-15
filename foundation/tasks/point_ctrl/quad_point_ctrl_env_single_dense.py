@@ -200,8 +200,8 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     angular_velocity_threshold = 35.0  # rad/s
 
     reward_coef_position_cost = 1.0
-    reward_coef_orientation_cost = 0.5
-    reward_coef_d_action_cost = 0.1
+    reward_coef_orientation_cost = 0.2
+    reward_coef_d_action_cost = 1.0
     reward_coef_termination_penalty = 100.0
     reward_constant = 1.5
 
@@ -1104,6 +1104,8 @@ class QuadcopterEnv(DirectRLEnv):
             self._langevin_max_vel[env_ids] = torch.rand(len(env_ids), device=self.device) * 1.0 + 0.5
             # --- 3. RAPTOR 初始化逻辑 ---
             
+            self._current_motor_speeds[env_ids] = 0.0 
+
             # 定义物理参数
             l_arm = 0.04384  # 论文中的 l_arm
 
@@ -1352,11 +1354,6 @@ class QuadcopterEnv(DirectRLEnv):
                     
                 # 使用 fixed_rot，球体姿态永远为0
                 self.traj_fixed_visualizer.visualize(pos_red, fixed_rot)
-
-    class EpisodeOutcome(IntEnum):
-        ONGOING = 0
-        SUCCESS = 1
-        FAILURE = 2
             
     def _update_episode_outcomes_and_metrics(self, env_ids, success_mask, died_mask, timed_out_mask):
             """

@@ -108,7 +108,7 @@ class QuadcopterSceneCfg(InteractiveSceneCfg):
     """Configuration for the Quadcopter scene."""
     num_envs: int = 512
     env_spacing: float = 64.0
-    replicate_physics: bool = True
+    replicate_physics: bool = False
 
     terrain = TerrainImporterCfg(
         prim_path="/World/ground",
@@ -888,8 +888,10 @@ class QuadcopterEnv(DirectRLEnv):
 
         self._langevin_max_vel[env_ids] = torch.rand(len(env_ids), device=self.device) * 1.0 + 0.5
         
+        self._current_motor_speeds[env_ids] = 0.0 
+
         # --- 3. RAPTOR 初始化逻辑 ---
-        l_arm_env = self.arm_l_tensor[env_ids] 
+        l_arm_env = self.arm_l_tensor[env_ids]
 
         if self.cfg.train_or_play:
             # ================= [TRAIN MODE] =================
@@ -988,28 +990,6 @@ class QuadcopterEnv(DirectRLEnv):
         self.pos_des_raw[env_ids] = spawn_center.clone()
         self.vel_des_raw[env_ids] = 0.0
 
-        # # ==========================================================
-        # # [DEBUG] Verify Controller Uses Correct Per-env Dynamics
-        # # ==========================================================
-        # ctrl = self._controller
-
-        # print("\n========== [Controller Dynamics Verification] ==========")
-
-        # with torch.no_grad():
-        #     print("mass_: ", ctrl.mass_[env_ids])
-        #     print("arm_l_: ", ctrl.arm_l_[env_ids])
-        #     print("inertia_: ", ctrl.inertia_[env_ids])
-        #     print("twr_: ", ctrl.thrust_to_weight_[env_ids])
-
-        #     # Allocation matrix: [num_env, 4, 4]
-        #     print("alloc_matrix_: shape=", ctrl.alloc_matrix_.shape)
-        #     print("alloc_matrix_[env_ids]:\n", ctrl.alloc_matrix_[env_ids])
-
-        # print("=========================================================\n")
-        # # ==========================================================
-
-
-
 
     def _set_debug_vis_impl(self, debug_vis: bool):
             """Show debug markers if debug_vis is True."""
@@ -1101,11 +1081,6 @@ class QuadcopterEnv(DirectRLEnv):
                 if mask.any():
                     pos_red[mask] = self.pos_des[mask]
                 self.traj_fixed_visualizer.visualize(pos_red, fixed_rot)
-
-    class EpisodeOutcome(IntEnum):
-        ONGOING = 0
-        SUCCESS = 1
-        FAILURE = 2
             
     def _update_episode_outcomes_and_metrics(self, env_ids, success_mask, died_mask, timed_out_mask):
             """

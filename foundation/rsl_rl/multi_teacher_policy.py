@@ -32,7 +32,7 @@ class MultiTeacherPolicy(StudentTeacherRecurrentCustom):
             if teacher_norm_state_dicts and i < len(teacher_norm_state_dicts):
                 if teacher_norm_state_dicts[i] is not None:
                     normalizer.load_state_dict(teacher_norm_state_dicts[i])
-                    print(f"  > [MultiPolicy] Teacher {i} normalizer loaded. Mean[0]={normalizer.mean[0]:.4f}")
+                    print(f"  > [MultiPolicy] Teacher {i} normalizer loaded. Mean[0]={normalizer.mean[0]:.4f}, Std[0]={normalizer.std[0]:.4f}")
                 else:
                     print(f"  > [MultiPolicy] Teacher {i} has NO normalizer stats. Using Identity behavior.")
             

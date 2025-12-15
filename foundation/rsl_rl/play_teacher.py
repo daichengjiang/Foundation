@@ -21,7 +21,7 @@ parser = argparse.ArgumentParser(description="Play and evaluate trajectory track
 parser.add_argument("--video", action="store_true", default=False, help="Record videos during playing.")
 parser.add_argument("--video_length", type=int, default=2000, help="Length of the recorded video (in steps).")
 parser.add_argument("--video_interval", type=int, default=10000, help="Interval between video recordings (in steps).")
-parser.add_argument("--num_envs", type=int, default=2, help="Number of environments to simulate.")
+parser.add_argument("--num_envs", type=int, default=4, help="Number of environments to simulate.")
 parser.add_argument("--task", type=str, default=None, required=True, help="Name of the task.")
 parser.add_argument("--seed", type=int, default=42, help="Seed used for the environment")
 parser.add_argument("--max_steps", type=int, default=10000, help="Maximum steps to run for trajectory tracking.")
@@ -30,12 +30,6 @@ parser.add_argument(
     "--disable_fabric", action="store_true", default=False, help="Disable fabric and use USD I/O operations."
 )
 parser.add_argument("--realtime", action="store_true", default=False, help="Run in real-time, if possible.")
-
-# [原有] 动力学 CSV 路径
-parser.add_argument("--dynamics_csv", type=str, default=None, help="Path to teacher_dynamics.csv to overwrite env physics.")
-# [新增] 指定动力学 ID
-parser.add_argument("--dynamics_id", type=int, default=0, help="ID of the teacher dynamics to load from CSV (applies to ALL envs).")
-
 # append RSL-RL cli arguments (this includes --checkpoint)
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -60,11 +54,7 @@ import os
 import time
 import torch
 import numpy as np
-import pandas as pd
 from datetime import datetime
-
-# Isaac Sim Core
-import isaacsim.core.utils.prims as prims_utils
 
 from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper
 from rsl_rl.runners import OnPolicyRunner
@@ -110,6 +100,18 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
     env_cfg.sim.use_fabric = not args_cli.disable_fabric if args_cli.disable_fabric is not None else env_cfg.sim.use_fabric
 
+    # env_cfg.dynamics.mass = 0.042650814707119296
+    # env_cfg.dynamics.arm_length = 0.04709796532826468
+    # env_cfg.dynamics.inertia = (0.0007679770076841281,0.0007679770076841281,0.0014069338780773226)
+    # env_cfg.dynamics.thrust_to_weight = 4.23108099633458
+    # env_cfg.dynamics.motor_tau = 0.05043375805083486
+
+    env_cfg.dynamics.mass = 0.5341363827864255
+    env_cfg.dynamics.arm_length = 0.11716311172050321
+    env_cfg.dynamics.inertia = (0.008633919865618027,0.008633919865618027,0.015817341193812225)
+    env_cfg.dynamics.thrust_to_weight = 4.581534080567852
+    env_cfg.dynamics.motor_tau = 0.039698122640419706
+
     # get checkpoint path
     checkpoint_path = retrieve_file_path(args_cli.checkpoint)
     print(f"[INFO]: Loading best model checkpoint from: {checkpoint_path}")
@@ -144,111 +146,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # wrap around environment for rsl-rl
     env = RslRlVecEnvWrapper(env)
 
-    # =======================================================================
-    # [修改] 覆盖动力学参数: 指定 ID，统一赋值
-    # =======================================================================
-    if args_cli.dynamics_csv and os.path.exists(args_cli.dynamics_csv):
-        print(f"\n[INFO] Loading dynamics from CSV: {args_cli.dynamics_csv}")
-        df = pd.read_csv(args_cli.dynamics_csv)
-        
-        target_id = args_cli.dynamics_id
-        
-        # 1. 查找指定 ID 的行
-        row = df[df['id'] == target_id]
-        if row.empty:
-            raise ValueError(f"Dynamics ID {target_id} not found in CSV file!")
-        
-        print(f"[INFO] Selected Dynamics ID: {target_id}")
-        
-        # 2. 将该行数据复制 env.num_envs 份
-        # 这样 sampled_df 的每一行都是相同的参数
-        sampled_df = pd.concat([row] * env.num_envs, ignore_index=True)
-        
-        print(f"[INFO] Applied dynamics ID {target_id} to ALL {env.num_envs} environments.")
-        
-        device = torch.device(env.unwrapped.device)
-
-        # 提取参数并转为 Tensor
-        mass_t = torch.tensor(sampled_df['mass'].values, device=device, dtype=torch.float32)
-        arm_t = torch.tensor(sampled_df['arm_length'].values, device=device, dtype=torch.float32)
-        twr_t = torch.tensor(sampled_df['twr'].values, device=device, dtype=torch.float32)
-        tau_t = torch.tensor(sampled_df['motor_tau'].values, device=device, dtype=torch.float32)
-        
-        ixx = torch.tensor(sampled_df['Ixx'].values, device=device, dtype=torch.float32)
-        iyy = torch.tensor(sampled_df['Iyy'].values, device=device, dtype=torch.float32)
-        izz = torch.tensor(sampled_df['Izz'].values, device=device, dtype=torch.float32)
-        inertia_t = torch.stack([ixx, iyy, izz], dim=1) # (N, 3)
-        
-        print(f"  > Loaded Params: Mass={mass_t[0]:.4f}, TWR={twr_t[0]:.2f}, Arm={arm_t[0]:.4f}")
-
-        # 强制覆盖 Environment 内部变量
-        unwrapped_env = env.unwrapped
-        
-        # 1. 覆盖环境 Tensor
-        unwrapped_env.mass_tensor = mass_t
-        unwrapped_env.arm_l_tensor = arm_t
-        unwrapped_env.inertia_tensor = inertia_t
-        unwrapped_env.twr_tensor = twr_t
-        unwrapped_env.motor_tau = tau_t.view(-1, 1)
-        
-        # 2. 覆盖控制器 Controller 参数
-        unwrapped_env._controller.mass_ = mass_t
-        if not hasattr(unwrapped_env._controller, 'thrust_to_weight_'):
-             unwrapped_env._controller.thrust_to_weight_ = twr_t
-        else:
-             unwrapped_env._controller.thrust_to_weight_ = twr_t
-
-        # 更新推力系数
-        if hasattr(unwrapped_env._controller, 'update_dependent_params'):
-            unwrapped_env._controller.update_dependent_params()
-        else:
-            print("\n[WARNING] Controller missing 'update_dependent_params' method!")
-
-        # 3. 覆盖 Physics (USD/PhysX)
-        print(f"[Override Check] Syncing physics properties to USD/PhysX...")
-        for i in range(env.num_envs):
-            # 获取数值
-            m_val = mass_t[i].item()
-            Ixx_val = inertia_t[i, 0].item()
-            Iyy_val = inertia_t[i, 1].item()
-            Izz_val = inertia_t[i, 2].item()
-            
-            prim_path = f"/World/envs/env_{i}/Robot/body"
-            
-            # 修改质量
-            prims_utils.set_prim_property(prim_path, "physics:mass", m_val)
-            # 修改惯性张量
-            prims_utils.set_prim_property(prim_path, "physics:diagonalInertia", (Ixx_val, Iyy_val, Izz_val))
-            
-            if i == 0:
-                print(f"  > PhysX Env 0 Updated: Mass={m_val:.4f}, Inertia={Ixx_val:.2e}, {Iyy_val:.2e}, {Izz_val:.2e}")
-
-        # 4. 重新计算派生参数
-        unwrapped_env.motor_alpha = unwrapped_env.dt / (unwrapped_env.dt + unwrapped_env.motor_tau)
-        
-    else:
-        print("\n[WARNING] No dynamics CSV provided. Using DEFAULT Crazyflie dynamics!")
-
-    # =======================================================================
-    # [新增] 打印每个环境的详细动力学参数 (用于验证)
-    # =======================================================================
-    print(f"\n{'='*30} [Per-Environment Dynamics Check] {'='*30}")
-    # 从环境内部变量直接读取，确保打印的是真实使用的参数
-    _u_env = env.unwrapped
-    for i in range(env.num_envs):
-        _m = _u_env.mass_tensor[i].item()
-        _arm = _u_env.arm_l_tensor[i].item()
-        _twr = _u_env.twr_tensor[i].item()
-        # 处理可能的维度差异 (N, 1) 或 (N,)
-        _tau = _u_env.motor_tau[i].item() if _u_env.motor_tau.dim() > 1 else _u_env.motor_tau.view(-1)[i].item()
-        _ixx = _u_env.inertia_tensor[i, 0].item()
-        _iyy = _u_env.inertia_tensor[i, 1].item()
-        _izz = _u_env.inertia_tensor[i, 2].item()
-        
-        print(f"  Env {i:03d} | Mass: {_m:.4f} kg | Arm: {_arm:.4f} m | TWR: {_twr:.2f} | Tau: {_tau:.3f} s | Inertia: [{_ixx:.2e}, {_iyy:.2e}, {_izz:.2e}]")
-    print(f"{'='*88}\n")
-    # =======================================================================
-
     # create runner from rsl-rl
     runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
     
@@ -261,6 +158,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # get inference policy
     policy = runner.get_inference_policy(device=agent_cfg.device)
+    policy_model = runner.alg.policy
 
     # simulation timestep
     dt = env.unwrapped.step_dt
@@ -300,33 +198,56 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # run everything in inference mode
         with torch.inference_mode():
             
+            # -----------------------------------------------------------------
+            # --- 1. 获取 t 步的期望状态，并缓存下来 ---
+            # -----------------------------------------------------------------
             desired_pos = env.unwrapped.pos_des.clone()
             desired_vel = env.unwrapped.vel_des.clone()
             
-            actions = policy(obs) 
+            # -----------------------------------------------------------------
+            # --- 2. 获取 t 步的动作 a_t ---
+            # -----------------------------------------------------------------
+            actions = policy(obs) # obs 来自上一个时间步的 step() 结果
             
+            # -----------------------------------------------------------------
+            # --- 3. 执行动作，环境从 t-1 转移到 t ---
+            # -----------------------------------------------------------------
+            # 在 env.step() 内部，机器人实际位置变为 current_pos_t
+            # 且环境的期望位置 pos_des/vel_des 可能会更新为下一时刻 t+1 的值
             obs, rewards, dones, extras = env.step(actions)
+
+            if hasattr(policy_model, "reset"):
+                policy_model.reset(dones)
             
+            # -----------------------------------------------------------------
+            # --- 4. 获取 t 步的实际状态 ---
+            # -----------------------------------------------------------------
+            # 这是动作执行后的新位置/速度
             current_pos = env.unwrapped._robot.data.root_pos_w.clone()
             current_vel = env.unwrapped._robot.data.root_lin_vel_w.clone()
             
+            # -----------------------------------------------------------------
+            # --- 5. 计算跟踪误差 (使用 t 步的实际状态 和 t 步缓存的期望状态) ---
+            # -----------------------------------------------------------------
             pos_error = torch.norm(current_pos - desired_pos, dim=1) 
             vel_error = torch.norm(current_vel - desired_vel, dim=1) 
 
             # Store tracking errors for each environment
             for env_id in range(env.num_envs):
+                # 使用修正后的 pos_error/vel_error
                 position_errors_all[env_id].append(pos_error[env_id].item())
                 velocity_errors_all[env_id].append(vel_error[env_id].item())
             
             # Save trajectory data (only for environment 0 to reduce storage)
             if args_cli.save_trajectory:
+                # 记录 t 步的数据
                 trajectory_data['desired_pos'].append(desired_pos[0].cpu().numpy())
                 trajectory_data['actual_pos'].append(current_pos[0].cpu().numpy())
                 trajectory_data['desired_vel'].append(desired_vel[0].cpu().numpy())
                 trajectory_data['actual_vel'].append(current_vel[0].cpu().numpy())
                 trajectory_data['position_error'].append(pos_error[0].item())
                 trajectory_data['velocity_error'].append(vel_error[0].item())
-                trajectory_data['actions'].append(actions[0].cpu().numpy()) 
+                trajectory_data['actions'].append(actions[0].cpu().numpy()) # actions 是 t 步使用的动作
                 trajectory_data['timestamps'].append(timestep * dt)
                         
             timestep += 1
@@ -339,6 +260,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     f"Avg Pos Error: {avg_pos_error:.4f}m | "
                     f"Avg Vel Error: {avg_vel_error:.4f}m/s")
                 
+        # time delay for real-time evaluation
         if args_cli.realtime:
             sleep_time = dt - (time.time() - step_start_time)
             if sleep_time > 0:
@@ -354,6 +276,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     print(f"  Total Time:           {total_time:.2f}s")
     print(f"  Average FPS:          {timestep / total_time:.2f}")
     
+    # Calculate statistics for each environment
     all_env_pos_errors = []
     all_env_vel_errors = []
     
@@ -367,9 +290,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             all_env_pos_errors.extend(position_errors_all[env_id])
             all_env_vel_errors.extend(velocity_errors_all[env_id])
             
-            # print(f"  Env {env_id:2d} | "
-            #       f"Pos Error: {np.mean(pos_errors):.4f}±{np.std(pos_errors):.4f}m | "
-            #       f"Vel Error: {np.mean(vel_errors):.4f}±{np.std(vel_errors):.4f}m/s")
+            print(f"  Env {env_id:2d} | "
+                  f"Pos Error: {np.mean(pos_errors):.4f}±{np.std(pos_errors):.4f}m | "
+                  f"Vel Error: {np.mean(vel_errors):.4f}±{np.std(vel_errors):.4f}m/s")
     
     # Overall statistics
     if len(all_env_pos_errors) > 0:
@@ -381,10 +304,16 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         print(f"  Position Error:")
         print(f"    Mean:     {np.mean(all_pos_errors):.4f} m")
         print(f"    Std:      {np.std(all_pos_errors):.4f} m")
+        print(f"    Median:   {np.median(all_pos_errors):.4f} m")
+        print(f"    Max:      {np.max(all_pos_errors):.4f} m")
+        print(f"    95th %ile: {np.percentile(all_pos_errors, 95):.4f} m")
         
         print(f"\n  Velocity Error:")
         print(f"    Mean:     {np.mean(all_vel_errors):.4f} m/s")
         print(f"    Std:      {np.std(all_vel_errors):.4f} m/s")
+        print(f"    Median:   {np.median(all_vel_errors):.4f} m/s")
+        print(f"    Max:      {np.max(all_vel_errors):.4f} m/s")
+        print(f"    95th %ile: {np.percentile(all_vel_errors, 95):.4f} m/s")
         
         # Save statistics to file
         stats_file = os.path.join(log_dir, "tracking_statistics.txt")
@@ -392,28 +321,50 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             f.write(f"Trajectory Tracking Evaluation Results\n")
             f.write(f"{'=' * 80}\n")
             f.write(f"Checkpoint: {checkpoint_path}\n")
-            f.write(f"Dynamics CSV: {args_cli.dynamics_csv} (ID: {args_cli.dynamics_id})\n")
+            f.write(f"Task: {args_cli.task}\n")
             f.write(f"trajectory_type: {env_cfg.trajectory_type}\n")
             f.write(f"Num Envs: {env_cfg.scene.num_envs}\n")
+            f.write(f"Seed: {env_cfg.seed}\n")
+            f.write(f"Total Steps: {timestep}\n")
+            f.write(f"Total Time: {total_time:.2f}s\n")
+            f.write(f"Average FPS: {timestep / total_time:.2f}\n")
             
             f.write(f"\n{'Overall Statistics':^80}\n")
             f.write(f"{'-' * 80}\n")
             f.write(f"Position Error:\n")
             f.write(f"  Mean:     {np.mean(all_pos_errors):.4f} m\n")
             f.write(f"  Std:      {np.std(all_pos_errors):.4f} m\n")
+            f.write(f"  Median:   {np.median(all_pos_errors):.4f} m\n")
+            f.write(f"  Max:      {np.max(all_pos_errors):.4f} m\n")
+            f.write(f"  95th %%:   {np.percentile(all_pos_errors, 95):.4f} m\n")
             
             f.write(f"\nVelocity Error:\n")
             f.write(f"  Mean:     {np.mean(all_vel_errors):.4f} m/s\n")
             f.write(f"  Std:      {np.std(all_vel_errors):.4f} m/s\n")
+            f.write(f"  Median:   {np.median(all_vel_errors):.4f} m/s\n")
+            f.write(f"  Max:      {np.max(all_vel_errors):.4f} m/s\n")
+            f.write(f"  95th %%:   {np.percentile(all_vel_errors, 95):.4f} m/s\n")
+            
+            f.write(f"\n{'Per-Environment Statistics':^80}\n")
+            f.write(f"{'-' * 80}\n")
+            for env_id in range(env.num_envs):
+                if len(position_errors_all[env_id]) > 0:
+                    pos_errors = np.array(position_errors_all[env_id])
+                    vel_errors = np.array(velocity_errors_all[env_id])
+                    f.write(f"Env {env_id:2d}:\n")
+                    f.write(f"  Pos Error: {np.mean(pos_errors):.4f} ± {np.std(pos_errors):.4f} m\n")
+                    f.write(f"  Vel Error: {np.mean(vel_errors):.4f} ± {np.std(vel_errors):.4f} m/s\n")
         
         print(f"\nStatistics saved to: {stats_file}")
         
+        # Save numpy arrays for detailed analysis
         error_data_file = os.path.join(log_dir, "tracking_errors.npz")
         np.savez(error_data_file,
                  position_errors=all_pos_errors,
                  velocity_errors=all_vel_errors)
         print(f"Error data saved to: {error_data_file}")
         
+        # Save trajectory data if enabled
         if args_cli.save_trajectory and len(trajectory_data['timestamps']) > 0:
             traj_file = os.path.join(log_dir, "trajectory_data.npz")
             np.savez(traj_file,
@@ -426,12 +377,17 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                      actions=np.array(trajectory_data['actions']),
                      timestamps=np.array(trajectory_data['timestamps']))
             print(f"Trajectory data (Env 0) saved to: {traj_file}")
+            print(f"  - Use this data to visualize desired vs actual trajectories")
+            print(f"  - Data contains {len(trajectory_data['timestamps'])} time steps")
     
     print(f"{'=' * 80}\n")
 
+    # close the simulator
     env.close()
 
 
 if __name__ == "__main__":
+    # run the main function
     main()
+    # close sim app
     simulation_app.close()

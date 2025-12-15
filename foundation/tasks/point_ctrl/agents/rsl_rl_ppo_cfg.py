@@ -57,7 +57,7 @@ class QuadcopterDistillationPolicyCfg(RslRlPpoActorCriticCfg):
     class_name = "StudentTeacherRecurrentCustom"  # 核心：指定自定义的策略实现类
     
     # *** 学生网络MLP/RNN架构参数 ***
-    actor_hidden_dims = []   # 不使用额外的MLP层，直接从post_rnn_dim输出
+    student_hidden_dims = []
     rnn_type = "gru"         # 使用GRU
     rnn_hidden_dim = 16      # GRU隐藏层维度
     rnn_num_layers = 1       # GRU层数

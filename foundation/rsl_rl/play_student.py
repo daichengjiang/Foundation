@@ -87,7 +87,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
     
     # Force figure-8 trajectory for testing
-    # env_cfg.trajectory_type = "figure8"
+    env_cfg.trajectory_type = "figure8"
     env_cfg.prob_null_trajectory = 0.0  # Disable null trajectory
 
     env_cfg.train_or_play = False  # Set to Play mode
@@ -100,18 +100,17 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
     env_cfg.sim.use_fabric = not args_cli.disable_fabric if args_cli.disable_fabric is not None else env_cfg.sim.use_fabric
 
-    # 0000
-    env_cfg.dynamics.mass = 0.042650814707119296
-    env_cfg.dynamics.arm_length = 0.04709796532826468
-    env_cfg.dynamics.inertia = (0.0007679770076841281,0.0007679770076841281,0.0014069338780773226)
-    env_cfg.dynamics.thrust_to_weight = 4.23108099633458
-    env_cfg.dynamics.motor_tau = 0.05043375805083486
-    # # 0001
-    # env_cfg.dynamics.mass = 1.548819450932384
-    # env_cfg.dynamics.arm_length = 0.15835488595704575
-    # env_cfg.dynamics.inertia = (0.0219077279360826,0.0219077279360826,0.04013495757890332)
-    # env_cfg.dynamics.thrust_to_weight = 4.520628169512712
-    # env_cfg.dynamics.motor_tau = 0.029981892560062243
+    # env_cfg.dynamics.mass = 0.042650814707119296
+    # env_cfg.dynamics.arm_length = 0.04709796532826468
+    # env_cfg.dynamics.inertia = (0.0007679770076841281,0.0007679770076841281,0.0014069338780773226)
+    # env_cfg.dynamics.thrust_to_weight = 4.23108099633458
+    # env_cfg.dynamics.motor_tau = 0.05043375805083486
+
+    env_cfg.dynamics.mass = 2.833765582636589
+    env_cfg.dynamics.arm_length = 0.1986871511240633
+    env_cfg.dynamics.inertia = (0.14268255564146431,0.14268255564146431,0.26139444193516265)
+    env_cfg.dynamics.thrust_to_weight = 2.4089572543198496
+    env_cfg.dynamics.motor_tau = 0.0835541196823556
 
     # get checkpoint path
     checkpoint_path = retrieve_file_path(args_cli.checkpoint)
@@ -152,7 +151,36 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     
     # load the best model checkpoint
     print(f"[INFO]: Loading model checkpoint from: {checkpoint_path}")
-    runner.load(checkpoint_path, load_optimizer=False)
+
+    # 1. 手动加载 checkpoint
+    loaded_dict = torch.load(checkpoint_path, map_location=agent_cfg.device)
+    
+    # 2. 过滤权重：只保留 student 部分，移除所有 teachers_list
+    full_state_dict = loaded_dict['model_state_dict']
+    student_only_state_dict = {}
+    
+    for k, v in full_state_dict.items():
+        # 过滤掉 MultiTeacherPolicy 特有的 teachers_list
+        if "teachers_list" in k:
+            continue
+        # 过滤掉标准 StudentTeacher 可能存在的 teacher (因为 play 时不需要 teacher，且结构可能不匹配)
+        if "teacher" in k and "student" not in k:
+            continue
+            
+        student_only_state_dict[k] = v
+        
+    # 3. 加载权重 (使用 strict=False，允许忽略缺失的 teacher 权重)
+    # StudentTeacherRecurrentCustom 内部会处理 memory_s.rnn -> rnn 的兼容性
+    runner.alg.policy.load_state_dict(student_only_state_dict, strict=False)
+    print("[INFO] Model weights loaded (Student only, Teachers ignored).")
+
+    # 4. 加载 Normalizer (这对性能至关重要)
+    if agent_cfg.empirical_normalization:
+        if 'obs_norm_state_dict' in loaded_dict:
+            runner.obs_normalizer.load_state_dict(loaded_dict['obs_norm_state_dict'])
+            print("[INFO] Observation Normalizer loaded.")
+        else:
+            print("[WARNING] Empirical normalization is enabled but no 'obs_norm_state_dict' found in checkpoint!")
     
     # set policy to evaluation mode
     runner.eval_mode()

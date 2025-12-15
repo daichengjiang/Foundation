@@ -36,7 +36,7 @@ class Distillation:
         num_mini_batches=8,
         # Two-stage training parameters
         use_two_stage_training=True,
-        phase1_iterations=300,
+        phase1_iterations=10,
     ):
         # device-related parameters
         self.device = device
