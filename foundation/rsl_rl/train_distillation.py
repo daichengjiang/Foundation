@@ -266,7 +266,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         num_student_obs=real_student_obs_dim,
         num_teacher_obs=real_teacher_obs_dim,
         num_actions=env.num_actions,
-        student_hidden_dims=agent_cfg.policy.actor_hidden_dims,
+        student_hidden_dims=agent_cfg.policy.student_hidden_dims,
         teacher_hidden_dims=agent_cfg.policy.teacher_hidden_dims,
         activation=agent_cfg.policy.activation,
         rnn_type=agent_cfg.policy.rnn_type,
