@@ -327,6 +327,10 @@ class QuadcopterEnv(DirectRLEnv):
         # 初始为 True，避免在 __init__ 时出错，具体会在 _reset_idx 中设为 False
         self._traj_origin_adjusted = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
 
+        # [新增] 模拟 RSL-RL 的 Reward Buffer (默认长度 100)
+        # 这确保了我们计算的 mean_reward 与终端输出的 "Mean reward" 是同一种算法
+        self.reward_rolling_buffer = deque(maxlen=100)
+
         # [新增] 结果回传文件路径和最大奖励记录
         self.reward_report_path = os.environ.get("TEACHER_MAX_REWARD_PATH", None)
         self.global_max_reward = -float('inf')
@@ -1033,37 +1037,52 @@ class QuadcopterEnv(DirectRLEnv):
             
             num_resets = len(env_ids)
             
-            # --- 1. 日志记录逻辑 (包含修改) ---
+            # --- 1. 日志记录逻辑 ---
             if num_resets > 0:
-                if "log" not in self.extras:
-                    self.extras["log"] = dict()
+                # -------------------------------------------------------------
+                # [关键修改] 计算与终端输出一致的 Sliding Window Mean Reward
+                # -------------------------------------------------------------
                 
-                # [新增] 计算本次 Reset 涉及的环境的总平均奖励
-                total_mean_reward = 0.0
+                # 1. 计算当前重置的这批环境，每个环境的 Episode 总奖励
+                # Shape: (num_resets, )
+                batch_total_rewards = torch.zeros(num_resets, device=self.device)
                 
+                # 累加各项子奖励 (position, orientation, etc.)
                 for key in self._episode_sums.keys():
-                    values = self._episode_sums[key][env_ids]
-                    mean_val = torch.mean(values).item()
-                    self.extras["log"][f"Episode_Reward/{key}"] = mean_val
-                    
-                    # 累加各个分项奖励的均值，得到总奖励的均值
-                    total_mean_reward += mean_val
-                    
-                    self._episode_sums[key][env_ids] = 0.0
+                    batch_total_rewards += self._episode_sums[key][env_ids]
                 
-                # [新增] 检查并更新最大奖励
-                # 注意：这里我们只关心训练中能达到的最高水平，所以记录历史最大值
-                if total_mean_reward > self.global_max_reward:
-                    self.global_max_reward = total_mean_reward
+                # 2. 将这批完成的数据存入滑动窗口 (Buffer)
+                # 使用 .cpu().tolist() 转为 Python 列表存入 deque
+                self.reward_rolling_buffer.extend(batch_total_rewards.cpu().tolist())
+                
+                # 3. 计算 Buffer 的平均值 (这就等于终端显示的 Mean reward)
+                if len(self.reward_rolling_buffer) > 0:
+                    current_rolling_mean = np.mean(self.reward_rolling_buffer)
+                else:
+                    current_rolling_mean = -float('inf')
+
+                # 4. 检查是否是历史最佳 (基于滑动平均值)
+                if current_rolling_mean > self.global_max_reward:
+                    self.global_max_reward = current_rolling_mean
                     
-                    # 如果设置了回传路径，写入文件
+                    # 写入临时文件
                     if self.reward_report_path:
                         try:
                             with open(self.reward_report_path, "w") as f:
                                 f.write(str(self.global_max_reward))
                         except Exception as e:
-                            # 避免IO错误中断训练
                             print(f"[Env Warning] Failed to write reward stats: {e}")
+
+                # -------------------------------------------------------------
+                # [原有的 Log 逻辑保持不变，用于 WandB 显示分项]
+                if "log" not in self.extras:
+                    self.extras["log"] = dict()
+                for key in self._episode_sums.keys():
+                    values = self._episode_sums[key][env_ids]
+                    mean_val = torch.mean(values).item()
+                    self.extras["log"][f"Episode_Reward/{key}"] = mean_val
+                    self._episode_sums[key][env_ids] = 0.0
+                # -------------------------------------------------------------
 
 
             died_mask = self.reset_terminated[env_ids]
