@@ -4,6 +4,7 @@ import os
 import time
 import argparse
 import sys
+import shutil # [新增] 用于删除文件夹
 from datetime import datetime
 
 def sample_raptor_dynamics():
@@ -37,9 +38,9 @@ def sample_raptor_dynamics():
         "thrust_to_weight": twr, "motor_tau": motor_tau
     }
 
-def run_training(teacher_id, dynamics, timestamp, gpu_id=0, csv_path="teacher_dynamics.csv", headless=False):
+def run_training(teacher_id, dynamics, timestamp, gpu_id=0, csv_path="teacher_dynamics.csv", headless=False, reward_threshold=10000.0):
     """
-    调用 train_teacher_single.py 并传入参数
+    调用 train_teacher_single.py 并传入参数，返回是否训练成功
     """
     inertia_str = f"[{dynamics['inertia'][0]:.10f},{dynamics['inertia'][1]:.10f},{dynamics['inertia'][2]:.10f}]"
 
@@ -53,18 +54,16 @@ def run_training(teacher_id, dynamics, timestamp, gpu_id=0, csv_path="teacher_dy
         f"agent.experiment_name=raptor_teachers",
         f"agent.run_name=teacher_{teacher_id:04d}",
         # 注意：请根据你的实际路径确认 USD 路径
-        'env.robot.spawn.usd_path="/home/frd/Foundation/USD/cf2x.usd"'
+        'env.robot.spawn.usd_path="/home/nv/Foundation/USD/cf2x.usd"'
     ]
     
-    # 假设你的 train_teacher_single.py 就在 foundation/rsl_rl 下，或者根据你的项目结构调整
     train_script = "foundation/rsl_rl/train_teacher_single.py"
     if not os.path.exists(train_script):
-        # 尝试相对路径回退
         if os.path.exists("train_teacher_single.py"):
             train_script = "train_teacher_single.py"
         else:
             print(f"Error: Could not find {train_script}")
-            return
+            return False
 
     cmd = [
         sys.executable, train_script,
@@ -77,34 +76,79 @@ def run_training(teacher_id, dynamics, timestamp, gpu_id=0, csv_path="teacher_dy
         "--log_timestamp", timestamp 
     ] + overrides
     
-    # [新增] 如果 headless 为 True，则添加该参数
     if headless:
         cmd.append("--headless")
 
-    # 保存参数到指定的 CSV 路径
-    save_params_to_csv(csv_path, teacher_id, dynamics)
+    # [新增] 构造临时文件路径，用于接收子进程的最大奖励
+    result_file = os.path.abspath(f"temp_reward_{timestamp}_{teacher_id}.txt")
+    if os.path.exists(result_file):
+        os.remove(result_file)
+
+    # [新增] 设置环境变量传给子进程
+    env_vars = os.environ.copy()
+    env_vars["TEACHER_MAX_REWARD_PATH"] = result_file
 
     print(f"==================================================")
     print(f"Starting Teacher {teacher_id} | GPU {gpu_id} | Headless: {headless}")
     print(f"Dir: .../{timestamp}/teacher_{teacher_id:04d}")
     print(f"Mass: {dynamics['mass']:.4f} kg | Arm: {dynamics['arm_length']:.4f} m") 
     print(f"TWR : {dynamics['thrust_to_weight']:.2f}    | Tau: {dynamics['motor_tau']:.3f} s")
-    print(f"CSV Saved to: {csv_path}")
+    print(f"Target Reward: > {reward_threshold}")
     print(f"==================================================")
     
+    success = False
+    
     try:
-        subprocess.run(cmd, check=True)
+        # 传入 env_vars
+        subprocess.run(cmd, check=True, env=env_vars)
+        
+        # [新增] 检查结果
+        max_reward = -float('inf')
+        if os.path.exists(result_file):
+            with open(result_file, 'r') as f:
+                try:
+                    content = f.read().strip()
+                    if content:
+                        max_reward = float(content)
+                except ValueError:
+                    pass
+            # 清理临时文件
+            os.remove(result_file)
+        
+        print(f"Teacher {teacher_id} Finished. Max Reward: {max_reward:.2f}")
+
+        if max_reward > reward_threshold:
+            print(f"SUCCESS: Reward {max_reward:.2f} > {reward_threshold}. Saving...")
+            # 只有成功了才保存 CSV
+            save_params_to_csv(csv_path, teacher_id, dynamics)
+            success = True
+        else:
+            print(f"FAILURE: Reward {max_reward:.2f} < {reward_threshold}. Deleting and Retrying...")
+            success = False
+
     except subprocess.CalledProcessError as e:
-        print(f"!!! Error training Teacher {teacher_id} !!!")
+        print(f"!!! Error training Teacher {teacher_id} (Process Crashed) !!!")
         print(e)
+        success = False
+    
+    # [新增] 如果失败，清理日志目录
+    if not success:
+        # 重构日志路径: logs/rsl_rl/raptor_teachers/{timestamp}/teacher_{id}
+        log_dir = os.path.join("logs", "rsl_rl", "raptor_teachers", timestamp, f"teacher_{teacher_id:04d}")
+        if os.path.exists(log_dir):
+            try:
+                print(f"[Auto-Clean] Removing failed log dir: {log_dir}")
+                shutil.rmtree(log_dir)
+            except OSError as e:
+                print(f"Warning: Could not remove failed dir: {e}")
+                
+    return success
 
 def save_params_to_csv(file_path, teacher_id, dynamics):
     """
     将参数追加写入到指定路径的 CSV 文件
     """
     file_exists = os.path.isfile(file_path)
-    
-    # 确保目录存在
     os.makedirs(os.path.dirname(file_path), exist_ok=True)
     
     with open(file_path, "a") as f:
@@ -121,27 +165,19 @@ if __name__ == "__main__":
     parser.add_argument("--num_teachers", type=int, default=1)
     parser.add_argument("--gpu_id", type=int, default=0)
     parser.add_argument("--timestamp", type=str, default=None) 
-    # [新增] headless 参数
-    parser.add_argument("--headless", action="store_true", default=False, help="Run without rendering (Headless mode)")
+    parser.add_argument("--headless", action="store_true", default=False, help="Run without rendering")
 
     args = parser.parse_args()
 
-    # 1. 确定本次运行的统一时间戳
     if args.timestamp:
         batch_timestamp = args.timestamp
     else:
         batch_timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
-    # 2. 构建目标 CSV 路径
-    # 路径格式: logs/rsl_rl/raptor_teachers/{timestamp}/teacher_dynamics.csv
     log_root_dir = os.path.join("logs", "rsl_rl", "raptor_teachers", batch_timestamp)
-    
-    # 确保日志目录先被创建 (虽然 train_teacher_single.py 也会创建，但我们要先写 CSV)
     os.makedirs(log_root_dir, exist_ok=True)
-    
     csv_path = os.path.join(log_root_dir, "teacher_dynamics.csv")
 
-    # 3. 自动清理 (仅当 start_id=0 时，删除该目录下可能已存在的 CSV)
     if args.start_id == 0:
         if os.path.exists(csv_path):
             print(f"[Auto-Clean] Removing existing '{csv_path}' to start fresh.")
@@ -153,17 +189,28 @@ if __name__ == "__main__":
     print(f"Batch Timestamp: {batch_timestamp}")
     print(f"Dynamics CSV will be saved to: {csv_path}")
 
-    # 4. 循环训练
-    for i in range(args.start_id, args.start_id + args.num_teachers):
+    # [修改] 使用 while 循环来实现重试逻辑
+    current_teacher_id = args.start_id
+    end_teacher_id = args.start_id + args.num_teachers
+
+    while current_teacher_id < end_teacher_id:
         dyn_params = sample_raptor_dynamics()
         
-        run_training(
-            teacher_id=i, 
+        is_success = run_training(
+            teacher_id=current_teacher_id, 
             dynamics=dyn_params, 
             timestamp=batch_timestamp, 
             gpu_id=args.gpu_id,
-            csv_path=csv_path, # 传入完整路径
-            headless=args.headless # [新增] 传入 headless 参数
+            csv_path=csv_path,
+            headless=args.headless,
+            reward_threshold=10000.0 # 设置阈值
         )
         
-        time.sleep(2)
+        if is_success:
+            # 只有成功才移动到下一个 ID
+            current_teacher_id += 1
+            time.sleep(1)
+        else:
+            # 失败则不增加 ID，继续循环，重新采样参数进行训练
+            print(f"Retrying Teacher {current_teacher_id}...")
+            time.sleep(2)

@@ -327,6 +327,10 @@ class QuadcopterEnv(DirectRLEnv):
         # 初始为 True，避免在 __init__ 时出错，具体会在 _reset_idx 中设为 False
         self._traj_origin_adjusted = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
 
+        # [新增] 结果回传文件路径和最大奖励记录
+        self.reward_report_path = os.environ.get("TEACHER_MAX_REWARD_PATH", None)
+        self.global_max_reward = -float('inf')
+
         self._calc_env_origins()
 
     def CHECK_NAN(self, tensor, name):
@@ -1029,15 +1033,37 @@ class QuadcopterEnv(DirectRLEnv):
             
             num_resets = len(env_ids)
             
-            # --- 1. 日志记录逻辑 (保持不变) ---
+            # --- 1. 日志记录逻辑 (包含修改) ---
             if num_resets > 0:
                 if "log" not in self.extras:
                     self.extras["log"] = dict()
+                
+                # [新增] 计算本次 Reset 涉及的环境的总平均奖励
+                total_mean_reward = 0.0
+                
                 for key in self._episode_sums.keys():
                     values = self._episode_sums[key][env_ids]
                     mean_val = torch.mean(values).item()
                     self.extras["log"][f"Episode_Reward/{key}"] = mean_val
+                    
+                    # 累加各个分项奖励的均值，得到总奖励的均值
+                    total_mean_reward += mean_val
+                    
                     self._episode_sums[key][env_ids] = 0.0
+                
+                # [新增] 检查并更新最大奖励
+                # 注意：这里我们只关心训练中能达到的最高水平，所以记录历史最大值
+                if total_mean_reward > self.global_max_reward:
+                    self.global_max_reward = total_mean_reward
+                    
+                    # 如果设置了回传路径，写入文件
+                    if self.reward_report_path:
+                        try:
+                            with open(self.reward_report_path, "w") as f:
+                                f.write(str(self.global_max_reward))
+                        except Exception as e:
+                            # 避免IO错误中断训练
+                            print(f"[Env Warning] Failed to write reward stats: {e}")
 
 
             died_mask = self.reset_terminated[env_ids]
