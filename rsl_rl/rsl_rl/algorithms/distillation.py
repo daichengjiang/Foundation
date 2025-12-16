@@ -155,28 +155,26 @@ class Distillation:
             pass
 
         for epoch in range(self.num_learning_epochs):
-            # 1. Get Batch Generator
             generator = self.storage.recurrent_distillation_batch_generator(self.num_mini_batches)
 
             for obs_batch, target_actions_batch, masks_batch in generator:
                 # obs_batch: [Seq_Len, Batch_Size, Dim]
-                # masks_batch: [Seq_Len, Batch_Size]
-
-                # ================= [新增: Burn-in 策略] =================
-                # 定义预热步数，通常 10-20 步足够让 GRU 恢复记忆
-                burn_in_steps = 20 
                 
-                # 复制一份 mask，以免修改原始数据
-                # 注意：obs_batch 形状是 [Seq_Len, Batch, Dim]
-                # 我们要屏蔽前 burn_in_steps 行
+                # ================= [FIX 1: 保留原始 Mask 用于隐状态管理] =================
+                # masks_batch 即将用于 Loss 计算（会被修改以进行 Burn-in）
+                # 我们需要一份"纯净"的 Mask，仅包含环境的 Done 信息，用于重置 RNN
+                # 假设 generator 返回的 masks_batch 中，1.0 代表继续，0.0 代表 Done/Reset
+                reset_masks_batch = masks_batch.clone() 
+                
+                # ================= [Burn-in 策略 (原代码)] =================
+                burn_in_steps = 20 
                 if masks_batch.shape[0] > burn_in_steps:
+                    # 这只影响 Loss 的计算，不应影响 RNN 记忆的传递
                     masks_batch[:burn_in_steps, :] = 0.0
-                # =======================================================
                 
                 T, B, _ = obs_batch.shape
                 
-                # 2. Initialize Hidden State for this batch (Zeros)
-                # Note: RNN hidden state shape is [Num_Layers, Batch, Hidden_Dim]
+                # 2. Initialize Hidden State (Zeros)
                 if hasattr(self.policy, 'rnn_type') and self.policy.rnn_type == 'lstm':
                      hidden_state = (
                          torch.zeros(self.policy.rnn_num_layers, B, self.policy.rnn_hidden_dim, device=self.device),
@@ -188,38 +186,35 @@ class Distillation:
                          device=self.device
                      )
 
-                # 3. Iterate Time (TBPTT: Truncated Backpropagation Through Time)
+                # 3. Iterate Time
                 for t in range(0, T, self.gradient_length):
                     end_t = min(t + self.gradient_length, T)
                     
-                    # Slice window
-                    obs_window = obs_batch[t:end_t]         # [Grad_Len, B, D]
+                    obs_window = obs_batch[t:end_t]
                     target_window = target_actions_batch[t:end_t]
-                    mask_window = masks_batch[t:end_t]
+                    mask_window = masks_batch[t:end_t]         # 用于 Loss (含 Burn-in)
+                    
+                    # [FIX 1 Continued] 获取当前窗口用于重置隐状态的 Mask
+                    # 我们需要当前窗口“最后一步”的 Mask
+                    # 如果最后一步是 Done (0.0)，则传给下一段的隐状态应为 0
+                    current_reset_mask_window = reset_masks_batch[t:end_t]
                     
                     # Forward Batch
-                    # hidden_state passes information from previous window to this one
                     pred_actions_window, next_hidden_state = self.policy.act_batch(obs_window, hidden_state)
                     
                     # Calculate Loss
-                    # reduction='none' allows us to mask invalid timesteps (padded data)
                     loss = self.loss_fn(pred_actions_window, target_window, reduction='none')
-                    
-                    # Average over action dim: [Grad_Len, B, A] -> [Grad_Len, B]
                     if len(loss.shape) > 2:
                         loss = loss.mean(dim=-1)
                     
-                    # Apply Mask
-                    loss = loss * mask_window
+                    loss = loss * mask_window # 使用含 Burn-in 的 mask 屏蔽 Loss
                     
-                    # Compute scalar loss (Average over valid tokens only)
                     valid_tokens = mask_window.sum()
                     if valid_tokens > 0:
                         loss_val = loss.sum() / valid_tokens
                     else:
                         loss_val = torch.tensor(0.0, device=self.device, requires_grad=True)
                     
-                    # Backward & Step
                     self.optimizer.zero_grad()
                     loss_val.backward()
                     
@@ -230,21 +225,30 @@ class Distillation:
                         
                     self.optimizer.step()
                     
-                    # Pass hidden state to next window (Detach to stop gradient flow)
-                    if isinstance(next_hidden_state, tuple):
-                        hidden_state = (next_hidden_state[0].detach(), next_hidden_state[1].detach())
-                    else:
-                        hidden_state = next_hidden_state.detach()
+                    # ================= [FIX 2: 根据 Mask 重置隐状态] =================
+                    # 取出当前窗口最后一步的 mask: [Batch_Size]
+                    # reset_masks通常是: 1.0 (Alive), 0.0 (Done)
+                    # 形状调整为: [1, Batch, 1] 以便与 hidden_state [Layers, Batch, Dim] 广播相乘
                     
-                    mean_behavior_loss += loss_val.item()
-                    cnt += 1
+                    # 注意：我们使用 reset_masks_batch 而不是 mask_window
+                    # 这样可以避免 Burn-in 阶段把隐状态清零了
+                    last_step_mask = current_reset_mask_window[-1].view(1, -1, 1)
 
-        # Clear storage after epoch
+                    if isinstance(next_hidden_state, tuple):
+                        # LSTM: (h, c)
+                        h_next, c_next = next_hidden_state
+                        # Detach AND Mask
+                        h_next = h_next.detach() * last_step_mask
+                        c_next = c_next.detach() * last_step_mask
+                        hidden_state = (h_next, c_next)
+                    else:
+                        # GRU: h
+                        # Detach AND Mask
+                        hidden_state = next_hidden_state.detach() * last_step_mask
+                    # ===============================================================
+
         self.storage.clear()
-        
-        # Reset policy internal state (just in case)
         self.policy.reset() 
-
         return {"behavior": mean_behavior_loss / max(cnt, 1)}
 
         
