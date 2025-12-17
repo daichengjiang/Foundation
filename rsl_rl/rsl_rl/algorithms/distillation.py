@@ -224,6 +224,9 @@ class Distillation:
                         nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
                         
                     self.optimizer.step()
+
+                    mean_behavior_loss += loss_val.item()
+                    cnt += 1
                     
                     # ================= [FIX 2: 根据 Mask 重置隐状态] =================
                     # 取出当前窗口最后一步的 mask: [Batch_Size]

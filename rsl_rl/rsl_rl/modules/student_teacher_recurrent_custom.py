@@ -76,11 +76,16 @@ class StudentTeacherRecurrentCustom(StudentTeacher):
         else:
             self.rnn = nn.GRU(input_size=pre_rnn_dim, hidden_size=rnn_hidden_dim, num_layers=rnn_num_layers)
         
-        # 3. Post-RNN Dense layer
-        self.post_rnn_mlp = nn.Sequential(
-            nn.Linear(rnn_hidden_dim, post_rnn_dim),
-            activation_fn
-        )
+        # 3. Post-RNN Dense layer (can be identity if post_rnn_dim == rnn_hidden_dim)
+        if post_rnn_dim == rnn_hidden_dim:
+            # Identity mapping: no transformation needed
+            self.post_rnn_mlp = nn.Identity()
+        else:
+            # Standard linear projection with activation
+            self.post_rnn_mlp = nn.Sequential(
+                nn.Linear(rnn_hidden_dim, post_rnn_dim),
+                activation_fn
+            )
 
         # 4. Student MLP (Rebuild input layer)
         student_layers = []
@@ -94,8 +99,10 @@ class StudentTeacherRecurrentCustom(StudentTeacher):
             student_layers.append(nn.Linear(student_hidden_dims[-1], num_actions))
             student_layers.append(nn.Tanh())  # Add tanh activation to output layer
         else:
+            # RAPTOR-style: Direct output without activation (or use Identity)
             student_layers.append(nn.Linear(input_dim, num_actions))
-            student_layers.append(nn.Tanh())  # Add tanh activation to output layer
+            # Use Identity instead of Tanh to match RAPTOR exactly
+            student_layers.append(nn.Identity())
         
         self.student = nn.Sequential(*student_layers)
         
@@ -150,12 +157,16 @@ class StudentTeacherRecurrentCustom(StudentTeacher):
              else:
                  self.hidden_state = torch.zeros(self.rnn_num_layers, batch_size, self.rnn_hidden_dim, device=device)
 
-        # 2. 网络计算 (保持原有逻辑)
+        # 2. 网络计算
         x = self.pre_rnn_mlp(observations)
         x = x.unsqueeze(0)  # [Seq=1, Batch, Dim]
         x, self.hidden_state = self.rnn(x, self.hidden_state)
         x = x.squeeze(0)
-        x = self.post_rnn_mlp(x)
+        
+        # Use post_rnn_mlp if it's not Identity, otherwise skip
+        if not isinstance(self.post_rnn_mlp, nn.Identity):
+            x = self.post_rnn_mlp(x)
+            
         mean = self.student(x)
         return mean
 
@@ -206,9 +217,10 @@ class StudentTeacherRecurrentCustom(StudentTeacher):
         x = x.view(T, B, -1)
         x, new_hidden_states = self.rnn(x, hidden_states)
         
-        # 3. Post-RNN (Merge T and B)
+        # 3. Post-RNN (Merge T and B) - skip if Identity
         x = x.contiguous().view(T * B, -1)
-        x = self.post_rnn_mlp(x)
+        if not isinstance(self.post_rnn_mlp, nn.Identity):
+            x = self.post_rnn_mlp(x)
         actions = self.student(x)
         
         # Reshape back to [T, B, A]
