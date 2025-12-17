@@ -38,7 +38,7 @@ def sample_raptor_dynamics():
         "thrust_to_weight": twr, "motor_tau": motor_tau
     }
 
-def run_training(teacher_id, dynamics, timestamp, gpu_id=0, csv_path="teacher_dynamics.csv", headless=False, reward_threshold=10000.0):
+def run_training(teacher_id, dynamics, timestamp, gpu_id=0, csv_path="teacher_dynamics.csv", headless=False, reward_threshold=11000.0):
     """
     调用 train_teacher_single.py 并传入参数，返回是否训练成功
     """
@@ -54,7 +54,8 @@ def run_training(teacher_id, dynamics, timestamp, gpu_id=0, csv_path="teacher_dy
         f"agent.experiment_name=raptor_teachers",
         f"agent.run_name=teacher_{teacher_id:04d}",
         # 注意：请根据你的实际路径确认 USD 路径
-        'env.robot.spawn.usd_path="/home/nv/Foundation/USD/cf2x.usd"'
+        'env.robot.spawn.usd_path="/home/nv/Foundation/USD/cf2x.usd"',
+        "env.debug_vis=False"
     ]
     
     train_script = "foundation/rsl_rl/train_teacher_single.py"
@@ -67,8 +68,8 @@ def run_training(teacher_id, dynamics, timestamp, gpu_id=0, csv_path="teacher_dy
 
     cmd = [
         sys.executable, train_script,
-        "--task", "point_ctrl_single_dense",
-        "--num_envs", "6400",
+        "--task", "teacher",
+        "--num_envs", "4000",
         "--max_iterations", "700",
         "--device", f"cuda:{gpu_id}",
         "--logger", "wandb",

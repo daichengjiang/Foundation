@@ -151,7 +151,7 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     decimation = 1
     action_space = 4 
     state_space = 0
-    debug_vis = True
+    debug_vis = False
 
     map_size = MAP_SIZE
 

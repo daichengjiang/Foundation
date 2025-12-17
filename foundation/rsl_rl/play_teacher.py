@@ -106,11 +106,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env_cfg.sim.use_fabric = not args_cli.disable_fabric if args_cli.disable_fabric is not None else env_cfg.sim.use_fabric
 
     # Example dynamics (Teacher usually works on specific dynamics)
-    env_cfg.dynamics.mass = 0.5341363827864255
-    env_cfg.dynamics.arm_length = 0.11716311172050321
-    env_cfg.dynamics.inertia = (0.008633919865618027,0.008633919865618027,0.015817341193812225)
-    env_cfg.dynamics.thrust_to_weight = 4.581534080567852
-    env_cfg.dynamics.motor_tau = 0.039698122640419706
+    env_cfg.dynamics.mass = 0.04710898687906457
+    env_cfg.dynamics.arm_length = 0.05346871324828392
+    env_cfg.dynamics.inertia = (0.00011600101103956468,0.00011600101103956468,0.0002125138522244825)
+    env_cfg.dynamics.thrust_to_weight = 3.1237472555681305
+    env_cfg.dynamics.motor_tau = 0.0688149915194806
 
     # get checkpoint path
     checkpoint_path = retrieve_file_path(args_cli.checkpoint)
