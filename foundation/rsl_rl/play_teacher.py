@@ -21,7 +21,7 @@ parser = argparse.ArgumentParser(description="Play and evaluate trajectory track
 parser.add_argument("--video", action="store_true", default=False, help="Record videos during playing.")
 parser.add_argument("--video_length", type=int, default=2000, help="Length of the recorded video (in steps).")
 parser.add_argument("--video_interval", type=int, default=10000, help="Interval between video recordings (in steps).")
-parser.add_argument("--num_envs", type=int, default=4, help="Number of environments to simulate.")
+parser.add_argument("--num_envs", type=int, default=1, help="Number of environments to simulate.")
 parser.add_argument("--task", type=str, default=None, required=True, help="Name of the task.")
 parser.add_argument("--seed", type=int, default=42, help="Seed used for the environment")
 parser.add_argument("--max_steps", type=int, default=10000, help="Maximum steps to run for trajectory tracking.")
@@ -78,6 +78,11 @@ torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.benchmark = False
 
+# ==========================================
+# CONFIGURATION: Statistics Start Step
+# ==========================================
+STATS_START_STEP = 3000
+# ==========================================
 
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg):
@@ -100,12 +105,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
     env_cfg.sim.use_fabric = not args_cli.disable_fabric if args_cli.disable_fabric is not None else env_cfg.sim.use_fabric
 
-    # env_cfg.dynamics.mass = 0.042650814707119296
-    # env_cfg.dynamics.arm_length = 0.04709796532826468
-    # env_cfg.dynamics.inertia = (0.0007679770076841281,0.0007679770076841281,0.0014069338780773226)
-    # env_cfg.dynamics.thrust_to_weight = 4.23108099633458
-    # env_cfg.dynamics.motor_tau = 0.05043375805083486
-
+    # Example dynamics (Teacher usually works on specific dynamics)
     env_cfg.dynamics.mass = 0.5341363827864255
     env_cfg.dynamics.arm_length = 0.11716311172050321
     env_cfg.dynamics.inertia = (0.008633919865618027,0.008633919865618027,0.015817341193812225)
@@ -127,11 +127,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
 
-    # convert to single-agent instance if required by the RL algorithm
     if isinstance(env.unwrapped, DirectMARLEnv):
         env = multi_agent_to_single_agent(env)
 
-    # wrap for video recording
     if args_cli.video:
         video_kwargs = {
             "video_folder": os.path.join(log_dir, "videos"),
@@ -143,124 +141,99 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         print_dict(video_kwargs, nesting=4)
         env = gym.wrappers.RecordVideo(env, **video_kwargs)
 
-    # wrap around environment for rsl-rl
     env = RslRlVecEnvWrapper(env)
-
-    # create runner from rsl-rl
     runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
     
-    # load the best model checkpoint
     print(f"[INFO]: Loading model checkpoint from: {checkpoint_path}")
     runner.load(checkpoint_path, load_optimizer=False)
     
-    # set policy to evaluation mode
     runner.eval_mode()
-
-    # get inference policy
     policy = runner.get_inference_policy(device=agent_cfg.device)
     policy_model = runner.alg.policy
-
-    # simulation timestep
     dt = env.unwrapped.step_dt
-
-    # reset environment
     obs, _ = env.get_observations()
     
-    # Trajectory tracking data storage
+    # Data storage
     trajectory_data = {
-        'desired_pos': [],      # Desired trajectory positions
-        'actual_pos': [],       # Actual drone positions
-        'desired_vel': [],      # Desired velocities
-        'actual_vel': [],       # Actual velocities
-        'position_error': [],   # Position tracking errors
-        'velocity_error': [],   # Velocity tracking errors
-        'actions': [],          # Control actions
-        'timestamps': []        # Time stamps
+        'desired_pos': [],
+        'actual_pos': [],
+        'desired_vel': [],
+        'actual_vel': [],
+        'actions': [],
+        'timestamps': []
     }
     
-    # Tracking error statistics (per environment)
-    position_errors_all = [[] for _ in range(env.num_envs)]
-    velocity_errors_all = [[] for _ in range(env.num_envs)]
-    
     print(f"\n{'=' * 80}")
-    print(f"Trajectory Tracking Evaluation")
+    print(f"Trajectory Tracking Evaluation (Teacher)")
     print(f"Number of environments: {env.num_envs}")
     print(f"Maximum steps: {args_cli.max_steps}")
+    print(f"Statistics start step: {STATS_START_STEP}")
     print(f"{'=' * 80}\n")
     
     timestep = 0
     start_time = time.time()
     
-    # simulate environment
+    # Storage for calculating overall metrics across all steps and envs
+    total_squared_error_pos = 0.0
+    total_squared_error_pos_xy = 0.0
+    max_velocity_observed = 0.0
+    total_samples = 0
+
     while simulation_app.is_running() and timestep < args_cli.max_steps:
         step_start_time = time.time()
         
-        # run everything in inference mode
         with torch.inference_mode():
-            
-            # -----------------------------------------------------------------
-            # --- 1. 获取 t 步的期望状态，并缓存下来 ---
-            # -----------------------------------------------------------------
             desired_pos = env.unwrapped.pos_des.clone()
             desired_vel = env.unwrapped.vel_des.clone()
             
-            # -----------------------------------------------------------------
-            # --- 2. 获取 t 步的动作 a_t ---
-            # -----------------------------------------------------------------
-            actions = policy(obs) # obs 来自上一个时间步的 step() 结果
-            
-            # -----------------------------------------------------------------
-            # --- 3. 执行动作，环境从 t-1 转移到 t ---
-            # -----------------------------------------------------------------
-            # 在 env.step() 内部，机器人实际位置变为 current_pos_t
-            # 且环境的期望位置 pos_des/vel_des 可能会更新为下一时刻 t+1 的值
+            actions = policy(obs)
             obs, rewards, dones, extras = env.step(actions)
 
             if hasattr(policy_model, "reset"):
                 policy_model.reset(dones)
             
-            # -----------------------------------------------------------------
-            # --- 4. 获取 t 步的实际状态 ---
-            # -----------------------------------------------------------------
-            # 这是动作执行后的新位置/速度
             current_pos = env.unwrapped._robot.data.root_pos_w.clone()
             current_vel = env.unwrapped._robot.data.root_lin_vel_w.clone()
             
-            # -----------------------------------------------------------------
-            # --- 5. 计算跟踪误差 (使用 t 步的实际状态 和 t 步缓存的期望状态) ---
-            # -----------------------------------------------------------------
-            pos_error = torch.norm(current_pos - desired_pos, dim=1) 
-            vel_error = torch.norm(current_vel - desired_vel, dim=1) 
-
-            # Store tracking errors for each environment
-            for env_id in range(env.num_envs):
-                # 使用修正后的 pos_error/vel_error
-                position_errors_all[env_id].append(pos_error[env_id].item())
-                velocity_errors_all[env_id].append(vel_error[env_id].item())
+            # --- Calculation for Metrics ---
+            pos_error_vec = current_pos - desired_pos
+            squared_error = torch.sum(pos_error_vec**2, dim=1) 
+            squared_error_xy = torch.sum(pos_error_vec[:, :2]**2, dim=1) 
+            vel_mag = torch.norm(current_vel, dim=1)
             
-            # Save trajectory data (only for environment 0 to reduce storage)
+            # === ONLY ACCUMULATE STATISTICS IF TIMESTEP >= STATS_START_STEP ===
+            if timestep >= STATS_START_STEP:
+                # 1. Total Squared Error (for RMSE)
+                total_squared_error_pos += torch.sum(squared_error).item()
+                
+                # 2. XY Squared Error (for RMSE w/o z)
+                total_squared_error_pos_xy += torch.sum(squared_error_xy).item()
+                
+                # 3. Max Velocity
+                current_max_vel = torch.max(vel_mag).item()
+                if current_max_vel > max_velocity_observed:
+                    max_velocity_observed = current_max_vel
+                
+                total_samples += env.num_envs
+            # =================================================================
+
+            # Save trajectory data (Env 0 only) - Save ALL steps for visualization
             if args_cli.save_trajectory:
-                # 记录 t 步的数据
                 trajectory_data['desired_pos'].append(desired_pos[0].cpu().numpy())
                 trajectory_data['actual_pos'].append(current_pos[0].cpu().numpy())
                 trajectory_data['desired_vel'].append(desired_vel[0].cpu().numpy())
                 trajectory_data['actual_vel'].append(current_vel[0].cpu().numpy())
-                trajectory_data['position_error'].append(pos_error[0].item())
-                trajectory_data['velocity_error'].append(vel_error[0].item())
-                trajectory_data['actions'].append(actions[0].cpu().numpy()) # actions 是 t 步使用的动作
+                trajectory_data['actions'].append(actions[0].cpu().numpy())
                 trajectory_data['timestamps'].append(timestep * dt)
                         
             timestep += 1
             
-            # Print periodic statistics
             if timestep % 1000 == 0:
-                avg_pos_error = torch.mean(pos_error).item()
-                avg_vel_error = torch.mean(vel_error).item()
-                print(f"Step {timestep:5d} | "
-                    f"Avg Pos Error: {avg_pos_error:.4f}m | "
-                    f"Avg Vel Error: {avg_vel_error:.4f}m/s")
+                cur_rmse = np.sqrt(torch.mean(squared_error).item())
+                cur_rmse_xy = np.sqrt(torch.mean(squared_error_xy).item())
+                status = " (Collecting Stats)" if timestep >= STATS_START_STEP else " (Warmup)"
+                print(f"Step {timestep:5d}{status} | RMSE: {cur_rmse:.4f}m | RMSE w/o z: {cur_rmse_xy:.4f}m")
                 
-        # time delay for real-time evaluation
         if args_cli.realtime:
             sleep_time = dt - (time.time() - step_start_time)
             if sleep_time > 0:
@@ -268,126 +241,55 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     
     total_time = time.time() - start_time
     
-    # Calculate overall statistics
+    # --- Final Metric Calculation ---
+    if total_samples > 0:
+        rmse_final = np.sqrt(total_squared_error_pos / total_samples)
+        rmse_xy_final = np.sqrt(total_squared_error_pos_xy / total_samples)
+    else:
+        rmse_final = 0.0
+        rmse_xy_final = 0.0
+    
     print(f"\n{'=' * 80}")
-    print(f"Trajectory Tracking Results:")
+    print(f"Paper Metrics Results (Calculated from step {STATS_START_STEP} onwards):")
+    print(f"{'-' * 80}")
+    print(f"  RMSE [m]:             {rmse_final:.4f}")
+    print(f"  RMSE w/o z [m]:       {rmse_xy_final:.4f}")
+    print(f"  Max velocity [m/s]:   {max_velocity_observed:.4f}")
     print(f"{'-' * 80}")
     print(f"  Total Steps:          {timestep}")
-    print(f"  Total Time:           {total_time:.2f}s")
-    print(f"  Average FPS:          {timestep / total_time:.2f}")
+    print(f"  Valid Stat Steps:     {timestep - STATS_START_STEP}")
     
-    # Calculate statistics for each environment
-    all_env_pos_errors = []
-    all_env_vel_errors = []
+    # Save statistics to file
+    stats_file = os.path.join(log_dir, "tracking_statistics.txt")
+    with open(stats_file, 'w') as f:
+        f.write(f"RAPTOR Paper Metrics Evaluation\n")
+        f.write(f"{'=' * 80}\n")
+        f.write(f"Checkpoint: {checkpoint_path}\n")
+        f.write(f"Task: {args_cli.task}\n")
+        f.write(f"Stats Start Step: {STATS_START_STEP}\n")
+        f.write(f"Total Steps: {timestep}\n")
+        f.write(f"\nKEY METRICS (Steps >= {STATS_START_STEP}):\n")
+        f.write(f"  RMSE [m]:             {rmse_final:.4f}\n")
+        f.write(f"  RMSE w/o z [m]:       {rmse_xy_final:.4f}\n")
+        f.write(f"  Max velocity [m/s]:   {max_velocity_observed:.4f}\n")
+        
+    print(f"\nStatistics saved to: {stats_file}")
     
-    print(f"\n{'Per-Environment Statistics:':^80}")
-    print(f"{'-' * 80}")
-    for env_id in range(env.num_envs):
-        if len(position_errors_all[env_id]) > 0:
-            pos_errors = np.array(position_errors_all[env_id])
-            vel_errors = np.array(velocity_errors_all[env_id])
-            
-            all_env_pos_errors.extend(position_errors_all[env_id])
-            all_env_vel_errors.extend(velocity_errors_all[env_id])
-            
-            print(f"  Env {env_id:2d} | "
-                  f"Pos Error: {np.mean(pos_errors):.4f}±{np.std(pos_errors):.4f}m | "
-                  f"Vel Error: {np.mean(vel_errors):.4f}±{np.std(vel_errors):.4f}m/s")
-    
-    # Overall statistics
-    if len(all_env_pos_errors) > 0:
-        all_pos_errors = np.array(all_env_pos_errors)
-        all_vel_errors = np.array(all_env_vel_errors)
-        
-        print(f"\n{'Overall Statistics:':^80}")
-        print(f"{'-' * 80}")
-        print(f"  Position Error:")
-        print(f"    Mean:     {np.mean(all_pos_errors):.4f} m")
-        print(f"    Std:      {np.std(all_pos_errors):.4f} m")
-        print(f"    Median:   {np.median(all_pos_errors):.4f} m")
-        print(f"    Max:      {np.max(all_pos_errors):.4f} m")
-        print(f"    95th %ile: {np.percentile(all_pos_errors, 95):.4f} m")
-        
-        print(f"\n  Velocity Error:")
-        print(f"    Mean:     {np.mean(all_vel_errors):.4f} m/s")
-        print(f"    Std:      {np.std(all_vel_errors):.4f} m/s")
-        print(f"    Median:   {np.median(all_vel_errors):.4f} m/s")
-        print(f"    Max:      {np.max(all_vel_errors):.4f} m/s")
-        print(f"    95th %ile: {np.percentile(all_vel_errors, 95):.4f} m/s")
-        
-        # Save statistics to file
-        stats_file = os.path.join(log_dir, "tracking_statistics.txt")
-        with open(stats_file, 'w') as f:
-            f.write(f"Trajectory Tracking Evaluation Results\n")
-            f.write(f"{'=' * 80}\n")
-            f.write(f"Checkpoint: {checkpoint_path}\n")
-            f.write(f"Task: {args_cli.task}\n")
-            f.write(f"trajectory_type: {env_cfg.trajectory_type}\n")
-            f.write(f"Num Envs: {env_cfg.scene.num_envs}\n")
-            f.write(f"Seed: {env_cfg.seed}\n")
-            f.write(f"Total Steps: {timestep}\n")
-            f.write(f"Total Time: {total_time:.2f}s\n")
-            f.write(f"Average FPS: {timestep / total_time:.2f}\n")
-            
-            f.write(f"\n{'Overall Statistics':^80}\n")
-            f.write(f"{'-' * 80}\n")
-            f.write(f"Position Error:\n")
-            f.write(f"  Mean:     {np.mean(all_pos_errors):.4f} m\n")
-            f.write(f"  Std:      {np.std(all_pos_errors):.4f} m\n")
-            f.write(f"  Median:   {np.median(all_pos_errors):.4f} m\n")
-            f.write(f"  Max:      {np.max(all_pos_errors):.4f} m\n")
-            f.write(f"  95th %%:   {np.percentile(all_pos_errors, 95):.4f} m\n")
-            
-            f.write(f"\nVelocity Error:\n")
-            f.write(f"  Mean:     {np.mean(all_vel_errors):.4f} m/s\n")
-            f.write(f"  Std:      {np.std(all_vel_errors):.4f} m/s\n")
-            f.write(f"  Median:   {np.median(all_vel_errors):.4f} m/s\n")
-            f.write(f"  Max:      {np.max(all_vel_errors):.4f} m/s\n")
-            f.write(f"  95th %%:   {np.percentile(all_vel_errors, 95):.4f} m/s\n")
-            
-            f.write(f"\n{'Per-Environment Statistics':^80}\n")
-            f.write(f"{'-' * 80}\n")
-            for env_id in range(env.num_envs):
-                if len(position_errors_all[env_id]) > 0:
-                    pos_errors = np.array(position_errors_all[env_id])
-                    vel_errors = np.array(velocity_errors_all[env_id])
-                    f.write(f"Env {env_id:2d}:\n")
-                    f.write(f"  Pos Error: {np.mean(pos_errors):.4f} ± {np.std(pos_errors):.4f} m\n")
-                    f.write(f"  Vel Error: {np.mean(vel_errors):.4f} ± {np.std(vel_errors):.4f} m/s\n")
-        
-        print(f"\nStatistics saved to: {stats_file}")
-        
-        # Save numpy arrays for detailed analysis
-        error_data_file = os.path.join(log_dir, "tracking_errors.npz")
-        np.savez(error_data_file,
-                 position_errors=all_pos_errors,
-                 velocity_errors=all_vel_errors)
-        print(f"Error data saved to: {error_data_file}")
-        
-        # Save trajectory data if enabled
-        if args_cli.save_trajectory and len(trajectory_data['timestamps']) > 0:
-            traj_file = os.path.join(log_dir, "trajectory_data.npz")
-            np.savez(traj_file,
-                     desired_pos=np.array(trajectory_data['desired_pos']),
-                     actual_pos=np.array(trajectory_data['actual_pos']),
-                     desired_vel=np.array(trajectory_data['desired_vel']),
-                     actual_vel=np.array(trajectory_data['actual_vel']),
-                     position_error=np.array(trajectory_data['position_error']),
-                     velocity_error=np.array(trajectory_data['velocity_error']),
-                     actions=np.array(trajectory_data['actions']),
-                     timestamps=np.array(trajectory_data['timestamps']))
-            print(f"Trajectory data (Env 0) saved to: {traj_file}")
-            print(f"  - Use this data to visualize desired vs actual trajectories")
-            print(f"  - Data contains {len(trajectory_data['timestamps'])} time steps")
-    
-    print(f"{'=' * 80}\n")
+    if args_cli.save_trajectory and len(trajectory_data['timestamps']) > 0:
+        traj_file = os.path.join(log_dir, "trajectory_data.npz")
+        np.savez(traj_file,
+                 desired_pos=np.array(trajectory_data['desired_pos']),
+                 actual_pos=np.array(trajectory_data['actual_pos']),
+                 desired_vel=np.array(trajectory_data['desired_vel']),
+                 actual_vel=np.array(trajectory_data['actual_vel']),
+                 actions=np.array(trajectory_data['actions']),
+                 timestamps=np.array(trajectory_data['timestamps']),
+                 metrics=np.array([rmse_final, rmse_xy_final, max_velocity_observed, STATS_START_STEP]))
+        print(f"Trajectory data saved to: {traj_file}")
 
-    # close the simulator
+    print(f"{'=' * 80}\n")
     env.close()
 
-
 if __name__ == "__main__":
-    # run the main function
     main()
-    # close sim app
     simulation_app.close()

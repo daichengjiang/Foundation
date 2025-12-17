@@ -25,6 +25,10 @@ def get_colored_segments(x, y, z, color_vals, cmap_name='plasma'):
 
 def plot_paper_style_2d(desired_pos, actual_pos, actual_vel, save_path=None):
     """Plot 2D projections with velocity color mapping (Like Fig 5)."""
+    if len(actual_pos) == 0:
+        print("No data to plot.")
+        return
+
     speed = np.linalg.norm(actual_vel, axis=1)
     max_speed = np.max(speed)
     
@@ -37,6 +41,8 @@ def plot_paper_style_2d(desired_pos, actual_pos, actual_vel, save_path=None):
         (0, 2, 'X (m)', 'Z (m)', 'XZ Plane (Side)'),
         (1, 2, 'Y (m)', 'Z (m)', 'YZ Plane (Front)')
     ]
+    
+    line = None
     
     for i, (idx1, idx2, xlabel, ylabel, title) in enumerate(planes):
         ax = axes[i]
@@ -70,8 +76,9 @@ def plot_paper_style_2d(desired_pos, actual_pos, actual_vel, save_path=None):
 
     # Add Colorbar
     cbar_ax = fig.add_axes([0.92, 0.15, 0.015, 0.7]) # Position [left, bottom, width, height]
-    cbar = fig.colorbar(line, cax=cbar_ax)
-    cbar.set_label('Speed [m/s]', fontsize=12)
+    if line:
+        cbar = fig.colorbar(line, cax=cbar_ax)
+        cbar.set_label('Speed [m/s]', fontsize=12)
     
     plt.subplots_adjust(wspace=0.3, right=0.9)
     
@@ -82,6 +89,10 @@ def plot_paper_style_2d(desired_pos, actual_pos, actual_vel, save_path=None):
 
 def plot_paper_style_3d(desired_pos, actual_pos, actual_vel, save_path=None):
     """Plot 3D trajectory with velocity color mapping."""
+    if len(actual_pos) == 0:
+        print("No data to plot.")
+        return
+
     speed = np.linalg.norm(actual_vel, axis=1)
     max_speed = np.max(speed)
     
@@ -140,6 +151,8 @@ def main():
                         help='Directory containing trajectory_data.npz')
     parser.add_argument('--save_plots', action='store_true', default=True,
                         help='Save plots to files')
+    parser.add_argument('--start_step', type=int, default=None,
+                        help='Manually override start step for plotting (default: uses saved metrics start step or 3000)')
     args = parser.parse_args()
     
     # Load trajectory data
@@ -155,37 +168,41 @@ def main():
     actual_pos = data['actual_pos']
     actual_vel = data['actual_vel']
     
-    # Check if metrics are saved
-    if 'metrics' in data:
-        metrics = data['metrics']
-        stats_start = int(metrics[3]) if len(metrics) > 3 else 3000
-        print(f"\nSaved Metrics (calculated from step {stats_start}):")
-        print(f"  RMSE:          {metrics[0]:.4f} m")
-        print(f"  RMSE w/o z:    {metrics[1]:.4f} m")
-        print(f"  Max Velocity:  {metrics[2]:.4f} m/s")
+    # Determine start step for stats and plotting
+    stats_start = 3000 # Default fallback
+    
+    if args.start_step is not None:
+        stats_start = args.start_step
+        print(f"[INFO] Using manual start step: {stats_start}")
+    elif 'metrics' in data and len(data['metrics']) > 3:
+        stats_start = int(data['metrics'][3])
+        print(f"[INFO] Using start step from saved metrics: {stats_start}")
     else:
-        # Calculate manually if not in npz, applying the 3000 step logic
-        stats_start = 3000
-        print(f"\nSaved metrics not found. Recalculating from step {stats_start}...")
-        
-        # Slice arrays
-        valid_actual = actual_pos[stats_start:]
-        valid_desired = desired_pos[stats_start:]
-        valid_vel = actual_vel[stats_start:]
-        
-        pos_error_sq = np.sum((valid_actual - valid_desired)**2, axis=1)
-        rmse = np.sqrt(np.mean(pos_error_sq))
-        
-        pos_error_xy_sq = np.sum((valid_actual[:, :2] - valid_desired[:, :2])**2, axis=1)
-        rmse_no_z = np.sqrt(np.mean(pos_error_xy_sq))
-        
-        speed = np.linalg.norm(valid_vel, axis=1)
-        max_vel = np.max(speed)
-        
-        print(f"Calculated Metrics (from step {stats_start}):")
-        print(f"  RMSE:          {rmse:.4f} m")
-        print(f"  RMSE w/o z:    {rmse_no_z:.4f} m")
-        print(f"  Max Velocity:  {max_vel:.4f} m/s")
+        print(f"[INFO] Using default start step: {stats_start}")
+
+    # --- Print Metrics ---
+    # Recalculate based on slicing to be safe (or use saved if preferred, but recalculating ensures alignment with plot)
+    valid_actual = actual_pos[stats_start:]
+    valid_desired = desired_pos[stats_start:]
+    valid_vel = actual_vel[stats_start:]
+    
+    if len(valid_actual) == 0:
+        print(f"Error: Start step {stats_start} is larger than data length {len(actual_pos)}")
+        return
+
+    pos_error_sq = np.sum((valid_actual - valid_desired)**2, axis=1)
+    rmse = np.sqrt(np.mean(pos_error_sq))
+    
+    pos_error_xy_sq = np.sum((valid_actual[:, :2] - valid_desired[:, :2])**2, axis=1)
+    rmse_no_z = np.sqrt(np.mean(pos_error_xy_sq))
+    
+    speed = np.linalg.norm(valid_vel, axis=1)
+    max_vel = np.max(speed)
+    
+    print(f"\nMetrics (Step {stats_start} -> End):")
+    print(f"  RMSE:          {rmse:.4f} m")
+    print(f"  RMSE w/o z:    {rmse_no_z:.4f} m")
+    print(f"  Max Velocity:  {max_vel:.4f} m/s")
     
     # Create plots directory
     plots_dir = os.path.join(args.data_dir, 'plots')
@@ -194,15 +211,20 @@ def main():
         print(f"\nSaving plots to: {plots_dir}")
     
     # Generate plots
-    print("\nGenerating paper-style plots...")
+    print(f"\nGenerating paper-style plots (Data Sliced: {stats_start} -> End)...")
+    
+    # Use SLICED data for plotting
+    plot_desired = desired_pos[stats_start:]
+    plot_actual = actual_pos[stats_start:]
+    plot_vel = actual_vel[stats_start:]
     
     # 1. 2D Projections with Velocity Coloring
     save_path_2d = os.path.join(plots_dir, '2d_velocity_trajectory.png') if args.save_plots else None
-    plot_paper_style_2d(desired_pos, actual_pos, actual_vel, save_path_2d)
+    plot_paper_style_2d(plot_desired, plot_actual, plot_vel, save_path_2d)
     
     # 2. 3D Trajectory with Velocity Coloring
     save_path_3d = os.path.join(plots_dir, '3d_velocity_trajectory.png') if args.save_plots else None
-    plot_paper_style_3d(desired_pos, actual_pos, actual_vel, save_path_3d)
+    plot_paper_style_3d(plot_desired, plot_actual, plot_vel, save_path_3d)
     
     print("\nVisualization complete!")
 
