@@ -717,6 +717,26 @@ class QuadcopterEnv(DirectRLEnv):
 
         motor_speeds_obs = self._current_motor_speeds
 
+        # # 用于raptor测试
+        # motor_speeds_obs = motor_speeds_obs * 2.0 - 1.0  # [0,1] → [-1,1]
+        # last_actions = self._last_actions * 2.0 - 1.0  # [0,1] → [-1,1]
+        # obs_teacher = torch.cat([
+        #     pos_error_w,            
+        #     rotation_matrix_flat,  
+        #     vel_error_w,           
+        #     ang_vel_b,              
+        #     last_actions,    
+        #     motor_speeds_obs
+        # ], dim=-1)
+
+        # obs_student = torch.cat([
+        #     pos_error_w,            
+        #     rotation_matrix_flat,  
+        #     vel_error_w,           
+        #     ang_vel_b,              
+        #     last_actions,
+        # ], dim=-1)
+
         obs_teacher = torch.cat([
             pos_error_b,            
             rotation_matrix_flat,  

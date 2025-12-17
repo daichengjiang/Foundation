@@ -54,7 +54,7 @@ def run_training(teacher_id, dynamics, timestamp, gpu_id=0, csv_path="teacher_dy
         f"agent.experiment_name=raptor_teachers",
         f"agent.run_name=teacher_{teacher_id:04d}",
         # 注意：请根据你的实际路径确认 USD 路径
-        'env.robot.spawn.usd_path="/home/nv/Foundation/USD/cf2x.usd"',
+        'env.robot.spawn.usd_path="./USD/cf2x.usd"'
         "env.debug_vis=False"
     ]
     

@@ -114,6 +114,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     teacher_params_list = []
     loaded_teachers_state_dicts = []
+    teacher_offsets_list = []  # [新增] 存储每个教师的稳态误差
     
     csv_path = os.path.join(args_cli.teacher_dir, "teacher_dynamics.csv")
     if not os.path.exists(csv_path):
@@ -139,6 +140,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         }
         teacher_params_list.append(params)
         
+        # [新增] 读取稳态误差
+        x_offset = float(row['x_offset']) if 'x_offset' in row else 0.0
+        y_offset = float(row['y_offset']) if 'y_offset' in row else 0.0
+        z_offset = float(row['z_offset']) if 'z_offset' in row else 0.0
+        teacher_offsets_list.append((x_offset, y_offset, z_offset))
+        
         teacher_run_name = f"teacher_{t_id:04d}"
         folder_path = os.path.join(args_cli.teacher_dir, teacher_run_name)
         
@@ -150,7 +157,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 raise FileNotFoundError(f"No model found for teacher {t_id} in {folder_path}")
             model_path = max(models, key=os.path.getctime)
             
-        print(f"  > [T-{t_id}] Dynamics: Mass={params['mass']:.3f} | Model: {os.path.basename(model_path)}")
+        print(f"  > [T-{t_id}] Dynamics: Mass={params['mass']:.3f} | Offset: ({x_offset:.4f}, {y_offset:.4f}, {z_offset:.4f}) | Model: {os.path.basename(model_path)}")
         
         ckpt = torch.load(model_path, map_location='cpu', weights_only=False)
         loaded_teachers_state_dicts.append(ckpt)
@@ -277,6 +284,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         init_noise_std=agent_cfg.policy.init_noise_std,
         teacher_models=teacher_modules,
         teacher_norm_state_dicts=teacher_norm_dicts,
+        teacher_offsets=teacher_offsets_list,  # [新增] 传递稳态误差给 Policy
     ).to(agent_cfg.device)
     
     resume_path = None
