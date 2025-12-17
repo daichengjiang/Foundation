@@ -141,9 +141,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         teacher_params_list.append(params)
         
         # [新增] 读取稳态误差
-        x_offset = float(row['x_offset']) if 'x_offset' in row else 0.0
-        y_offset = float(row['y_offset']) if 'y_offset' in row else 0.0
-        z_offset = float(row['z_offset']) if 'z_offset' in row else 0.0
+        x_offset = float(row['x_off_mean']) if 'x_off_mean' in row else 0.0
+        y_offset = float(row['y_off_mean']) if 'y_off_mean' in row else 0.0
+        z_offset = float(row['z_off_mean']) if 'z_off_mean' in row else 0.0
         teacher_offsets_list.append((x_offset, y_offset, z_offset))
         
         teacher_run_name = f"teacher_{t_id:04d}"
