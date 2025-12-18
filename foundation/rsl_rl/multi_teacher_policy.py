@@ -8,7 +8,7 @@ class MultiTeacherPolicy(StudentTeacherRecurrentCustom):
     def __init__(self, *args, 
                  teacher_models: list[nn.Module] = None, 
                  teacher_norm_state_dicts: list[dict] = None,
-                 teacher_offsets: list[tuple] = None,  # [新增] 每个教师的稳态误差 (x_offset, y_offset, z_offset)
+                 teacher_offsets: list[tuple] = None,
                  **kwargs):
         
         super().__init__(*args, **kwargs)
@@ -19,36 +19,37 @@ class MultiTeacherPolicy(StudentTeacherRecurrentCustom):
         self.num_teachers = len(teacher_models)
         self.teachers_list = nn.ModuleList(teacher_models)
         
-        # [新增] 存储每个教师的稳态误差，转为 Tensor
+        # [新增] 1. 初始化 Student Normalizer
+        # 注意：这里我们使用 num_student_obs (kwargs中已经由父类处理，但在父类初始化前我们拿不到，所以用 self.num_student_obs)
+        # 父类 StudentTeacherRecurrentCustom 会把 num_student_obs 存为属性吗？如果不存，我们需要从 args 或 kwargs 获取
+        # 根据 RSL-RL 源码，StudentTeacher 基类通常不保存 num_student_obs 为 public 属性，但我们可以从 kwargs 的 'num_student_obs' 或者输入维度推断。
+        # 稳妥起见，我们从 args[0] (num_student_obs) 获取，或者从 kwargs 获取。
+        # StudentTeacherRecurrentCustom.__init__ 签名是 (num_student_obs, ...)
+        
+        # 获取 obs 维度用于 Normalizer
+        if args:
+            student_obs_dim = args[0]
+        else:
+            student_obs_dim = kwargs.get('num_student_obs')
+            
+        self.student_normalizer = EmpiricalNormalization(shape=[student_obs_dim], until=1.0e8)
+        
+        # [新增] 存储每个教师的稳态误差
         if teacher_offsets is None:
             teacher_offsets = [(0.0, 0.0, 0.0)] * self.num_teachers
         
-        # 将稳态误差转为 tensor 并注册为 buffer (不参与梯度计算)
-        offsets_tensor = torch.tensor(teacher_offsets, dtype=torch.float32)  # shape: (num_teachers, 3)
+        offsets_tensor = torch.tensor(teacher_offsets, dtype=torch.float32)
         self.register_buffer('teacher_offsets', offsets_tensor)
-        print(f"  > [MultiPolicy] Registered {self.num_teachers} teacher offsets:")
-        for i, offset in enumerate(teacher_offsets):
-            print(f"    Teacher {i}: offset=({offset[0]:.4f}, {offset[1]:.4f}, {offset[2]:.4f})")
         
-        # 初始化每个 Teacher 对应的 Normalizer
+        print(f"  > [MultiPolicy] Registered {self.num_teachers} teacher offsets.")
+        
+        # ... (Teacher Normalizer 初始化逻辑保持不变) ...
         self.teacher_normalizers = nn.ModuleList()
-        
-        # 获取 Teacher Obs 维度
         norm_dim = kwargs.get('num_teacher_obs')
-        
         for i in range(self.num_teachers):
-            # 创建 Normalizer
             normalizer = EmpiricalNormalization(shape=[norm_dim], until=1.0e8)
-            
-            # 如果提供了参数，加载参数
-            if teacher_norm_state_dicts and i < len(teacher_norm_state_dicts):
-                if teacher_norm_state_dicts[i] is not None:
-                    normalizer.load_state_dict(teacher_norm_state_dicts[i])
-                    print(f"  > [MultiPolicy] Teacher {i} normalizer loaded. Mean[0]={normalizer.mean[0]:.4f}, Std[0]={normalizer.std[0]:.4f}")
-                else:
-                    print(f"  > [MultiPolicy] Teacher {i} has NO normalizer stats. Using Identity behavior.")
-            
-            # 初始冻结
+            if teacher_norm_state_dicts and i < len(teacher_norm_state_dicts) and teacher_norm_state_dicts[i] is not None:
+                normalizer.load_state_dict(teacher_norm_state_dicts[i])
             normalizer.eval()
             self.teacher_normalizers.append(normalizer)
 
@@ -58,86 +59,63 @@ class MultiTeacherPolicy(StudentTeacherRecurrentCustom):
                 param.requires_grad = False
             teacher.eval()
 
-    # ========================================================================
-    # [CRITICAL FIX] 重写 train 方法
-    # PyTorch 的 train() 会递归调用所有子模块的 train()。
-    # 我们必须拦截这个调用，确保 Teacher 和 Normalizer 永远处于 Eval 模式。
-    # ========================================================================
     def train(self, mode=True):
-        # 1. 让父类处理 Student 部分的模式切换 (包括 RNN, MLP 等)
-        # 注意：这里调用 super().train(mode) 会把所有子模块(包括 teachers)先设为 mode
+        # 1. 调用父类 train，这会把 Student 网络 (RNN, MLP) 和 self.student_normalizer 设为 mode
         super().train(mode)
         
-        # 2. 强制将 Teacher 部分改回 Eval 模式
+        # 2. [关键] 确保 Student Normalizer 跟随 mode (训练时更新均值方差，评估时停止)
+        self.student_normalizer.train(mode)
+        
+        # 3. 强制 Teacher 和 Teacher Normalizer 永远处于 Eval
         for teacher in self.teachers_list:
             teacher.eval()
-        
-        # 3. 强制将 Teacher Normalizer 改回 Eval 模式 (严禁更新均值方差)
         for norm in self.teacher_normalizers:
             norm.eval()
             
         return self
 
     def evaluate(self, teacher_observations):
-        """
-        Args:
-            teacher_observations: (Total_Envs, Obs_Dim) -> 此时应该是原始的、未归一化的数据
+        # Teacher 的评估逻辑保持不变 (Raw Obs -> Slice -> Norm -> Net)
+        # 注意：Teacher 的 Normalizer 是独立的，不需要加 offset (或者 offset 已经在环境/wrapper层处理了? 
+        # 根据你的描述，Teacher 是已经训练好的，所以这里我们只负责复现 Teacher 的行为)
+        # 如果 Teacher 训练时输入就是 Raw Obs，那么这里也是 Raw Obs -> Teacher Norm -> Teacher Net
         
-        在对教师进行推理前，需要对观测的前3维（pos_error）进行稳态误差补偿：
-        pos_error_compensated = pos_error + offset
-        """
         total_envs = teacher_observations.shape[0]
         envs_per_teacher = total_envs // self.num_teachers
-        
         outputs = []
         
         for i in range(self.num_teachers):
-            # 1. 切片
             start_idx = i * envs_per_teacher
-            # 处理最后一个 Teacher 可能承担剩余所有环境的情况
             end_idx = start_idx + envs_per_teacher if i < self.num_teachers - 1 else total_envs
             
-            # 2. 取出原始观测
-            obs_slice = teacher_observations[start_idx:end_idx].clone()  # 复制一份避免修改原数据
+            obs_slice = teacher_observations[start_idx:end_idx] # .clone() not strictly needed for read-only
             
-            # 3. [新增] 对前3维（pos_error）进行稳态误差补偿
-            # obs_slice[:, 0:3] 是 pos_error，加上该教师的稳态误差
-            # obs_slice[:, 0:3] += self.teacher_offsets[i]
-            
-            # 4. 使用该 Teacher 对应的 Normalizer 进行归一化
             with torch.no_grad():
-                # 双重保险：确保使用时是 eval 模式
+                # 确保 Teacher 组件处于 eval
                 self.teacher_normalizers[i].eval()
                 self.teachers_list[i].eval()
                 
+                # Teacher 直接归一化原始观测 (假设 Teacher 训练时没有 offset trick，或者 offset 隐含在 dynamics 中)
                 normalized_obs = self.teacher_normalizers[i](obs_slice)
-                
-                # 5. 推理 
                 action_slice = self.teachers_list[i].act_inference(normalized_obs)
                 
             outputs.append(action_slice)
             
-        final_actions = torch.cat(outputs, dim=0)
-        
-        # Teacher 的 act_inference 输出已经通过 Tanh，范围在 [-1, 1]
-        return final_actions
+        return torch.cat(outputs, dim=0)
 
-    # 兼容性方法，不再需要手动调用，留空即可
-    def train_mode(self):
-        self.train(True)
-            
-    def eval_mode(self):
-        self.train(False)
-
-    # 如果需要对学生观测应用offset补偿，可以重写此方法
-    # 另外还需要：❌ 删除这行：obs_slice[:, 0:3] += self.teacher_offsets[i]
     def _forward_head(self, observations):
-        """重写父类方法，在学生推理前对观测应用 offset 补偿"""
+        """
+        重写父类方法:
+        1. 接收 Raw Observations (因为 Runner 的 Normalizer 被我们架空了)
+        2. 加上稳态误差 Offset
+        3. 通过内部的 Student Normalizer 进行归一化
+        4. 传给父类处理 (RNN -> MLP)
+        """
         
-        # 1. 克隆观测，避免修改原始数据
+        # 1. 克隆观测，避免修改原始数据 (Runner 可能还需要用原始数据做其他 log)
         obs_compensated = observations.clone()
         
-        # 2. 根据环境索引应用对应教师的 offset
+        # 2. 根据环境索引应用对应教师的 Offset
         batch_size = observations.shape[0]
         envs_per_teacher = batch_size // self.num_teachers
         
@@ -145,8 +123,54 @@ class MultiTeacherPolicy(StudentTeacherRecurrentCustom):
             start_idx = i * envs_per_teacher
             end_idx = start_idx + envs_per_teacher if i < self.num_teachers - 1 else batch_size
             
-            # 对 pos_error (前3维) 加上该教师的稳态误差
-            obs_compensated[start_idx:end_idx, 0:3] -= self.teacher_offsets[i]
+            # [修改] 按照你的要求：在 obs 加上 offset
+            # 假设 offset 补偿的是前 3 维 (Pos Error)
+            obs_compensated[start_idx:end_idx, 0:3] += self.teacher_offsets[i]
         
-        # 3. 调用父类的真正推理逻辑
-        return super()._forward_head(obs_compensated)
+        # 3. [新增] 内部归一化
+        # 这个 normalizer 会根据 self.training 状态决定是更新均值方差还是仅使用
+        obs_normalized = self.student_normalizer(obs_compensated)
+        
+        # 4. 调用父类的真正推理逻辑 (传入归一化后的数据)
+        return super()._forward_head(obs_normalized)
+    
+    def act_batch(self, observations, hidden_states):
+        """
+        重写父类 act_batch，确保在进入 RNN 训练前：
+        1. 加上 Offset (对 Raw Obs)
+        2. 进行归一化 (使用 student_normalizer)
+        """
+        # observations shape: [Seq_Len, Batch, Dim]
+        T, B, D = observations.shape
+        
+        # 1. Clone，避免修改 Storage 中的原始数据
+        obs_processed = observations.clone()
+        
+        # 2. Apply Offsets (需要处理 T 维度)
+        envs_per_teacher = B // self.num_teachers
+        
+        # 对前3维 (pos_error) 加 Offset
+        # 这里的切片需要同时覆盖 T 和 B 维度
+        for i in range(self.num_teachers):
+            start_idx = i * envs_per_teacher
+            end_idx = start_idx + envs_per_teacher if i < self.num_teachers - 1 else B
+            
+            # [T, Envs_Slice, 3] += [3] (Broadcast)
+            obs_processed[:, start_idx:end_idx, 0:3] += self.teacher_offsets[i]
+
+        # 3. Apply Normalization
+        # EmpiricalNormalization 通常处理 (N, D) 的输入
+        # 我们先 flatten 成 (T*B, D)
+        obs_reshaped = obs_processed.view(-1, D)
+        
+        # 使用内部的 student_normalizer 进行归一化
+        # 注意：在 update 阶段，self.student_normalizer 处于 train() 模式 (由 self.train() 设定)
+        # 这意味着它会继续更新均值方差。这是符合 RSL-RL 原设计的 (On-policy数据更新Norm)。
+        obs_norm = self.student_normalizer(obs_reshaped)
+        
+        # 还原形状 [T, B, D] 以传给 RNN
+        obs_input = obs_norm.view(T, B, D)
+        
+        # 4. 调用父类的 act_batch 继续后续网络计算 (MLP -> RNN -> MLP)
+        # 注意：父类 act_batch 会再次 view 数据，但这没关系
+        return super().act_batch(obs_input, hidden_states)

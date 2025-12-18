@@ -304,7 +304,7 @@ class QuadcopterEnv(DirectRLEnv):
             mass=self.mass_tensor,        # Pass self.var
             arm_length=self.arm_l_tensor, # Pass self.var
             inertia=self.inertia_tensor,  # Pass self.var
-            thrust_to_weight=self.twr_tensor  # Pass self.var
+            thrust_to_weight=self.twr_tensor,  # Pass self.var
             moment_scale=self.kappa_tensor
         )
 

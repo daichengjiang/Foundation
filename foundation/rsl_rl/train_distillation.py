@@ -76,6 +76,39 @@ torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.benchmark = False
 
 
+class ProxyNormalizer(nn.Module):
+    """
+    代理 Normalizer。
+    在 forward 时表现为 Identity (不做处理)，
+    但在 state_dict/load_state_dict 时指向真正的 Policy 内部 Normalizer。
+    这样可以欺骗 Runner 保存 Policy 内部的 Normalizer 参数。
+    """
+    def __init__(self, real_normalizer):
+        super().__init__()
+        self.real_normalizer = real_normalizer
+    
+    def forward(self, x):
+        # 直接返回原始数据，不进行归一化
+        # 归一化逻辑已移至 Policy 内部
+        return x
+    
+    def state_dict(self, destination=None, prefix='', keep_vars=False):
+        return self.real_normalizer.state_dict(destination, prefix, keep_vars)
+    
+    def load_state_dict(self, state_dict, strict=True):
+        return self.real_normalizer.load_state_dict(state_dict, strict)
+    
+    def train(self, mode=True):
+        # 这里的 mode 切换虽然会被 Runner 调用，
+        # 但真正的 Normalizer mode 切换由 Policy.train() 统一管理更为稳妥。
+        # 不过为了兼容性，也可以透传。
+        self.real_normalizer.train(mode)
+        return self
+        
+    def eval(self):
+        self.real_normalizer.eval()
+        return self
+
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg):
     """Train with RSL-RL agent."""
@@ -288,6 +321,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         print("[INFO] Disabling global privileged_obs_normalizer in Runner.")
         print("       (Normalization is now handled internally by MultiTeacherPolicy per teacher)")
         runner.privileged_obs_normalizer = torch.nn.Identity().to(agent_cfg.device)
+        runner.obs_normalizer = ProxyNormalizer(multi_policy.student_normalizer).to(agent_cfg.device)
     # ==================================================================================
 
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
