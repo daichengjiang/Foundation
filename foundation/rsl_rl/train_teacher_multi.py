@@ -18,7 +18,7 @@ def sample_raptor_dynamics():
     m_cf = 0.032 
     l_cf = 0.04384 
     base_ratio = l_cf / (m_cf**(1/3)) 
-    u = np.random.normal(0.0, 0.1) 
+    u = np.random.normal(-0.1, 0.1) 
     u = np.clip(u, -0.3, 0.3) 
     if u < 0: s_ms = 1.0 / (1.0 - u)
     else: s_ms = 1.0 + u
@@ -32,10 +32,21 @@ def sample_raptor_dynamics():
     Iyy = Ixx 
     Izz = Ixx * 1.832 
     
-    motor_tau = np.random.uniform(0.02, 0.12)
+    # motor_tau = np.random.uniform(0.02, 0.12) <-- 删除这行
+    motor_tau_up = np.random.uniform(0.03, 0.1)
+    motor_tau_down = np.random.uniform(0.03, 0.3)
+
+    kappa = np.random.uniform(0.005, 0.05)
+
     return {
-        "mass": mass, "arm_length": arm_length, "inertia": (Ixx, Iyy, Izz),
-        "thrust_to_weight": twr, "motor_tau": motor_tau
+        "mass": mass, 
+        "arm_length": arm_length, 
+        "inertia": (Ixx, Iyy, Izz),
+        "thrust_to_weight": twr, 
+        # 修改返回字典
+        "motor_tau_up": motor_tau_up,
+        "motor_tau_down": motor_tau_down,
+        "kappa": kappa
     }
 
 def run_training(teacher_id, dynamics, timestamp, gpu_id=0, csv_path="teacher_dynamics.csv", headless=False, reward_threshold=11000.0):
@@ -49,12 +60,15 @@ def run_training(teacher_id, dynamics, timestamp, gpu_id=0, csv_path="teacher_dy
         f"env.dynamics.arm_length={dynamics['arm_length']:.8f}",
         f"env.dynamics.inertia={inertia_str}",
         f"env.dynamics.thrust_to_weight={dynamics['thrust_to_weight']:.5f}",
-        f"env.dynamics.motor_tau={dynamics['motor_tau']:.5f}",
+        # f"env.dynamics.motor_tau={dynamics['motor_tau']:.5f}",
+        f"env.dynamics.motor_tau_up={dynamics['motor_tau_up']:.5f}",
+        f"env.dynamics.motor_tau_down={dynamics['motor_tau_down']:.5f}",
+        f"env.dynamics.moment_scale={dynamics['kappa']:.5f}",
         
         f"agent.experiment_name=raptor_teachers",
         f"agent.run_name=teacher_{teacher_id:04d}",
         # 注意：请根据你的实际路径确认 USD 路径
-        'env.robot.spawn.usd_path="./USD/cf2x.usd"'
+        'env.robot.spawn.usd_path="./USD/cf2x.usd"',
         "env.debug_vis=False"
     ]
     
@@ -70,7 +84,7 @@ def run_training(teacher_id, dynamics, timestamp, gpu_id=0, csv_path="teacher_dy
         sys.executable, train_script,
         "--task", "teacher",
         "--num_envs", "4000",
-        "--max_iterations", "700",
+        "--max_iterations", "800",
         "--device", f"cuda:{gpu_id}",
         "--logger", "wandb",
         "--log_project_name", "Foundation",
@@ -93,7 +107,8 @@ def run_training(teacher_id, dynamics, timestamp, gpu_id=0, csv_path="teacher_dy
     print(f"Starting Teacher {teacher_id} | GPU {gpu_id} | Headless: {headless}")
     print(f"Dir: .../{timestamp}/teacher_{teacher_id:04d}")
     print(f"Mass: {dynamics['mass']:.4f} kg | Arm: {dynamics['arm_length']:.4f} m") 
-    print(f"TWR : {dynamics['thrust_to_weight']:.2f}    | Tau: {dynamics['motor_tau']:.3f} s")
+    print(f"TWR : {dynamics['thrust_to_weight']:.2f}    | Kappa: {dynamics['kappa']:.4f}")
+    print(f"Tau Up: {dynamics['motor_tau_up']:.3f} s | Tau Down: {dynamics['motor_tau_down']:.3f} s")
     print(f"Target Reward: > {reward_threshold}")
     print(f"==================================================")
     
@@ -154,11 +169,14 @@ def save_params_to_csv(file_path, teacher_id, dynamics):
     
     with open(file_path, "a") as f:
         if not file_exists:
-            f.write("id,mass,arm_length,Ixx,Iyy,Izz,twr,motor_tau\n")
+            # 更新 CSV 表头
+            f.write("id,mass,arm_length,Ixx,Iyy,Izz,twr,motor_tau_up,motor_tau_down,kappa\n")
         
+        # 写入对应的新 key 值
         f.write(f"{teacher_id},{dynamics['mass']},{dynamics['arm_length']},"
                 f"{dynamics['inertia'][0]},{dynamics['inertia'][1]},{dynamics['inertia'][2]},"
-                f"{dynamics['thrust_to_weight']},{dynamics['motor_tau']}\n")
+                f"{dynamics['thrust_to_weight']},"
+                f"{dynamics['motor_tau_up']},{dynamics['motor_tau_down']},{dynamics['kappa']}\n")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -204,7 +222,7 @@ if __name__ == "__main__":
             gpu_id=args.gpu_id,
             csv_path=csv_path,
             headless=args.headless,
-            reward_threshold=10000.0 # 设置阈值
+            reward_threshold=11000.0 # 设置阈值
         )
         
         if is_success:

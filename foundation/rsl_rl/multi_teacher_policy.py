@@ -102,7 +102,7 @@ class MultiTeacherPolicy(StudentTeacherRecurrentCustom):
             
             # 3. [新增] 对前3维（pos_error）进行稳态误差补偿
             # obs_slice[:, 0:3] 是 pos_error，加上该教师的稳态误差
-            obs_slice[:, 0:3] += self.teacher_offsets[i]
+            # obs_slice[:, 0:3] += self.teacher_offsets[i]
             
             # 4. 使用该 Teacher 对应的 Normalizer 进行归一化
             with torch.no_grad():
@@ -129,24 +129,24 @@ class MultiTeacherPolicy(StudentTeacherRecurrentCustom):
     def eval_mode(self):
         self.train(False)
 
-    # # 如果需要对学生观测应用offset补偿，可以重写此方法
-    # # 另外还需要：❌ 删除这行：obs_slice[:, 0:3] += self.teacher_offsets[i]
-    # def _forward_head(self, observations):
-    #     """重写父类方法，在学生推理前对观测应用 offset 补偿"""
+    # 如果需要对学生观测应用offset补偿，可以重写此方法
+    # 另外还需要：❌ 删除这行：obs_slice[:, 0:3] += self.teacher_offsets[i]
+    def _forward_head(self, observations):
+        """重写父类方法，在学生推理前对观测应用 offset 补偿"""
         
-    #     # 1. 克隆观测，避免修改原始数据
-    #     obs_compensated = observations.clone()
+        # 1. 克隆观测，避免修改原始数据
+        obs_compensated = observations.clone()
         
-    #     # 2. 根据环境索引应用对应教师的 offset
-    #     batch_size = observations.shape[0]
-    #     envs_per_teacher = batch_size // self.num_teachers
+        # 2. 根据环境索引应用对应教师的 offset
+        batch_size = observations.shape[0]
+        envs_per_teacher = batch_size // self.num_teachers
         
-    #     for i in range(self.num_teachers):
-    #         start_idx = i * envs_per_teacher
-    #         end_idx = start_idx + envs_per_teacher if i < self.num_teachers - 1 else batch_size
+        for i in range(self.num_teachers):
+            start_idx = i * envs_per_teacher
+            end_idx = start_idx + envs_per_teacher if i < self.num_teachers - 1 else batch_size
             
-    #         # 对 pos_error (前3维) 加上该教师的稳态误差
-    #         obs_compensated[start_idx:end_idx, 0:3] += self.teacher_offsets[i]
+            # 对 pos_error (前3维) 加上该教师的稳态误差
+            obs_compensated[start_idx:end_idx, 0:3] -= self.teacher_offsets[i]
         
-    #     # 3. 调用父类的真正推理逻辑
-    #     return super()._forward_head(obs_compensated)
+        # 3. 调用父类的真正推理逻辑
+        return super()._forward_head(obs_compensated)

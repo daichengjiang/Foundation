@@ -59,15 +59,18 @@ SPHERE_MARKER_CFG = VisualizationMarkersCfg(
 
 @configclass
 class QuadcopterDynamicsCfg:
-    # 默认值 (Crazyflie 2.1) - 仅在没有 multi_teacher_params 时使用
     mass: float = 0.0282
     arm_length: float = 0.04384
     inertia: tuple[float, float, float] = (2.44864e-5, 2.44864e-5, 3.61504e-5)
     thrust_to_weight: float = 2.25 
-    motor_tau: float = 0.05 
+    
+    # [修改] 替换单一的 motor_tau
+    motor_tau_up: float = 0.05
+    motor_tau_down: float = 0.10 # 默认值设大一点体现差异
+    
+    # [新增] 力矩系数
+    moment_scale: float = 0.016 
 
-    # [关键新增] 多教师异构参数列表
-    # 由 play_teacher_multi.py 注入，格式: [{'mass':..., 'inertia':...}, ...]
     multi_teacher_params: list[dict] | None = None
 
 # [0, 2pi] -> [-pi, pi]
@@ -177,7 +180,10 @@ class QuadcopterEnv(DirectRLEnv):
         self.arm_l_tensor = torch.zeros(self.num_envs, device=self.device)
         self.twr_tensor = torch.zeros(self.num_envs, device=self.device)
         self.inertia_tensor = torch.zeros(self.num_envs, 3, device=self.device)
-        self.motor_tau = torch.zeros(self.num_envs, 1, device=self.device)
+        # self.motor_tau = torch.zeros(self.num_envs, 1, device=self.device)
+        self.motor_tau_up_tensor = torch.zeros(self.num_envs, 1, device=self.device)
+        self.motor_tau_down_tensor = torch.zeros(self.num_envs, 1, device=self.device)
+        self.kappa_tensor = torch.zeros(self.num_envs, device=self.device)
 
         if self.cfg.dynamics.multi_teacher_params is not None:
             # 这里的 params 列表应该在 play_teacher_multi.py 中注入到 env_cfg
@@ -221,7 +227,11 @@ class QuadcopterEnv(DirectRLEnv):
             self.arm_l_tensor.fill_(self.cfg.dynamics.arm_length)
             self.inertia_tensor[:] = torch.tensor(self.cfg.dynamics.inertia, device=self.device)
             self.twr_tensor.fill_(self.cfg.dynamics.thrust_to_weight)
-            self.motor_tau.fill_(self.cfg.dynamics.motor_tau)
+            # self.motor_tau.fill_(self.cfg.dynamics.motor_tau)
+            # [修改] 填充新参数
+            self.motor_tau_up_tensor.fill_(self.cfg.dynamics.motor_tau_up)
+            self.motor_tau_down_tensor.fill_(self.cfg.dynamics.motor_tau_down)
+            self.kappa_tensor.fill_(self.cfg.dynamics.moment_scale)
         
         # Store for reference
         self._robot_mass = self.mass_tensor 
@@ -233,14 +243,23 @@ class QuadcopterEnv(DirectRLEnv):
             mass=self.mass_tensor,
             arm_length=self.arm_l_tensor,
             inertia=self.inertia_tensor,
-            thrust_to_weight=self.twr_tensor
+            thrust_to_weight=self.twr_tensor,
+            moment_scale=self.kappa_tensor # <--- 传入
         )
         # =================================================================
 
         self.dt = self.cfg.sim.dt
-        if self.motor_tau.shape != (self.num_envs, 1):
-             self.motor_tau = self.motor_tau.view(self.num_envs, 1)
-        self.motor_alpha = self.dt / (self.dt + self.motor_tau)
+        # if self.motor_tau.shape != (self.num_envs, 1):
+        #      self.motor_tau = self.motor_tau.view(self.num_envs, 1)
+        # self.motor_alpha = self.dt / (self.dt + self.motor_tau)
+        if self.motor_tau_up_tensor.shape != (self.num_envs, 1):
+             self.motor_tau_up_tensor = self.motor_tau_up_tensor.view(self.num_envs, 1)
+        if self.motor_tau_down_tensor.shape != (self.num_envs, 1):
+             self.motor_tau_down_tensor = self.motor_tau_down_tensor.view(self.num_envs, 1)
+             
+        self.motor_alpha_up = self.dt / (self.dt + self.motor_tau_up_tensor)
+        self.motor_alpha_down = self.dt / (self.dt + self.motor_tau_down_tensor)
+
         self._current_motor_speeds = torch.zeros(self.num_envs, 4, device=self.device)
 
         # 状态标志位
@@ -503,15 +522,21 @@ class QuadcopterEnv(DirectRLEnv):
         action_norm = (raw_clamped + 1.0) * 0.5
         self._actions = action_norm.clone()
 
-        if self.motor_tau.shape != (self.num_envs, 1):
-            self.motor_tau = self.motor_tau.view(self.num_envs, 1)
-        self.motor_alpha = self.dt / (self.dt + self.motor_tau)
-
-        self._current_motor_speeds = (self.motor_alpha * action_norm + 
-                                      (1.0 - self.motor_alpha) * self._current_motor_speeds)      
-
-        force_b, torque_b, _ = self._controller.motor_speeds_to_wrench(self._current_motor_speeds)
+        # 判断是加速还是减速
+        # 如果 target > current, 使用 alpha_up
+        # 如果 target < current, 使用 alpha_down
+        target = action_norm
+        current = self._current_motor_speeds
         
+        # 构造混合 alpha
+        # 这里使用了 torch.where: condition ? alpha_up : alpha_down
+        alpha = torch.where(target > current, self.motor_alpha_up, self.motor_alpha_down)
+        
+        # 一阶低通滤波
+        self._current_motor_speeds = alpha * target + (1.0 - alpha) * current
+
+        # 计算力与力矩
+        force_b, torque_b, _ = self._controller.motor_speeds_to_wrench(self._current_motor_speeds)    
         self._forces.zero_()
         self._torques.zero_()
         self._forces[:, 0, :] = force_b
