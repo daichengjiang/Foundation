@@ -71,12 +71,11 @@ class QuadcopterDynamicsCfg:
     arm_length: float = 0.04384
     # Inertia: Ixx, Iyy, Izz
     inertia: tuple[float, float, float] = (2.44864e-5, 2.44864e-5, 3.61504e-5)
-    
-    # 推力系数相关
     thrust_to_weight: float = 2.25 
-
-    # 电机参数
-    motor_tau: float = 0.05 
+    motor_tau_up: float = 0.05
+    motor_tau_down: float = 0.10 # 默认值设大一点体现差异
+    # [新增] 力矩系数
+    moment_scale: float = 0.016  
 
     # [新增] 用于多教师蒸馏的参数列表 (List of dicts)
     # 格式: [{'mass': 0.03, 'arm_length': 0.04, 'inertia': (x,y,z), 'twr': 2.0, 'motor_tau': 0.05}, {...}]
@@ -226,7 +225,10 @@ class QuadcopterEnv(DirectRLEnv):
         self.arm_l_tensor = torch.zeros(self.num_envs, device=self.device)
         self.twr_tensor = torch.zeros(self.num_envs, device=self.device)
         self.inertia_tensor = torch.zeros(self.num_envs, 3, device=self.device)
-        self.motor_tau = torch.zeros(self.num_envs, 1, device=self.device)
+        # self.motor_tau = torch.zeros(self.num_envs, 1, device=self.device)
+        self.motor_tau_up_tensor = torch.zeros(self.num_envs, 1, device=self.device)
+        self.motor_tau_down_tensor = torch.zeros(self.num_envs, 1, device=self.device)
+        self.kappa_tensor = torch.zeros(self.num_envs, device=self.device)
 
         if self.cfg.dynamics.multi_teacher_params is not None:
             teacher_params_list = self.cfg.dynamics.multi_teacher_params
@@ -260,8 +262,11 @@ class QuadcopterEnv(DirectRLEnv):
                 self.inertia_tensor[indices, 1] = iyy
                 self.inertia_tensor[indices, 2] = izz
                 
-                self.motor_tau[indices] = params['motor_tau']
-                
+                # self.motor_tau[indices] = params['motor_tau']
+                self.motor_tau_up_tensor[indices] = params['motor_tau_up']
+                self.motor_tau_down_tensor[indices] = params['motor_tau_down']
+                self.kappa_tensor[indices] = params['kappa']
+
                 count = end_idx - start_idx
                 print(f"  > Teacher {t_id} (ID: {params.get('id', 'N/A')}): Envs {start_idx}-{end_idx-1} (Count: {count})")
 
@@ -281,19 +286,14 @@ class QuadcopterEnv(DirectRLEnv):
             self.arm_l_tensor.fill_(self.cfg.dynamics.arm_length)
             self.inertia_tensor[:] = torch.tensor(self.cfg.dynamics.inertia, device=self.device)
             self.twr_tensor.fill_(self.cfg.dynamics.thrust_to_weight)
-            self.motor_tau.fill_(self.cfg.dynamics.motor_tau)
+            # self.motor_tau.fill_(self.cfg.dynamics.motor_tau)
+            # [修改] 填充新参数
+            self.motor_tau_up_tensor.fill_(self.cfg.dynamics.motor_tau_up)
+            self.motor_tau_down_tensor.fill_(self.cfg.dynamics.motor_tau_down)
+            self.kappa_tensor.fill_(self.cfg.dynamics.moment_scale)
 
         # =================================================================
 
-        self.dt = self.cfg.sim.dt
-        
-        # 确保 motor_tau 是 (N, 1)
-        if self.motor_tau.shape != (self.num_envs, 1):
-             self.motor_tau = self.motor_tau.view(self.num_envs, 1)
-
-        self.motor_alpha = self.dt / (self.dt + self.motor_tau)
-        self._current_motor_speeds = torch.zeros(self.num_envs, 4, device=self.device)
-        
         # Store the robot mass for reference (e.g. wind force calculation if added later)
         self._robot_mass = self.mass_tensor 
 
@@ -305,8 +305,26 @@ class QuadcopterEnv(DirectRLEnv):
             arm_length=self.arm_l_tensor, # Pass self.var
             inertia=self.inertia_tensor,  # Pass self.var
             thrust_to_weight=self.twr_tensor  # Pass self.var
+            moment_scale=self.kappa_tensor
         )
 
+        self.dt = self.cfg.sim.dt
+
+        # if self.motor_tau.shape != (self.num_envs, 1):
+        #      self.motor_tau = self.motor_tau.view(self.num_envs, 1)
+
+        # self.motor_alpha = self.dt / (self.dt + self.motor_tau)
+        if self.motor_tau_up_tensor.shape != (self.num_envs, 1):
+             self.motor_tau_up_tensor = self.motor_tau_up_tensor.view(self.num_envs, 1)
+        if self.motor_tau_down_tensor.shape != (self.num_envs, 1):
+             self.motor_tau_down_tensor = self.motor_tau_down_tensor.view(self.num_envs, 1)
+             
+        self.motor_alpha_up = self.dt / (self.dt + self.motor_tau_up_tensor)
+        self.motor_alpha_down = self.dt / (self.dt + self.motor_tau_down_tensor)
+
+
+        self._current_motor_speeds = torch.zeros(self.num_envs, 4, device=self.device)
+        
         self._is_langevin_task = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
         # === 死亡原因标志位 ===
@@ -665,19 +683,21 @@ class QuadcopterEnv(DirectRLEnv):
         
         self._actions = action_setpoint_normalized.clone()
 
-        # 3. 电机低通滤波
-        # 确保 motor_alpha 根据当前的 motor_tau 动态计算
-        if self.motor_tau.shape != (self.num_envs, 1):
-            self.motor_tau = self.motor_tau.view(self.num_envs, 1)
+        # 判断是加速还是减速
+        # 如果 target > current, 使用 alpha_up
+        # 如果 target < current, 使用 alpha_down
+        target = action_setpoint_normalized
+        current = self._current_motor_speeds
+        
+        # 构造混合 alpha
+        # 这里使用了 torch.where: condition ? alpha_up : alpha_down
+        alpha = torch.where(target > current, self.motor_alpha_up, self.motor_alpha_down)
+        
+        # 一阶低通滤波
+        self._current_motor_speeds = alpha * target + (1.0 - alpha) * current
 
-        self.motor_alpha = self.dt / (self.dt + self.motor_tau)
-
-        # 更新当前电机转速
-        self._current_motor_speeds = (self.motor_alpha * action_setpoint_normalized + 
-                                      (1.0 - self.motor_alpha) * self._current_motor_speeds)      
-
-        # 4. 计算力
-        force_b, torque_b, px4info = self._controller.motor_speeds_to_wrench(self._current_motor_speeds)
+        # 计算力与力矩
+        force_b, torque_b, _ = self._controller.motor_speeds_to_wrench(self._current_motor_speeds) 
 
         # 5. 施加力
         self._forces.zero_()

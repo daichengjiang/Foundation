@@ -136,7 +136,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             "arm_length": float(row['arm_length']),
             "inertia": (float(row['Ixx']), float(row['Iyy']), float(row['Izz'])),
             "twr": float(row['twr']) if 'twr' in row else float(row['thrust_to_weight']),
-            "motor_tau": float(row['motor_tau'])
+            "motor_tau_up": float(row['motor_tau_up']) if 'motor_tau_up' in row else 0.05,
+            "motor_tau_down": float(row['motor_tau_down']) if 'motor_tau_down' in row else 0.07,
+            "kappa": float(row['kappa']) if 'kappa' in row else 0.016,
         }
         teacher_params_list.append(params)
         
@@ -203,26 +205,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         env = gym.wrappers.RecordVideo(env, **video_kwargs)
 
     env = RslRlVecEnvWrapper(env)
-
-    # quad_env = env.unwrapped  # 就是 QuadcopterEnv
-
-    # print("\n========== [PER-ENV Dynamics Parameters] ==========")
-
-    # attrs = [
-    #     "mass_tensor", "arm_l_tensor", "inertia_tensor",
-    #     "twr_tensor", "motor_tau"
-    # ]
-
-    # for attr in attrs:
-    #     if hasattr(quad_env, attr):
-    #         tensor = getattr(quad_env, attr)
-    #         print(f"{attr}: shape={tensor.shape}")
-    #         print(tensor)
-    #     else:
-    #         print(f"{attr}: [NOT FOUND]")
-
-    # print("===================================================\n")
-
 
     runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
     runner.add_git_repo_to_log(__file__)

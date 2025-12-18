@@ -215,7 +215,10 @@ class QuadcopterEnv(DirectRLEnv):
                     self.inertia_tensor[indices, 1] = inertia_val[1]
                     self.inertia_tensor[indices, 2] = inertia_val[2]
                 
-                self.motor_tau[indices] = params['motor_tau']
+                # self.motor_tau[indices] = params['motor_tau']
+                self.motor_tau_up_tensor[indices] = params['motor_tau_up']
+                self.motor_tau_down_tensor[indices] = params['motor_tau_down']
+                self.kappa_tensor[indices] = params['kappa']
                 
                 # Debug print for first teacher
                 if t_id == 0:
