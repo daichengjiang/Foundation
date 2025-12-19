@@ -125,7 +125,9 @@ def parse_teacher_config(teacher_dir, teacher_ids_str):
             "arm_length": float(row['arm_length']),
             "inertia": (float(row['Ixx']), float(row['Iyy']), float(row['Izz'])),
             "twr": float(row['twr']) if 'twr' in row else float(row['thrust_to_weight']),
-            "motor_tau": float(row['motor_tau'])
+            "motor_tau_up": float(row['motor_tau_up']) if 'motor_tau_up' in row else 0.05,
+            "motor_tau_down": float(row['motor_tau_down']) if 'motor_tau_down' in row else 0.07,
+            "kappa": float(row['kappa']) if 'kappa' in row else 0.016,
         }
         
         teacher_run_name = f"teacher_{t_id:04d}"

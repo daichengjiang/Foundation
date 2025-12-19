@@ -19,11 +19,9 @@ def sample_raptor_dynamics():
     l_cf = 0.04384 
     base_ratio = l_cf / (m_cf**(1/3)) 
     u = np.random.normal(-0.1, 0.1) 
-    u = np.clip(u, -0.3, 0.3) 
     if u < 0: s_ms = 1.0 / (1.0 - u)
     else: s_ms = 1.0 + u
-    size_variation = s_ms 
-    arm_length = base_ratio * (mass**(1/3)) * size_variation
+    arm_length = base_ratio * (mass**(1/3)) / s_ms
     
     r_t2i = np.random.uniform(40, 1200)
     total_thrust = twr * 9.81 * mass

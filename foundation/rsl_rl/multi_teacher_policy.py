@@ -125,7 +125,7 @@ class MultiTeacherPolicy(StudentTeacherRecurrentCustom):
             
             # [修改] 按照你的要求：在 obs 加上 offset
             # 假设 offset 补偿的是前 3 维 (Pos Error)
-            obs_compensated[start_idx:end_idx, 0:3] += self.teacher_offsets[i]
+            obs_compensated[start_idx:end_idx, 0:3] -= self.teacher_offsets[i]
         
         # 3. [新增] 内部归一化
         # 这个 normalizer 会根据 self.training 状态决定是更新均值方差还是仅使用
@@ -156,7 +156,7 @@ class MultiTeacherPolicy(StudentTeacherRecurrentCustom):
             end_idx = start_idx + envs_per_teacher if i < self.num_teachers - 1 else B
             
             # [T, Envs_Slice, 3] += [3] (Broadcast)
-            obs_processed[:, start_idx:end_idx, 0:3] += self.teacher_offsets[i]
+            obs_processed[:, start_idx:end_idx, 0:3] -= self.teacher_offsets[i]
 
         # 3. Apply Normalization
         # EmpiricalNormalization 通常处理 (N, D) 的输入
