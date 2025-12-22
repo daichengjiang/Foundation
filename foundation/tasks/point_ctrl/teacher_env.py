@@ -648,6 +648,9 @@ class QuadcopterEnv(DirectRLEnv):
             # Clear logs
             if "log" not in self.extras: self.extras["log"] = dict()
             for k in self._episode_sums.keys():
+                values = self._episode_sums[k][env_ids]
+                mean_val = torch.mean(values).item()
+                self.extras["log"][f"Episode_Reward/{k}"] = mean_val
                 self._episode_sums[k][env_ids] = 0.0
 
         # Update Metrics
