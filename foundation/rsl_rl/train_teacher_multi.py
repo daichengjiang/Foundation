@@ -82,7 +82,7 @@ def run_training(teacher_id, dynamics, timestamp, gpu_id=0, csv_path="teacher_dy
         sys.executable, train_script,
         "--task", "teacher",
         "--num_envs", "8000",
-        "--max_iterations", "800",
+        "--max_iterations", "1000",
         "--device", f"cuda:{gpu_id}",
         "--logger", "wandb",
         "--log_project_name", "Foundation",
