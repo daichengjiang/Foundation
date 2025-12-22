@@ -78,12 +78,14 @@ def run_training(teacher_id, dynamics, timestamp, gpu_id=0, csv_path="teacher_dy
             print(f"Error: Could not find {train_script}")
             return False
 
+    target_device = "cuda:0"
+
     cmd = [
         sys.executable, train_script,
         "--task", "teacher",
         "--num_envs", "8000",
         "--max_iterations", "1000",
-        "--device", f"cuda:{gpu_id}",
+        "--device", target_device,
         "--logger", "wandb",
         "--log_project_name", "Foundation",
         "--log_timestamp", timestamp 
@@ -99,6 +101,7 @@ def run_training(teacher_id, dynamics, timestamp, gpu_id=0, csv_path="teacher_dy
 
     # [新增] 设置环境变量传给子进程
     env_vars = os.environ.copy()
+    env_vars["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
     env_vars["TEACHER_MAX_REWARD_PATH"] = result_file
 
     print(f"==================================================")
