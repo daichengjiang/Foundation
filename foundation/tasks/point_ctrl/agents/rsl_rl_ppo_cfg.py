@@ -13,7 +13,7 @@ from isaaclab.utils import configclass
 
 @configclass
 class QuadcopterPPORunnerCfg(RslRlOnPolicyRunnerCfg):
-    num_steps_per_env = 128
+    num_steps_per_env = 256
     max_iterations = 5000
     save_interval = 25
     experiment_name = "point_ctrl_direct"
@@ -31,7 +31,7 @@ class QuadcopterPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         clip_param=0.2,
         entropy_coef=0.0002, #0.0002
         num_learning_epochs=1,  #4
-        num_mini_batches=32,   #4
+        num_mini_batches=64,   #4
         learning_rate=1.0e-4,
         schedule="fixed",  #"adaptive"
         gamma=0.99,
