@@ -109,9 +109,11 @@ class QuadcopterSceneCfg(InteractiveSceneCfg):
 
 @configclass
 class QuadcopterEnvCfg(DirectRLEnvCfg):
-    # Observation space
-    frame_observation_space = 3 + 9 + 3 + 3 + 4 + 4  # 26
+    # 15(pos_hist) + 9(rot) + 15(vel_hist) + 3(ang_vel) + 4(last_act) + 4(motor) + 3(acc_des) + 3(vel_des)
+    frame_observation_space = 56
     observation_space = frame_observation_space
+
+    history_len = 5
 
     prob_null_trajectory = 0.5
     trajectory_type = "langevin"
@@ -184,6 +186,13 @@ class QuadcopterEnv(DirectRLEnv):
         self.motor_tau_up_tensor = torch.zeros(self.num_envs, 1, device=self.device)
         self.motor_tau_down_tensor = torch.zeros(self.num_envs, 1, device=self.device)
         self.kappa_tensor = torch.zeros(self.num_envs, device=self.device)
+
+        # ================= [新增：历史观测 Buffer] =================
+        self.history_len = self.cfg.history_len
+        # 存储世界坐标系下的误差，形状: (num_envs, history_len, 3)
+        self.pos_error_w_history = torch.zeros(self.num_envs, self.history_len, 3, device=self.device)
+        self.vel_error_w_history = torch.zeros(self.num_envs, self.history_len, 3, device=self.device)
+        # ========================================================
 
         if self.cfg.dynamics.multi_teacher_params is not None:
             # 这里的 params 列表应该在 play_teacher_multi.py 中注入到 env_cfg
@@ -282,8 +291,7 @@ class QuadcopterEnv(DirectRLEnv):
         # 目标状态
         self.pos_des = torch.zeros(self.num_envs, 3, device=self.device)
         self.vel_des = torch.zeros(self.num_envs, 3, device=self.device)
-        self.pos_des_raw = torch.zeros(self.num_envs, 3, device=self.device)
-        self.vel_des_raw = torch.zeros(self.num_envs, 3, device=self.device)
+        self.acc_des = torch.zeros(self.num_envs, 3, device=self.device)
         
         # 轨迹参数
         self._langevin_dt = 0.01
@@ -366,35 +374,61 @@ class QuadcopterEnv(DirectRLEnv):
     def _generate_desired_trajectory_langevin(self, env_ids: torch.Tensor = None):
         if env_ids is None: env_ids = torch.arange(self.num_envs, device=self.device)
         n_envs = len(env_ids)
+        dt = self.dt  # 使用仿真步长，或者使用独立的轨迹步长 self._langevin_dt
         
-        gamma, omega, sigma = self._langevin_friction, self._langevin_omega, self._langevin_sigma
-        dt, alpha = self._langevin_dt, self._langevin_alpha
-        sqrt_dt = torch.sqrt(torch.tensor(dt, device=self.device))
+        # --- 参数设置 (可以提取到 Config 中) ---
+        # 弹簧刚度 (把无人机拉回原点，影响位置约束强弱)
+        k_pos = 1.0  
+        # 阻尼系数 (防止速度过大，影响最高速度)
+        k_vel = 1.5   
+        # 加速度平滑系数 (模拟加加速度 Jerk 的惯性，值越小加速度变化越慢)
+        acc_inertia = 0.1 
+        # 噪声强度 (直接决定加速度的变化幅度)
+        noise_scale = 10.0 # 需要根据无人机推重比调整，通常 5.0 - 15.0 之间
         
-        x_prev_g = self.pos_des_raw[env_ids]
-        v_prev = self.vel_des_raw[env_ids]
+        # 获取当前状态
+        pos_current = self.pos_des[env_ids]
+        vel_current = self.vel_des[env_ids]
+        acc_current = self.acc_des[env_ids]
         spawn_pos = self._spawn_pos_w[env_ids]
-        x_prev_l = x_prev_g - spawn_pos 
-        
-        dW = sqrt_dt * torch.randn(n_envs, 3, device=self.device)
-        v_next = v_prev + (-gamma * v_prev - omega * omega * x_prev_l) * dt + sigma * dW
-        
-        max_vel = self._langevin_max_vel[env_ids].unsqueeze(1)
-        v_norm = torch.norm(v_next, dim=1, keepdim=True)
-        scale = torch.clamp(max_vel / (v_norm + 1e-6), max=1.0)
-        v_next = v_next * scale
 
-        x_next_g = x_prev_g + v_next * dt
+        # --- 积分更新 ---
+        # Euler 积分更新速度和位置
+        vel_next = vel_current + acc_current * dt
         
-        self.pos_des_raw[env_ids] = x_next_g
-        self.vel_des_raw[env_ids] = v_next
+        # 限制最大速度 (软限制已由阻尼 k_vel 提供，这里做硬截断以防万一)
+        max_vel = 3.0 # m/s
+        vel_norm = torch.norm(vel_next, dim=1, keepdim=True)
+        scale = torch.clamp(max_vel / (vel_norm + 1e-6), max=1.0)
+        vel_next = vel_next * scale
         
-        v_smooth_prev = self.vel_des[env_ids]
-        v_smooth = alpha * v_next + (1.0 - alpha) * v_smooth_prev
-        x_smooth = self.pos_des[env_ids] + v_smooth * dt
+        pos_next = pos_current + vel_current * dt
         
-        self.pos_des[env_ids] = x_smooth
-        self.vel_des[env_ids] = v_smooth
+        # 计算相对于出生点的位移
+        pos_err = pos_current - spawn_pos
+        
+        # --- 核心物理动力学 ---
+        # 目标加速度变化量 (Jerk) = 随机噪声 + 回复力(拉回中心) - 阻尼力(限制速度)
+        # 这是一个受到随机力扰动的弹簧阻尼二阶系统
+        noise = torch.randn(n_envs, 3, device=self.device) * noise_scale
+        
+        # 期望的合外力 (Target Force/Mass)
+        force_total = noise - k_pos * pos_err - k_vel * vel_current
+        
+        # 更新加速度 (一阶低通滤波，模拟物理惯性)
+        # acc_new = (1 - alpha) * acc_old + alpha * target
+        acc_next = (1.0 - acc_inertia) * acc_current + acc_inertia * force_total
+        
+        # --- 物理限制 (Clipping) ---
+        # 限制最大加速度 (基于推重比，假设最大推力约为 2G 到 3G)
+        max_acc = 15.0 # m/s^2
+        acc_next = torch.clamp(acc_next, -max_acc, max_acc)
+ 
+        # --- 保存状态 ---
+        self.acc_des[env_ids] = acc_next
+        self.vel_des[env_ids] = vel_next
+        self.pos_des[env_ids] = pos_next
+        
 
     def _generate_desired_trajectory_figure8(self, env_ids: torch.Tensor = None):
         if env_ids is None: env_ids = torch.arange(self.num_envs, device=self.device)
@@ -410,7 +444,6 @@ class QuadcopterEnv(DirectRLEnv):
             curr_pos = self._robot.data.root_pos_w[recenter_idx].clone()
             self._spawn_pos_w[recenter_idx] = curr_pos
             self.pos_des[recenter_idx] = curr_pos
-            self.pos_des_raw[recenter_idx] = curr_pos
             self._traj_origin_adjusted[recenter_idx] = True
 
         in_warmup = t < self._figure8_warmup_duration
@@ -437,8 +470,6 @@ class QuadcopterEnv(DirectRLEnv):
         if len(active_env_ids) > 0:
             self.pos_des[active_env_ids] = pos_des_new[active_mask]
             self.vel_des[active_env_ids] = vel_des_new[active_mask]
-            self.pos_des_raw[active_env_ids] = pos_des_new[active_mask]
-            self.vel_des_raw[active_env_ids] = vel_des_new[active_mask]
 
     def _calc_env_origins(self):
         robots_per_env = self.cfg.robots_per_env
@@ -555,28 +586,62 @@ class QuadcopterEnv(DirectRLEnv):
         vel_w = self._robot.data.root_lin_vel_w
         ang_vel_b = self._robot.data.root_ang_vel_b
         
+        # 1. 计算当前的世界坐标系误差
+        pos_error_w = pos_w - self.pos_des
+        vel_error_w = vel_w - self.vel_des # 注意：通常 vel_des 在悬停时为0，在追踪时非0
+
+        # 2. 更新历史 Buffer (Rolling Update)
+        # 将数据向前滚动一位 (丢弃最早的，空出最后一个位置)
+        self.pos_error_w_history = torch.roll(self.pos_error_w_history, shifts=-1, dims=1)
+        self.vel_error_w_history = torch.roll(self.vel_error_w_history, shifts=-1, dims=1)
+        
+        # 填入最新数据
+        self.pos_error_w_history[:, -1, :] = pos_error_w
+        self.vel_error_w_history[:, -1, :] = vel_error_w
+
+        # 3. 构建旋转矩阵 (World -> Body)
         rot_matrix_b2w = matrix_from_quat(quat_w)
         rot_matrix_w2b = rot_matrix_b2w.transpose(1, 2) 
 
-        pos_error_b = torch.bmm(rot_matrix_w2b, (pos_w - self.pos_des).unsqueeze(-1)).squeeze(-1)
-        vel_error_b = torch.bmm(rot_matrix_w2b, (vel_w - self.vel_des).unsqueeze(-1)).squeeze(-1)
+        # 4. 批量旋转历史误差到当前的 Body Frame
+        # history shape: (N, T, 3), matrix shape: (N, 3, 3)
+        # 公式: Vector_body = R_w2b @ Vector_world
+        # torch.matmul 支持 broadcasting: (N, 3, 3) @ (N, T, 3).transpose -> (N, 3, T) -> transpose back
+        
+        pos_error_b_hist = torch.matmul(rot_matrix_w2b, self.pos_error_w_history.transpose(1, 2)).transpose(1, 2)
+        vel_error_b_hist = torch.matmul(rot_matrix_w2b, self.vel_error_w_history.transpose(1, 2)).transpose(1, 2)
+        
+        # 展平历史数据: (N, T, 3) -> (N, T*3)
+        pos_error_flat = pos_error_b_hist.reshape(self.num_envs, -1)
+        vel_error_flat = vel_error_b_hist.reshape(self.num_envs, -1)
+
+        # 5. 处理期望加速度和速度 (转到 Body Frame)
+        # acc_des 和 vel_des 通常是在 World Frame 生成的
+        acc_des_w = self.acc_des
+        vel_des_w = self.vel_des
+        
+        acc_des_b = torch.bmm(rot_matrix_w2b, acc_des_w.unsqueeze(-1)).squeeze(-1)
+        vel_des_b = torch.bmm(rot_matrix_w2b, vel_des_w.unsqueeze(-1)).squeeze(-1)
 
         rot_flat = rot_matrix_b2w.reshape(self.num_envs, 9)
-        
-        # Student obs (No motor speeds)
-        # obs_student = torch.cat([
-        #     pos_error_b, rot_flat, vel_error_b, ang_vel_b, self._last_actions
-        # ], dim=-1)
 
-        # Teacher obs (With motor speeds)
+        # 6. 拼接 Observation
+        # 顺序: Pos_Err_Hist(15), Rot(9), Vel_Err_Hist(15), Ang_Vel(3), Last_Act(4), Motor(4), Acc_Des(3), Vel_Des(3)
         obs_teacher = torch.cat([
-            pos_error_b, rot_flat, vel_error_b, ang_vel_b, self._last_actions, self._current_motor_speeds
+            pos_error_flat,       # 15
+            rot_flat,             # 9
+            vel_error_flat,       # 15
+            ang_vel_b,            # 3
+            self._last_actions,   # 4
+            acc_des_b,            # 3 
+            vel_des_b,            # 3 
+            self._current_motor_speeds, # 4
+
         ], dim=-1)
 
-        # 4. 去除冗余历史堆叠，直接返回当前帧
         obs_teacher = self.CHECK_NAN(obs_teacher, "Observation")
         return {"policy": obs_teacher, "critic": obs_teacher, "rnd_state": obs_teacher}
-    
+
     def _get_rewards(self) -> torch.Tensor:
         pos_error_norm = torch.norm(self._robot.data.root_pos_w - self.pos_des, dim=1)
         q_z = self._robot.data.root_quat_w[:, 3]
@@ -678,6 +743,21 @@ class QuadcopterEnv(DirectRLEnv):
         # Initialize State (RAPTOR style)
         l_arm = self.arm_l_tensor[env_ids]
         
+        # ================= [新增：重置历史 Buffer] =================
+        # 1. 计算当前初始时刻的世界坐标系误差
+        # 注意：此时 robot 状态已经重置，pos_des 已经设定
+        curr_pos_w = self._robot.data.root_pos_w[env_ids]
+        curr_vel_w = self._robot.data.root_lin_vel_w[env_ids]
+        
+        initial_pos_err_w = curr_pos_w - self.pos_des[env_ids]
+        initial_vel_err_w = curr_vel_w - self.vel_des[env_ids]
+        
+        # 2. 用当前误差填满历史 (复制 history_len 次)，确保 t=0 时没有剧烈梯度
+        # (N, 3) -> (N, 1, 3) -> (N, T, 3)
+        self.pos_error_w_history[env_ids] = initial_pos_err_w.unsqueeze(1).repeat(1, self.history_len, 1)
+        self.vel_error_w_history[env_ids] = initial_vel_err_w.unsqueeze(1).repeat(1, self.history_len, 1)
+        # ========================================================
+
         if self.cfg.train_or_play:
             # TRAIN Initialization
             def sample_in_sphere(r, n):
@@ -715,9 +795,8 @@ class QuadcopterEnv(DirectRLEnv):
         
         self.pos_des[env_ids] = spawn_center
         self._spawn_pos_w[env_ids] = spawn_center
-        self.pos_des_raw[env_ids] = spawn_center
         self.vel_des[env_ids] = 0.0
-        self.vel_des_raw[env_ids] = 0.0
+        self.acc_des[env_ids] = 0.0
 
         # Task type
         self._is_langevin_task[env_ids] = torch.rand(len(env_ids), device=self.device) > self.cfg.prob_null_trajectory
