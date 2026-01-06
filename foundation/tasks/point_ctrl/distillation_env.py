@@ -126,14 +126,14 @@ class QuadcopterSceneCfg(InteractiveSceneCfg):
 
 @configclass
 class QuadcopterEnvCfg(DirectRLEnvCfg):
-    # custom config for the quadcopter environment
-
-    # Updated observation space: pos_error(3) + rot_matrix(9) + vel_error(3) + ang_vel(3) + last_actions(4) + motor_speeds(4)
-    frame_observation_space = 3 + 9 + 3 + 3 + 4 + 4  # 26
-
-    # Calculate total observation space (without depth history, only current frame)
-    observation_space = frame_observation_space  # 26D: pos_error(3) + rot_matrix(9) + vel_error(3) + ang_vel(3) + last_actions(4) + motor_speeds(4)
-
+    # 历史(15+15) + 旋转(9) + 角速度(3) + 上次动作(4) + 期望加速度(3) + 期望速度(3) + 电机转速(4) = 56
+    teacher_observation_space = 56
+    # 学生策略 = 教师策略 - 电机转速(4) = 52
+    student_observation_space = 52
+    # 设置 IsaacLab 默认观测空间（通常对应学生策略维度）
+    observation_space = student_observation_space 
+    
+    history_len = 5  # 对应 teacher_env 的 5 帧历史
 
     prob_null_trajectory = 0.5  # 50% 概率做定点控制
 
@@ -229,6 +229,10 @@ class QuadcopterEnv(DirectRLEnv):
         self.motor_tau_up_tensor = torch.zeros(self.num_envs, 1, device=self.device)
         self.motor_tau_down_tensor = torch.zeros(self.num_envs, 1, device=self.device)
         self.kappa_tensor = torch.zeros(self.num_envs, device=self.device)
+        # --- 新增：历史 Buffer ---
+        self.history_len = self.cfg.history_len
+        self.pos_error_b_history = torch.zeros(self.num_envs, self.history_len, 3, device=self.device)
+        self.vel_error_b_history = torch.zeros(self.num_envs, self.history_len, 3, device=self.device)
 
         if self.cfg.dynamics.multi_teacher_params is not None:
             teacher_params_list = self.cfg.dynamics.multi_teacher_params
@@ -343,11 +347,8 @@ class QuadcopterEnv(DirectRLEnv):
         # Desired states
         self.pos_des = torch.zeros(self.num_envs, 3, device=self.device)
         self.vel_des = torch.zeros(self.num_envs, 3, device=self.device)
-        
-        # Raw states for Langevin
-        self.pos_des_raw = torch.zeros(self.num_envs, 3, device=self.device)
-        self.vel_des_raw = torch.zeros(self.num_envs, 3, device=self.device)
-        
+        self.acc_des = torch.zeros(self.num_envs, 3, device=self.device) # 新增加速度项
+
         # Langevin parameters
         self._langevin_dt = 0.01
         self._langevin_friction = 0.5
@@ -453,115 +454,110 @@ class QuadcopterEnv(DirectRLEnv):
         self._numerical_is_unstable = torch.logical_or(self._numerical_is_unstable, state_is_unstable)
 
     def _generate_desired_trajectory_langevin(self, env_ids: torch.Tensor = None):
-        """
-        Generate desired position and velocity using Langevin dynamics.
-        """ 
-        if env_ids is None:
-            env_ids = torch.arange(self.num_envs, device=self.device)
-        
+        if env_ids is None: env_ids = torch.arange(self.num_envs, device=self.device)
         n_envs = len(env_ids)
+        dt = self.dt  # 使用仿真步长，或者使用独立的轨迹步长 self._langevin_dt
         
-        gamma = self._langevin_friction
-        omega = self._langevin_omega
-        sigma = self._langevin_sigma
-        dt = self._langevin_dt
-        alpha = self._langevin_alpha
+        # --- 参数设置 (可以提取到 Config 中) ---
+        # 弹簧刚度 (把无人机拉回原点，影响位置约束强弱)
+        k_pos = 1.0  
+        # 阻尼系数 (防止速度过大，影响最高速度)
+        k_vel = 1.5   
+        # 加速度平滑系数 (模拟加加速度 Jerk 的惯性，值越小加速度变化越慢)
+        acc_inertia = 0.1 
+        # 噪声强度 (直接决定加速度的变化幅度)
+        noise_scale = 10.0 # 需要根据无人机推重比调整，通常 5.0 - 15.0 之间
         
-        sqrt_dt = torch.sqrt(torch.tensor(dt, device=self.device))
-        
-        # Get previous raw states
-        x_prev_global = self.pos_des_raw[env_ids]
-        v_prev = self.vel_des_raw[env_ids]
-        
-        # 获取对应的出生点，计算局部坐标
+        # 获取当前状态
+        pos_current = self.pos_des[env_ids]
+        vel_current = self.vel_des[env_ids]
+        acc_current = self.acc_des[env_ids]
         spawn_pos = self._spawn_pos_w[env_ids]
-        x_prev_local = x_prev_global - spawn_pos 
-        
-        dW = sqrt_dt * torch.randn(n_envs, 3, device=self.device)
-        
-        # Update velocity
-        v_next = v_prev + (-gamma * v_prev - omega * omega * x_prev_local) * dt + sigma * dW
-        
-        # 速度限幅
-        max_vel_limits = self._langevin_max_vel[env_ids].unsqueeze(1)
-        v_norm = torch.norm(v_next, dim=1, keepdim=True)
-        scale_factor = torch.clamp(max_vel_limits / (v_norm + 1e-6), max=1.0)
-        v_next = v_next * scale_factor
 
-        # Update position
-        x_next_global = x_prev_global + v_next * dt
+        # --- 积分更新 ---
+        # Euler 积分更新速度和位置
+        vel_next = vel_current + acc_current * dt
         
-        # Store raw states
-        self.pos_des_raw[env_ids] = x_next_global
-        self.vel_des_raw[env_ids] = v_next
+        # 限制最大速度 (软限制已由阻尼 k_vel 提供，这里做硬截断以防万一)
+        max_vel = 3.0 # m/s
+        vel_norm = torch.norm(vel_next, dim=1, keepdim=True)
+        scale = torch.clamp(max_vel / (vel_norm + 1e-6), max=1.0)
+        vel_next = vel_next * scale
         
-        # Apply smoothing
-        v_smooth_prev = self.vel_des[env_ids]
-        v_smooth = alpha * v_next + (1.0 - alpha) * v_smooth_prev
+        pos_next = pos_current + vel_current * dt
         
-        x_smooth_prev = self.pos_des[env_ids]
-        x_smooth = x_smooth_prev + v_smooth * dt
+        # 计算相对于出生点的位移
+        pos_err = pos_current - spawn_pos
         
-        # Store smoothed states
-        self.pos_des[env_ids] = x_smooth
-        self.vel_des[env_ids] = v_smooth
+        # --- 核心物理动力学 ---
+        # 目标加速度变化量 (Jerk) = 随机噪声 + 回复力(拉回中心) - 阻尼力(限制速度)
+        # 这是一个受到随机力扰动的弹簧阻尼二阶系统
+        noise = torch.randn(n_envs, 3, device=self.device) * noise_scale
+        
+        # 期望的合外力 (Target Force/Mass)
+        force_total = noise - k_pos * pos_err - k_vel * vel_current
+        
+        # 更新加速度 (一阶低通滤波，模拟物理惯性)
+        # acc_new = (1 - alpha) * acc_old + alpha * target
+        acc_next = (1.0 - acc_inertia) * acc_current + acc_inertia * force_total
+        
+        # --- 物理限制 (Clipping) ---
+        # 限制最大加速度 (基于推重比，假设最大推力约为 2G 到 3G)
+        max_acc = 15.0 # m/s^2
+        acc_next = torch.clamp(acc_next, -max_acc, max_acc)
+ 
+        # --- 保存状态 ---
+        self.acc_des[env_ids] = acc_next
+        self.vel_des[env_ids] = vel_next
+        self.pos_des[env_ids] = pos_next
 
     def _generate_desired_trajectory_figure8(self, env_ids: torch.Tensor = None):
-            if env_ids is None:
-                env_ids = torch.arange(self.num_envs, device=self.device)
-            
+            if env_ids is None: env_ids = torch.arange(self.num_envs, device=self.device)
             n_envs = len(env_ids)
             
-            # 1. Update time variable
             self._figure8_time[env_ids] += self.dt
             t = self._figure8_time[env_ids]
             
-            # 2. 重定中心逻辑
+            # Recentering logic
             needs_recenter = (t >= self._figure8_warmup_duration) & (~self._traj_origin_adjusted[env_ids])
-            
             if needs_recenter.any():
-                recenter_indices = env_ids[needs_recenter]
-                current_robot_pos = self._robot.data.root_pos_w[recenter_indices].clone()
-                self._spawn_pos_w[recenter_indices] = current_robot_pos
-                self.pos_des[recenter_indices] = current_robot_pos
-                self.pos_des_raw[recenter_indices] = current_robot_pos
-                self._traj_origin_adjusted[recenter_indices] = True
+                recenter_idx = env_ids[needs_recenter]
+                curr_pos = self._robot.data.root_pos_w[recenter_idx].clone()
+                self._spawn_pos_w[recenter_idx] = curr_pos
+                self.pos_des[recenter_idx] = curr_pos
+                self._traj_origin_adjusted[recenter_idx] = True
 
-            # 3. Calculate Figure-8 Path
             in_warmup = t < self._figure8_warmup_duration
-            if torch.all(in_warmup):
-                return 
-            
-            omega = 2 * math.pi * self._figure8_frequency
-            spawn_pos = self._spawn_pos_w[env_ids]
-            
-            t_adjusted = t - self._figure8_warmup_duration
-            
-            x_rel = self._figure8_scale_x * torch.sin(omega * t_adjusted)
-            y_rel = self._figure8_scale_y * torch.sin(2 * omega * t_adjusted)
-            z_target = spawn_pos[:, 2] 
-            
-            pos_des_new = torch.stack([
-                spawn_pos[:, 0] + x_rel,
-                spawn_pos[:, 1] + y_rel,
-                z_target
-            ], dim=1)
-            
-            vx = self._figure8_scale_x * omega * torch.cos(omega * t_adjusted)
-            vy = self._figure8_scale_y * 2 * omega * torch.cos(2 * omega * t_adjusted)
-            vz = torch.zeros(n_envs, device=self.device)
-            
-            vel_des_new = torch.stack([vx, vy, vz], dim=1)
-            
             active_mask = ~in_warmup
             active_env_ids = env_ids[active_mask]
             
             if len(active_env_ids) > 0:
-                self.pos_des[active_env_ids] = pos_des_new[active_mask]
-                self.vel_des[active_env_ids] = vel_des_new[active_mask]
-                self.pos_des_raw[active_env_ids] = pos_des_new[active_mask]
-                self.vel_des_raw[active_env_ids] = vel_des_new[active_mask]
+                omega = 2 * math.pi * self._figure8_frequency
+                spawn = self._spawn_pos_w[active_env_ids] # 只取活跃环境的出生点
+                t_adj = t[active_mask] - self._figure8_warmup_duration # 只取活跃环境的时间
+                
+                # --- 修正：补全 pos_des_new ---
+                x_rel = self._figure8_scale_x * torch.sin(omega * t_adj)
+                y_rel = self._figure8_scale_y * torch.sin(2 * omega * t_adj)
+                z_target = spawn[:, 2] 
+                pos_des_new = torch.stack([spawn[:, 0] + x_rel, spawn[:, 1] + y_rel, z_target], dim=1)
+                
+                # 速度
+                vx = self._figure8_scale_x * omega * torch.cos(omega * t_adj)
+                vy = self._figure8_scale_y * 2 * omega * torch.cos(2 * omega * t_adj)
+                vz = torch.zeros_like(vx)
+                vel_des_new = torch.stack([vx, vy, vz], dim=1)
 
+                # 加速度
+                ax = -self._figure8_scale_x * (omega**2) * torch.sin(omega * t_adj)
+                ay = -self._figure8_scale_y * (4 * omega**2) * torch.sin(2 * omega * t_adj)
+                az = torch.zeros_like(ax)
+                acc_des_new = torch.stack([ax, ay, az], dim=1)
+                
+                # 赋值
+                self.pos_des[active_env_ids] = pos_des_new
+                self.vel_des[active_env_ids] = vel_des_new
+                self.acc_des[active_env_ids] = acc_des_new
     def _calc_env_origins(self):
         robots_per_env = self.cfg.robots_per_env
         num_groups = self.num_envs // robots_per_env + 1
@@ -713,72 +709,55 @@ class QuadcopterEnv(DirectRLEnv):
         self._robot.set_external_force_and_torque(self._forces, self._torques, body_ids=self._body_id)
 
     def _get_observations(self) -> dict:
-        # 1. 获取物理状态
         pos_w = self._robot.data.root_pos_w
         quat_w = self._robot.data.root_quat_w
         vel_w = self._robot.data.root_lin_vel_w
         ang_vel_b = self._robot.data.root_ang_vel_b
         
-        # 2. 计算旋转矩阵
-        rot_matrix_b2w = matrix_from_quat(quat_w)  # R_b->w
-        rotation_matrix_flat = rot_matrix_b2w.reshape(self.num_envs, 9)
-        
-        # 3. 坐标系转换
-        # 计算世界系误差
-        pos_error_w = pos_w - self.pos_des
-        vel_error_w = vel_w - self.vel_des
-
-        # 计算 R_w->b (即 R_b->w 的转置)
+        # 1. 坐标系转换矩阵 (World -> Body)
+        rot_matrix_b2w = matrix_from_quat(quat_w)
         rot_matrix_w2b = rot_matrix_b2w.transpose(1, 2) 
 
-        # 投影到机体坐标系: error_body = R_w->b @ error_world
-        pos_error_b = torch.bmm(rot_matrix_w2b, pos_error_w.unsqueeze(-1)).squeeze(-1)
-        vel_error_b = torch.bmm(rot_matrix_w2b, vel_error_w.unsqueeze(-1)).squeeze(-1)
+        # 2. 计算当前帧在机体系下的误差
+        curr_pos_error_b = torch.bmm(rot_matrix_w2b, (pos_w - self.pos_des).unsqueeze(-1)).squeeze(-1)
+        curr_vel_error_b = torch.bmm(rot_matrix_w2b, (vel_w - self.vel_des).unsqueeze(-1)).squeeze(-1)
 
-        motor_speeds_obs = self._current_motor_speeds
+        # 3. 更新历史 Buffer (Rolling window)
+        self.pos_error_b_history = torch.roll(self.pos_error_b_history, shifts=-1, dims=1)
+        self.vel_error_b_history = torch.roll(self.vel_error_b_history, shifts=-1, dims=1)
+        self.pos_error_b_history[:, -1, :] = curr_pos_error_b
+        self.vel_error_b_history[:, -1, :] = curr_vel_error_b
 
-        # # 用于raptor测试
-        # motor_speeds_obs = motor_speeds_obs * 2.0 - 1.0  # [0,1] → [-1,1]
-        # last_actions = self._last_actions * 2.0 - 1.0  # [0,1] → [-1,1]
-        # obs_teacher = torch.cat([
-        #     pos_error_w,            
-        #     rotation_matrix_flat,  
-        #     vel_error_w,           
-        #     ang_vel_b,              
-        #     last_actions,    
-        #     motor_speeds_obs
-        # ], dim=-1)
+        # 4. 展平历史数据
+        pos_error_flat = self.pos_error_b_history.reshape(self.num_envs, -1) # (N, 15)
+        vel_error_flat = self.vel_error_b_history.reshape(self.num_envs, -1) # (N, 15)
 
-        # obs_student = torch.cat([
-        #     pos_error_w,            
-        #     rotation_matrix_flat,  
-        #     vel_error_w,           
-        #     ang_vel_b,              
-        #     last_actions,
-        # ], dim=-1)
+        # 5. 处理期望量（转到机体系）
+        acc_des_b = torch.bmm(rot_matrix_w2b, self.acc_des.unsqueeze(-1)).squeeze(-1)
+        vel_des_b = torch.bmm(rot_matrix_w2b, self.vel_des.unsqueeze(-1)).squeeze(-1)
+        rot_flat = rot_matrix_b2w.reshape(self.num_envs, 9)
 
-        obs_teacher = torch.cat([
-            pos_error_b,            
-            rotation_matrix_flat,  
-            vel_error_b,           
-            ang_vel_b,              
-            self._last_actions,     
-            motor_speeds_obs
+        # 6. 构造基础特征（公共部分，48维）
+        common_obs = torch.cat([
+            pos_error_flat,             # 15
+            rot_flat,                   # 9
+            vel_error_flat,             # 15
+            ang_vel_b,                  # 3
+            self._last_actions,         # 4
+            acc_des_b,                  # 3 
+            vel_des_b,                  # 3 
         ], dim=-1)
 
-        obs_student = torch.cat([
-            pos_error_b,            
-            rotation_matrix_flat,  
-            vel_error_b,           
-            ang_vel_b,              
-            self._last_actions,
-        ], dim=-1)
+        # 7. 教师策略输入 (Common + Motor Speeds = 56维)
+        obs_teacher = torch.cat([common_obs, self._current_motor_speeds], dim=-1)
 
-        # 4. 去除冗余历史堆叠，直接返回当前帧
-        obs_teacher = self.CHECK_NAN(obs_teacher, "Observation")
-        obs_student = self.CHECK_NAN(obs_student, "Observation")
+        # 8. 学生策略输入 (仅 Common = 52维，即教师减去电机转速)
+        obs_student = common_obs
+
+        obs_teacher = self.CHECK_NAN(obs_teacher, "Teacher Observation")
+        obs_student = self.CHECK_NAN(obs_student, "Student Observation")
+        
         return {"policy": obs_student, "teacher": obs_teacher, "rnd_state": obs_student}
-    
     def _get_rewards(self) -> torch.Tensor:
         # --- 1. 获取状态 ---
         pos_w = self._robot.data.root_pos_w
@@ -885,151 +864,109 @@ class QuadcopterEnv(DirectRLEnv):
         """Reset specific environment indexes."""
         if env_ids is None:
             env_ids = self._robot._ALL_INDICES
-        
         num_resets = len(env_ids)
         
-        # --- 1. 日志记录逻辑 ---
+        # --- 1. 日志记录与基础状态重置 ---
         if num_resets > 0:
             if "log" not in self.extras:
                 self.extras["log"] = dict()
             for key in self._episode_sums.keys():
                 values = self._episode_sums[key][env_ids]
-                mean_val = torch.mean(values).item()
-                self.extras["log"][f"Episode_Reward/{key}"] = mean_val
+                self.extras["log"][f"Episode_Reward/{key}"] = torch.mean(values).item()
                 self._episode_sums[key][env_ids] = 0.0
-
 
         died_mask = self.reset_terminated[env_ids]
         timed_out_mask = self.reset_time_outs[env_ids]
         if hasattr(self, '_update_episode_outcomes_and_metrics'):
-            success_mask = torch.zeros(num_resets, dtype=torch.bool, device=self.device)
-            self._update_episode_outcomes_and_metrics(env_ids, success_mask, died_mask, timed_out_mask)
+            self._update_episode_outcomes_and_metrics(env_ids, None, died_mask, timed_out_mask)
 
         self._robot.reset(env_ids)
         super()._reset_idx(env_ids)
 
-        # 状态清零
+        # 清除动作和物理标志位
         self._actions[env_ids] = 0.0
         self._last_actions[env_ids] = 0.0
         self._forces[env_ids] = 0.0
         self._torques[env_ids] = 0.0
-        self._last_angular_velocity[env_ids] = 0.0
-        # 清零所有不稳定性标志位
         self._numerical_is_unstable[env_ids] = False
         self._died_pos_limit[env_ids] = False
         self._died_lin_vel_limit[env_ids] = False
         self._died_ang_vel_limit[env_ids] = False
         self._died_tilt_limit[env_ids] = False
         self._died_nan[env_ids] = False
-
-        # 重置轨迹时间 (用于八字形轨迹)
         self._figure8_time[env_ids] = 0.0
         self._traj_origin_adjusted[env_ids] = False
-
-        self._langevin_max_vel[env_ids] = torch.rand(len(env_ids), device=self.device) * 1.0 + 0.5
-        
         self._current_motor_speeds[env_ids] = 0.0 
 
-        # --- 3. RAPTOR 初始化逻辑 ---
-        l_arm_env = self.arm_l_tensor[env_ids]
+        # --- 2. 确定位置与随机状态采样 (核心修正点：先定义变量) ---
+        spawn_center = self.env_origins[env_ids].clone()
+        spawn_center[:, 0] += self.cfg.terrain_length / 2.0
+        spawn_center[:, 1] += self.cfg.terrain_width / 2.0
+        spawn_center[:, 2] = self.cfg.height
+        self._spawn_pos_w[env_ids] = spawn_center 
+
+        l_arm = self.arm_l_tensor[env_ids]
 
         if self.cfg.train_or_play:
-            # ================= [TRAIN MODE] =================
-            r_pos_limit = 10.0 * l_arm_env   # 位置采样半径
-            v_lin_limit = 1.0           # 线速度限制
-            v_ang_limit = 1.0           # 角速度限制
-
-            # 辅助函数：球体内均匀采样
+            # 定义采样函数
             def sample_in_sphere(radius, n_samples):
-                direction = torch.randn(n_samples, 3, device=self.device)
-                direction = F.normalize(direction, p=2, dim=1)
-
-                # --- 解决 float 和 [N] 张量两种情况 ---
-                if isinstance(radius, float) or isinstance(radius, int):
-                    # 标量 → 转成 shape=[n_samples, 1]
-                    radius = torch.full((n_samples, 1), radius, device=self.device)
-                else:
-                    # Tensor:
-                    # radius 可能是 [N] 或 [N,1]
-                    if radius.dim() == 1:
-                        radius = radius.unsqueeze(1)
-                    # 如果是 [N,1] 直接保持
-
-                u = torch.rand(n_samples, 1, device=self.device)
-                r = radius * torch.pow(u, 1.0 / 3.0)
-
+                direction = F.normalize(torch.randn(n_samples, 3, device=self.device), p=2, dim=1)
+                if not isinstance(radius, (float, int)):
+                    radius = radius.view(-1, 1)
+                r = radius * torch.pow(torch.rand(n_samples, 1, device=self.device), 1.0 / 3.0)
                 return direction * r
 
-            # A. 生成随机状态偏移
-            pos_offset = sample_in_sphere(r_pos_limit, num_resets)
-            lin_vel = sample_in_sphere(v_lin_limit, num_resets)
-            ang_vel = sample_in_sphere(v_ang_limit, num_resets)
+            pos_offset = sample_in_sphere(10.0 * l_arm, num_resets)
+            lin_vel = sample_in_sphere(1.0, num_resets)
+            ang_vel = sample_in_sphere(1.0, num_resets)
             
-            # 姿态随机
             roll = (torch.rand(num_resets, device=self.device) * 2 - 1) * (math.pi / 2.0)
             pitch = (torch.rand(num_resets, device=self.device) * 2 - 1) * (math.pi / 2.0)
             yaw = (torch.rand(num_resets, device=self.device) * 2 - 1) * math.pi
             quat = quat_from_euler_xyz(roll, pitch, yaw)
 
-            # B. 10% 概率覆盖为完美初始状态
-            reset_to_target_probs = torch.rand(num_resets, device=self.device)
-            is_perfect_start = reset_to_target_probs < 0.10 
-
-            pos_offset[is_perfect_start] = 0.0
-            lin_vel[is_perfect_start] = 0.0
-            ang_vel[is_perfect_start] = 0.0
-            
-            identity_quat = torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device).repeat(num_resets, 1)
-            quat[is_perfect_start] = identity_quat[is_perfect_start]
-            
+            # 10% 完美开局
+            is_perfect = torch.rand(num_resets, device=self.device) < 0.10 
+            pos_offset[is_perfect] = 0.0
+            lin_vel[is_perfect] = 0.0
+            ang_vel[is_perfect] = 0.0
+            quat[is_perfect] = torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device)
         else:
-            # ================= [PLAY MODE] =================
             pos_offset = torch.zeros(num_resets, 3, device=self.device)
             lin_vel = torch.zeros(num_resets, 3, device=self.device)
             ang_vel = torch.zeros(num_resets, 3, device=self.device)
-            quat = torch.zeros(num_resets, 4, device=self.device)
-            quat[:, 0] = 1.0 
+            quat = torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device).repeat(num_resets, 1)
 
-        # --- 4. 设置仿真器状态 ---
+        # --- 3. 根据采样结果同步初始化 Buffer 和期望值 ---
+        self.pos_des[env_ids] = spawn_center
+        self.vel_des[env_ids] = 0.0
+        self.acc_des[env_ids] = 0.0
         
-        # 获取默认状态
-        joint_pos = self._robot.data.default_joint_pos[env_ids].clone()
-        joint_vel = self._robot.data.default_joint_vel[env_ids].clone()
+        # 转换到机体系并填充 5 帧历史
+        rot_w2b_init = matrix_from_quat(quat).transpose(1, 2)
+        initial_pos_err_b = torch.bmm(rot_w2b_init, pos_offset.unsqueeze(-1)).squeeze(-1)
+        initial_vel_err_b = torch.bmm(rot_w2b_init, lin_vel.unsqueeze(-1)).squeeze(-1)
         
-        # 计算出生中心点
-        spawn_center = self.env_origins[env_ids].clone()
-        spawn_center[:, 0] += self.cfg.terrain_length / 2.0
-        spawn_center[:, 1] += self.cfg.terrain_width / 2.0
-        spawn_center[:, 2] = self.cfg.height
+        self.pos_error_b_history[env_ids] = initial_pos_err_b.unsqueeze(1).repeat(1, self.history_len, 1)
+        self.vel_error_b_history[env_ids] = initial_vel_err_b.unsqueeze(1).repeat(1, self.history_len, 1)
 
-        # 记录出生点
-        start_pos = spawn_center + pos_offset
-        self._spawn_pos_w[env_ids] = spawn_center 
-
-        # 构建 Root State 写入仿真
+        # --- 4. 写入物理仿真器 ---
         root_state = self._robot.data.default_root_state[env_ids].clone()
-        root_state[:, :3] = start_pos
+        root_state[:, :3] = spawn_center + pos_offset
         root_state[:, 3:7] = quat
         root_state[:, 7:10] = lin_vel
         root_state[:, 10:13] = ang_vel
 
         self._robot.write_root_pose_to_sim(root_state[:, :7], env_ids)
         self._robot.write_root_velocity_to_sim(root_state[:, 7:], env_ids)
-        self._robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
+        self._robot.write_joint_state_to_sim(
+            self._robot.data.default_joint_pos[env_ids], 
+            self._robot.data.default_joint_vel[env_ids], 
+            None, env_ids
+        )
 
-        # --- 5. 任务与轨迹初始化 ---
-
-        # 重新采样任务类型 (50% 概率)
-        random_task_probs = torch.rand(num_resets, device=self.device)
-        is_langevin = random_task_probs > self.cfg.prob_null_trajectory
-        self._is_langevin_task[env_ids] = is_langevin
-
-        # 初始化期望状态
-        self.pos_des[env_ids] = spawn_center.clone()
-        self.vel_des[env_ids] = 0.0
-        self.pos_des_raw[env_ids] = spawn_center.clone()
-        self.vel_des_raw[env_ids] = 0.0
-
+        # 任务类型分配
+        self._is_langevin_task[env_ids] = torch.rand(num_resets, device=self.device) > self.cfg.prob_null_trajectory
 
     def _set_debug_vis_impl(self, debug_vis: bool):
             """Show debug markers if debug_vis is True."""

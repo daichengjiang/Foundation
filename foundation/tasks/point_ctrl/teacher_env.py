@@ -192,7 +192,6 @@ class QuadcopterEnv(DirectRLEnv):
         # 存储机体坐标系下的误差 (Body Frame)
         self.pos_error_b_history = torch.zeros(self.num_envs, self.history_len, 3, device=self.device)
         self.vel_error_b_history = torch.zeros(self.num_envs, self.history_len, 3, device=self.device)
-        # ===================================================================
 
         if self.cfg.dynamics.multi_teacher_params is not None:
             # 这里的 params 列表应该在 play_teacher_multi.py 中注入到 env_cfg
@@ -685,137 +684,137 @@ class QuadcopterEnv(DirectRLEnv):
         return died, time_out
 
     def _reset_idx(self, env_ids: torch.Tensor | None):
-            if env_ids is None: env_ids = self._robot._ALL_INDICES
+        if env_ids is None: env_ids = self._robot._ALL_INDICES
+        
+        # 1. --- 统计与日志处理 ---
+        if len(env_ids) > 0:
+            batch_rewards = torch.zeros(len(env_ids), device=self.device)
+            for k in self._episode_sums.keys():
+                batch_rewards += self._episode_sums[k][env_ids]
+            self.reward_rolling_buffer.extend(batch_rewards.cpu().tolist())
             
-            # 1. --- 统计与日志处理 ---
-            if len(env_ids) > 0:
-                batch_rewards = torch.zeros(len(env_ids), device=self.device)
-                for k in self._episode_sums.keys():
-                    batch_rewards += self._episode_sums[k][env_ids]
-                self.reward_rolling_buffer.extend(batch_rewards.cpu().tolist())
-                
-                # 记录最大奖励均值
-                if len(self.reward_rolling_buffer) > 0:
-                    cur_mean = np.mean(self.reward_rolling_buffer)
-                    if cur_mean > self.global_max_reward:
-                        self.global_max_reward = cur_mean
-                        if self.reward_report_path:
-                            try:
-                                with open(self.reward_report_path, "w") as f: f.write(str(cur_mean))
-                            except: pass
-                
-                # 清理本轮奖励累计
-                if "log" not in self.extras: self.extras["log"] = dict()
-                for k in self._episode_sums.keys():
-                    values = self._episode_sums[k][env_ids]
-                    self.extras["log"][f"Episode_Reward/{k}"] = torch.mean(values).item()
-                    self._episode_sums[k][env_ids] = 0.0
-
-            # 2. --- 状态重置与基础清理 ---
-            died = self.reset_terminated[env_ids]
-            tout = self.reset_time_outs[env_ids]
-            self._update_episode_outcomes_and_metrics(env_ids, None, died, tout)
-
-            self._robot.reset(env_ids)
-            super()._reset_idx(env_ids)
-
-            # 标志位与动作重置
-            self._actions[env_ids] = 0.0
-            self._last_actions[env_ids] = 0.0
-            self._current_motor_speeds[env_ids] = 0.0
-            self._numerical_is_unstable[env_ids] = False
-            self._died_pos_limit[env_ids] = False
-            self._died_lin_vel_limit[env_ids] = False
-            self._died_ang_vel_limit[env_ids] = False
-            self._died_tilt_limit[env_ids] = False
-            self._died_nan[env_ids] = False
+            # 记录最大奖励均值
+            if len(self.reward_rolling_buffer) > 0:
+                cur_mean = np.mean(self.reward_rolling_buffer)
+                if cur_mean > self.global_max_reward:
+                    self.global_max_reward = cur_mean
+                    if self.reward_report_path:
+                        try:
+                            with open(self.reward_report_path, "w") as f: f.write(str(cur_mean))
+                        except: pass
             
-            self._figure8_time[env_ids] = 0.0
-            self._traj_origin_adjusted[env_ids] = False
-            self._langevin_max_vel[env_ids] = torch.rand(len(env_ids), device=self.device) * 1.0 + 0.5
+            # 清理本轮奖励累计
+            if "log" not in self.extras: self.extras["log"] = dict()
+            for k in self._episode_sums.keys():
+                values = self._episode_sums[k][env_ids]
+                self.extras["log"][f"Episode_Reward/{k}"] = torch.mean(values).item()
+                self._episode_sums[k][env_ids] = 0.0
 
-            # 3. --- 轨迹中心点设定 ---
-            spawn_center = self.env_origins[env_ids].clone()
-            spawn_center[:, 0] += self.cfg.terrain_length / 2.0
-            spawn_center[:, 1] += self.cfg.terrain_width / 2.0
-            spawn_center[:, 2] = self.cfg.height
-            
-            self.pos_des[env_ids] = spawn_center
-            self.vel_des[env_ids] = 0.0
-            self.acc_des[env_ids] = 0.0
-            self._spawn_pos_w[env_ids] = spawn_center
+        # 2. --- 状态重置与基础清理 ---
+        died = self.reset_terminated[env_ids]
+        tout = self.reset_time_outs[env_ids]
+        self._update_episode_outcomes_and_metrics(env_ids, None, died, tout)
 
-            # 4. --- 随机初始状态采样 (RAPTOR style) ---
-            num_resets = len(env_ids)
-            l_arm = self.arm_l_tensor[env_ids]
-            
-            if self.cfg.train_or_play:
-                # 定义球体内均匀采样函数
-                def sample_in_sphere(r, n):
-                    if isinstance(r, torch.Tensor) and r.dim()==1: r = r.unsqueeze(1)
-                    d = torch.randn(n, 3, device=self.device)
-                    d = F.normalize(d, p=2, dim=1)
-                    u = torch.rand(n, 1, device=self.device)
-                    return d * (r * torch.pow(u, 1.0/3.0))
+        self._robot.reset(env_ids)
+        super()._reset_idx(env_ids)
 
-                # 采样偏移量
-                pos_offset = sample_in_sphere(10.0 * l_arm, num_resets) # 位置偏移与轴距成正比
-                lin_vel = sample_in_sphere(1.0, num_resets)            # 1m/s 内的随机初速度
-                ang_vel = sample_in_sphere(1.0, num_resets)            # 1rad/s 内的随机角速度
-                
-                # 随机旋转 (Roll, Pitch, Yaw)
-                r = (torch.rand(num_resets, device=self.device)*2-1) * (math.pi/2)
-                p = (torch.rand(num_resets, device=self.device)*2-1) * (math.pi/2)
-                y = (torch.rand(num_resets, device=self.device)*2-1) * math.pi
-                quat = quat_from_euler_xyz(r, p, y)
-                
-                # 10% 几率完美开局，加速初期收敛
-                perfect_mask = torch.rand(num_resets, device=self.device) < 0.1
-                pos_offset[perfect_mask] = 0.0
-                lin_vel[perfect_mask] = 0.0
-                ang_vel[perfect_mask] = 0.0
-                quat[perfect_mask] = torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device)
-            else:
-                # Play 模式固定开局
-                pos_offset = torch.zeros(num_resets, 3, device=self.device)
-                lin_vel = torch.zeros(num_resets, 3, device=self.device)
-                ang_vel = torch.zeros(num_resets, 3, device=self.device)
-                quat = torch.zeros(num_resets, 4, device=self.device)
-                quat[:, 0] = 1.0
+        # 标志位与动作重置
+        self._actions[env_ids] = 0.0
+        self._last_actions[env_ids] = 0.0
+        self._current_motor_speeds[env_ids] = 0.0
+        self._numerical_is_unstable[env_ids] = False
+        self._died_pos_limit[env_ids] = False
+        self._died_lin_vel_limit[env_ids] = False
+        self._died_ang_vel_limit[env_ids] = False
+        self._died_tilt_limit[env_ids] = False
+        self._died_nan[env_ids] = False
+        
+        self._figure8_time[env_ids] = 0.0
+        self._traj_origin_adjusted[env_ids] = False
+        self._langevin_max_vel[env_ids] = torch.rand(len(env_ids), device=self.device) * 1.0 + 0.5
 
-            # 5. --- [核心优化] 初始化历史 Buffer (同步随机状态) ---
-            # 计算重置时刻的 Body-frame 旋转矩阵
-            rot_w2b = matrix_from_quat(quat).transpose(1, 2)
-            
-            # 初始世界误差：机器人位置(spawn+offset) - 目标(spawn) = offset
-            # 初始速度误差：机器人速度(lin_vel) - 目标速度(0) = lin_vel
-            initial_pos_err_b = torch.bmm(rot_w2b, pos_offset.unsqueeze(-1)).squeeze(-1)
-            initial_vel_err_b = torch.bmm(rot_w2b, lin_vel.unsqueeze(-1)).squeeze(-1)
-            
-            # 用当前的 Body 误差填满 5 帧历史
-            self.pos_error_b_history[env_ids] = initial_pos_err_b.unsqueeze(1).repeat(1, self.history_len, 1)
-            self.vel_error_b_history[env_ids] = initial_vel_err_b.unsqueeze(1).repeat(1, self.history_len, 1)
+        # 3. --- 轨迹中心点设定 ---
+        spawn_center = self.env_origins[env_ids].clone()
+        spawn_center[:, 0] += self.cfg.terrain_length / 2.0
+        spawn_center[:, 1] += self.cfg.terrain_width / 2.0
+        spawn_center[:, 2] = self.cfg.height
+        
+        self.pos_des[env_ids] = spawn_center
+        self.vel_des[env_ids] = 0.0
+        self.acc_des[env_ids] = 0.0
+        self._spawn_pos_w[env_ids] = spawn_center
 
-            # 6. --- 任务类型分配 ---
-            # 决定该环境运行 Langevin 轨迹还是固定/其他轨迹
-            self._is_langevin_task[env_ids] = torch.rand(num_resets, device=self.device) > self.cfg.prob_null_trajectory
+        # 4. --- 随机初始状态采样 (RAPTOR style) ---
+        num_resets = len(env_ids)
+        l_arm = self.arm_l_tensor[env_ids]
+        
+        if self.cfg.train_or_play:
+            # 定义球体内均匀采样函数
+            def sample_in_sphere(r, n):
+                if isinstance(r, torch.Tensor) and r.dim()==1: r = r.unsqueeze(1)
+                d = torch.randn(n, 3, device=self.device)
+                d = F.normalize(d, p=2, dim=1)
+                u = torch.rand(n, 1, device=self.device)
+                return d * (r * torch.pow(u, 1.0/3.0))
 
-            # 7. --- 写入物理仿真器 ---
-            root_state = self._robot.data.default_root_state[env_ids].clone()
-            root_state[:, :3] = spawn_center + pos_offset # 世界坐标位置
-            root_state[:, 3:7] = quat                    # 姿态
-            root_state[:, 7:10] = lin_vel                 # 世界线速度
-            root_state[:, 10:13] = ang_vel                # 机体角速度
+            # 采样偏移量
+            pos_offset = sample_in_sphere(10.0 * l_arm, num_resets) # 位置偏移与轴距成正比
+            lin_vel = sample_in_sphere(1.0, num_resets)            # 1m/s 内的随机初速度
+            ang_vel = sample_in_sphere(1.0, num_resets)            # 1rad/s 内的随机角速度
             
-            self._robot.write_root_pose_to_sim(root_state[:, :7], env_ids)
-            self._robot.write_root_velocity_to_sim(root_state[:, 7:], env_ids)
+            # 随机旋转 (Roll, Pitch, Yaw)
+            r = (torch.rand(num_resets, device=self.device)*2-1) * (math.pi/2)
+            p = (torch.rand(num_resets, device=self.device)*2-1) * (math.pi/2)
+            y = (torch.rand(num_resets, device=self.device)*2-1) * math.pi
+            quat = quat_from_euler_xyz(r, p, y)
             
-            # 重置关节状态（如果模型有螺旋桨旋转等关节）
-            self._robot.write_joint_state_to_sim(
-                self._robot.data.default_joint_pos[env_ids], 
-                self._robot.data.default_joint_vel[env_ids], 
-                None, env_ids
-            )
+            # 10% 几率完美开局，加速初期收敛
+            perfect_mask = torch.rand(num_resets, device=self.device) < 0.1
+            pos_offset[perfect_mask] = 0.0
+            lin_vel[perfect_mask] = 0.0
+            ang_vel[perfect_mask] = 0.0
+            quat[perfect_mask] = torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device)
+        else:
+            # Play 模式固定开局
+            pos_offset = torch.zeros(num_resets, 3, device=self.device)
+            lin_vel = torch.zeros(num_resets, 3, device=self.device)
+            ang_vel = torch.zeros(num_resets, 3, device=self.device)
+            quat = torch.zeros(num_resets, 4, device=self.device)
+            quat[:, 0] = 1.0
+
+        # 5. --- [核心优化] 初始化历史 Buffer (同步随机状态) ---
+        # 计算重置时刻的 Body-frame 旋转矩阵
+        rot_w2b = matrix_from_quat(quat).transpose(1, 2)
+        
+        # 初始世界误差：机器人位置(spawn+offset) - 目标(spawn) = offset
+        # 初始速度误差：机器人速度(lin_vel) - 目标速度(0) = lin_vel
+        initial_pos_err_b = torch.bmm(rot_w2b, pos_offset.unsqueeze(-1)).squeeze(-1)
+        initial_vel_err_b = torch.bmm(rot_w2b, lin_vel.unsqueeze(-1)).squeeze(-1)
+        
+        # 用当前的 Body 误差填满 5 帧历史
+        self.pos_error_b_history[env_ids] = initial_pos_err_b.unsqueeze(1).repeat(1, self.history_len, 1)
+        self.vel_error_b_history[env_ids] = initial_vel_err_b.unsqueeze(1).repeat(1, self.history_len, 1)
+
+        # 6. --- 任务类型分配 ---
+        # 决定该环境运行 Langevin 轨迹还是固定/其他轨迹
+        self._is_langevin_task[env_ids] = torch.rand(num_resets, device=self.device) > self.cfg.prob_null_trajectory
+
+        # 7. --- 写入物理仿真器 ---
+        root_state = self._robot.data.default_root_state[env_ids].clone()
+        root_state[:, :3] = spawn_center + pos_offset # 世界坐标位置
+        root_state[:, 3:7] = quat                    # 姿态
+        root_state[:, 7:10] = lin_vel                 # 世界线速度
+        root_state[:, 10:13] = ang_vel                # 机体角速度
+        
+        self._robot.write_root_pose_to_sim(root_state[:, :7], env_ids)
+        self._robot.write_root_velocity_to_sim(root_state[:, 7:], env_ids)
+        
+        # 重置关节状态（如果模型有螺旋桨旋转等关节）
+        self._robot.write_joint_state_to_sim(
+            self._robot.data.default_joint_pos[env_ids], 
+            self._robot.data.default_joint_vel[env_ids], 
+            None, env_ids
+        )
 
     def _set_debug_vis_impl(self, debug_vis: bool):
         if debug_vis:
