@@ -141,13 +141,21 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # env_cfg.dynamics.motor_tau_down = 0.2601621073237004
     # env_cfg.dynamics.moment_scale = 0.04343799444626214
 
-    env_cfg.dynamics.mass = 0.9723406524454805
-    env_cfg.dynamics.arm_length = 0.1440677911119537
-    env_cfg.dynamics.inertia = (0.005845751033218391,0.005845751033218391,0.010709415892856093)
-    env_cfg.dynamics.thrust_to_weight = 3.419472671407245
-    env_cfg.dynamics.motor_tau_up = 0.030316265523195485
-    env_cfg.dynamics.motor_tau_down = 0.20380266906645023
-    env_cfg.dynamics.moment_scale = 0.0168386257003069
+    # env_cfg.dynamics.mass = 0.9723406524454805
+    # env_cfg.dynamics.arm_length = 0.1440677911119537
+    # env_cfg.dynamics.inertia = (0.005845751033218391,0.005845751033218391,0.010709415892856093)
+    # env_cfg.dynamics.thrust_to_weight = 3.419472671407245
+    # env_cfg.dynamics.motor_tau_up = 0.030316265523195485
+    # env_cfg.dynamics.motor_tau_down = 0.20380266906645023
+    # env_cfg.dynamics.moment_scale = 0.0168386257003069
+
+    env_cfg.dynamics.mass = 4.170006822537896
+    env_cfg.dynamics.arm_length = 0.23338959219177477
+    env_cfg.dynamics.inertia = (0.025736608433949416,0.025736608433949416,0.04714946665099533)
+    env_cfg.dynamics.thrust_to_weight = 1.7042349524548057
+    env_cfg.dynamics.motor_tau_up = 0.04830513035810187
+    env_cfg.dynamics.motor_tau_down = 0.2732373476309069
+    env_cfg.dynamics.moment_scale = 0.0451817502153234
 
     # get checkpoint path
     checkpoint_path = retrieve_file_path(args_cli.checkpoint)

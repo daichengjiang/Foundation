@@ -110,10 +110,8 @@ class QuadcopterSceneCfg(InteractiveSceneCfg):
 @configclass
 class QuadcopterEnvCfg(DirectRLEnvCfg):
     # 15(pos_hist) + 9(rot) + 15(vel_hist) + 3(ang_vel) + 4(last_act) + 4(motor) + 3(acc_des) + 3(vel_des)
-    frame_observation_space = 56
+    frame_observation_space = 38
     observation_space = frame_observation_space
-
-    history_len = 5
 
     prob_null_trajectory = 0.5
     trajectory_type = "langevin"
@@ -167,6 +165,7 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     reward_constant = 1.5
 
 
+
 class QuadcopterEnv(DirectRLEnv):
     cfg: QuadcopterEnvCfg
 
@@ -187,11 +186,8 @@ class QuadcopterEnv(DirectRLEnv):
         self.motor_tau_down_tensor = torch.zeros(self.num_envs, 1, device=self.device)
         self.kappa_tensor = torch.zeros(self.num_envs, device=self.device)
 
-        # ================= [修改：Buffer 存储机体坐标系误差] =================
-        self.history_len = self.cfg.history_len
-        # 存储机体坐标系下的误差 (Body Frame)
-        self.pos_error_b_history = torch.zeros(self.num_envs, self.history_len, 3, device=self.device)
-        self.vel_error_b_history = torch.zeros(self.num_envs, self.history_len, 3, device=self.device)
+        self.pos_error_integral = torch.zeros(self.num_envs, 3, device=self.device)
+        self.vel_error_integral = torch.zeros(self.num_envs, 3, device=self.device)
 
         if self.cfg.dynamics.multi_teacher_params is not None:
             # 这里的 params 列表应该在 play_teacher_multi.py 中注入到 env_cfg
@@ -429,52 +425,52 @@ class QuadcopterEnv(DirectRLEnv):
         self.pos_des[env_ids] = pos_next
 
     def _generate_desired_trajectory_figure8(self, env_ids: torch.Tensor = None):
-            if env_ids is None: env_ids = torch.arange(self.num_envs, device=self.device)
-            n_envs = len(env_ids)
-            
-            self._figure8_time[env_ids] += self.dt
-            t = self._figure8_time[env_ids]
-            
-            # Recentering logic
-            needs_recenter = (t >= self._figure8_warmup_duration) & (~self._traj_origin_adjusted[env_ids])
-            if needs_recenter.any():
-                recenter_idx = env_ids[needs_recenter]
-                curr_pos = self._robot.data.root_pos_w[recenter_idx].clone()
-                self._spawn_pos_w[recenter_idx] = curr_pos
-                self.pos_des[recenter_idx] = curr_pos
-                self._traj_origin_adjusted[recenter_idx] = True
+        if env_ids is None: env_ids = torch.arange(self.num_envs, device=self.device)
+        n_envs = len(env_ids)
+        
+        self._figure8_time[env_ids] += self.dt
+        t = self._figure8_time[env_ids]
+        
+        # Recentering logic
+        needs_recenter = (t >= self._figure8_warmup_duration) & (~self._traj_origin_adjusted[env_ids])
+        if needs_recenter.any():
+            recenter_idx = env_ids[needs_recenter]
+            curr_pos = self._robot.data.root_pos_w[recenter_idx].clone()
+            self._spawn_pos_w[recenter_idx] = curr_pos
+            self.pos_des[recenter_idx] = curr_pos
+            self._traj_origin_adjusted[recenter_idx] = True
 
-            in_warmup = t < self._figure8_warmup_duration
-            active_mask = ~in_warmup
-            active_env_ids = env_ids[active_mask]
+        in_warmup = t < self._figure8_warmup_duration
+        active_mask = ~in_warmup
+        active_env_ids = env_ids[active_mask]
+        
+        if len(active_env_ids) > 0:
+            omega = 2 * math.pi * self._figure8_frequency
+            spawn = self._spawn_pos_w[active_env_ids] # 只取活跃环境的出生点
+            t_adj = t[active_mask] - self._figure8_warmup_duration # 只取活跃环境的时间
             
-            if len(active_env_ids) > 0:
-                omega = 2 * math.pi * self._figure8_frequency
-                spawn = self._spawn_pos_w[active_env_ids] # 只取活跃环境的出生点
-                t_adj = t[active_mask] - self._figure8_warmup_duration # 只取活跃环境的时间
-                
-                # --- 修正：补全 pos_des_new ---
-                x_rel = self._figure8_scale_x * torch.sin(omega * t_adj)
-                y_rel = self._figure8_scale_y * torch.sin(2 * omega * t_adj)
-                z_target = spawn[:, 2] 
-                pos_des_new = torch.stack([spawn[:, 0] + x_rel, spawn[:, 1] + y_rel, z_target], dim=1)
-                
-                # 速度
-                vx = self._figure8_scale_x * omega * torch.cos(omega * t_adj)
-                vy = self._figure8_scale_y * 2 * omega * torch.cos(2 * omega * t_adj)
-                vz = torch.zeros_like(vx)
-                vel_des_new = torch.stack([vx, vy, vz], dim=1)
+            # --- 修正：补全 pos_des_new ---
+            x_rel = self._figure8_scale_x * torch.sin(omega * t_adj)
+            y_rel = self._figure8_scale_y * torch.sin(2 * omega * t_adj)
+            z_target = spawn[:, 2] 
+            pos_des_new = torch.stack([spawn[:, 0] + x_rel, spawn[:, 1] + y_rel, z_target], dim=1)
+            
+            # 速度
+            vx = self._figure8_scale_x * omega * torch.cos(omega * t_adj)
+            vy = self._figure8_scale_y * 2 * omega * torch.cos(2 * omega * t_adj)
+            vz = torch.zeros_like(vx)
+            vel_des_new = torch.stack([vx, vy, vz], dim=1)
 
-                # 加速度
-                ax = -self._figure8_scale_x * (omega**2) * torch.sin(omega * t_adj)
-                ay = -self._figure8_scale_y * (4 * omega**2) * torch.sin(2 * omega * t_adj)
-                az = torch.zeros_like(ax)
-                acc_des_new = torch.stack([ax, ay, az], dim=1)
-                
-                # 赋值
-                self.pos_des[active_env_ids] = pos_des_new
-                self.vel_des[active_env_ids] = vel_des_new
-                self.acc_des[active_env_ids] = acc_des_new
+            # 加速度
+            ax = -self._figure8_scale_x * (omega**2) * torch.sin(omega * t_adj)
+            ay = -self._figure8_scale_y * (4 * omega**2) * torch.sin(2 * omega * t_adj)
+            az = torch.zeros_like(ax)
+            acc_des_new = torch.stack([ax, ay, az], dim=1)
+            
+            # 赋值
+            self.pos_des[active_env_ids] = pos_des_new
+            self.vel_des[active_env_ids] = vel_des_new
+            self.acc_des[active_env_ids] = acc_des_new
 
     def _calc_env_origins(self):
         robots_per_env = self.cfg.robots_per_env
@@ -595,41 +591,38 @@ class QuadcopterEnv(DirectRLEnv):
         rot_matrix_b2w = matrix_from_quat(quat_w)
         rot_matrix_w2b = rot_matrix_b2w.transpose(1, 2) 
 
-        # 2. 计算当前的世界坐标系误差，并立即转换到当前的 Body Frame
+        # 2. 计算当前的世界坐标系误差，并转换到 Body Frame
         curr_pos_error_w = pos_w - self.pos_des
         curr_vel_error_w = vel_w - self.vel_des
         
-        # 转换当前帧到 Body Frame: (N, 3, 3) @ (N, 3, 1) -> (N, 3)
+        # (N, 3, 3) @ (N, 3, 1) -> (N, 3)
         curr_pos_error_b = torch.bmm(rot_matrix_w2b, curr_pos_error_w.unsqueeze(-1)).squeeze(-1)
         curr_vel_error_b = torch.bmm(rot_matrix_w2b, curr_vel_error_w.unsqueeze(-1)).squeeze(-1)
 
-        # 3. 更新历史记录 (已经在 Body Frame 下的数据)
-        self.pos_error_b_history = torch.roll(self.pos_error_b_history, shifts=-1, dims=1)
-        self.vel_error_b_history = torch.roll(self.vel_error_b_history, shifts=-1, dims=1)
+        # 3. 更新积分项 (Accumulate Error)
+        # 简单的累加，相当于 Integral / dt。如果需要严格数学积分可以乘 dt，但对网络来说直接累加通常更数值稳定
+        self.pos_error_integral += curr_pos_error_b
+        self.vel_error_integral += curr_vel_error_b
+
+        # 4. 展平数据
+        rot_flat = rot_matrix_b2w.reshape(self.num_envs, 9)
         
-        self.pos_error_b_history[:, -1, :] = curr_pos_error_b
-        self.vel_error_b_history[:, -1, :] = curr_vel_error_b
-
-        # 4. 展平历史数据用于拼接 (N, T*3)
-        pos_error_flat = self.pos_error_b_history.reshape(self.num_envs, -1)
-        vel_error_flat = self.vel_error_b_history.reshape(self.num_envs, -1)
-
         # 5. 处理期望加速度和速度 (转到 Body Frame)
         acc_des_b = torch.bmm(rot_matrix_w2b, self.acc_des.unsqueeze(-1)).squeeze(-1)
         vel_des_b = torch.bmm(rot_matrix_w2b, self.vel_des.unsqueeze(-1)).squeeze(-1)
 
-        rot_flat = rot_matrix_b2w.reshape(self.num_envs, 9)
-
-        # 6. 拼接 Observation
+        # 6. 拼接 Observation (Total: 38 dims)
         obs_teacher = torch.cat([
-            pos_error_flat,             # 15
-            rot_flat,                   # 9
-            vel_error_flat,             # 15
-            ang_vel_b,                  # 3
-            self._last_actions,         # 4
-            acc_des_b,                  # 3 
-            vel_des_b,                  # 3 
-            self._current_motor_speeds, # 4
+            curr_pos_error_b,           # 3 (当前位置误差)
+            self.pos_error_integral,    # 3 (历史位置误差累积)
+            rot_flat,                   # 9 (旋转矩阵)
+            curr_vel_error_b,           # 3 (当前速度误差)
+            self.vel_error_integral,    # 3 (历史速度误差累积)
+            ang_vel_b,                  # 3 (角速度)
+            self._last_actions,         # 4 (上一帧动作)
+            acc_des_b,                  # 3 (期望加速度)
+            vel_des_b,                  # 3 (期望速度)
+            self._current_motor_speeds, # 4 (电机转速)
         ], dim=-1)
 
         obs_teacher = self.CHECK_NAN(obs_teacher, "Observation")
@@ -782,18 +775,10 @@ class QuadcopterEnv(DirectRLEnv):
             quat = torch.zeros(num_resets, 4, device=self.device)
             quat[:, 0] = 1.0
 
-        # 5. --- [核心优化] 初始化历史 Buffer (同步随机状态) ---
-        # 计算重置时刻的 Body-frame 旋转矩阵
-        rot_w2b = matrix_from_quat(quat).transpose(1, 2)
-        
-        # 初始世界误差：机器人位置(spawn+offset) - 目标(spawn) = offset
-        # 初始速度误差：机器人速度(lin_vel) - 目标速度(0) = lin_vel
-        initial_pos_err_b = torch.bmm(rot_w2b, pos_offset.unsqueeze(-1)).squeeze(-1)
-        initial_vel_err_b = torch.bmm(rot_w2b, lin_vel.unsqueeze(-1)).squeeze(-1)
-        
-        # 用当前的 Body 误差填满 5 帧历史
-        self.pos_error_b_history[env_ids] = initial_pos_err_b.unsqueeze(1).repeat(1, self.history_len, 1)
-        self.vel_error_b_history[env_ids] = initial_vel_err_b.unsqueeze(1).repeat(1, self.history_len, 1)
+        # 5. --- [修改] 重置积分项 ---
+        # 移除原来的 History Buffer 填充，直接清零积分项
+        self.pos_error_integral[env_ids] = 0.0
+        self.vel_error_integral[env_ids] = 0.0
 
         # 6. --- 任务类型分配 ---
         # 决定该环境运行 Langevin 轨迹还是固定/其他轨迹

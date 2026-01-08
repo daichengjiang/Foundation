@@ -744,8 +744,8 @@ class QuadcopterEnv(DirectRLEnv):
             curr_vel_error_b,             # 3
             ang_vel_b,                  # 3
             self._last_actions,         # 4
-            acc_des_b,                  # 3 
-            vel_des_b,                  # 3 
+            # acc_des_b,                  # 3 
+            # vel_des_b,                  # 3 
         ], dim=-1)
 
         # 7. 教师
