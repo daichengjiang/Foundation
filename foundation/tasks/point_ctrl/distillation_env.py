@@ -737,8 +737,19 @@ class QuadcopterEnv(DirectRLEnv):
         vel_des_b = torch.bmm(rot_matrix_w2b, self.vel_des.unsqueeze(-1)).squeeze(-1)
         rot_flat = rot_matrix_b2w.reshape(self.num_envs, 9)
 
-        # 6. 构造基础特征（公共部分，48维）
-        common_obs = torch.cat([
+        # 6. 学生
+        obs_student = torch.cat([
+            curr_pos_error_b,             # 3
+            rot_flat,                   # 9
+            curr_vel_error_b,             # 3
+            ang_vel_b,                  # 3
+            self._last_actions,         # 4
+            acc_des_b,                  # 3 
+            vel_des_b,                  # 3 
+        ], dim=-1)
+
+        # 7. 教师
+        obs_teacher = torch.cat([
             pos_error_flat,             # 15
             rot_flat,                   # 9
             vel_error_flat,             # 15
@@ -746,13 +757,8 @@ class QuadcopterEnv(DirectRLEnv):
             self._last_actions,         # 4
             acc_des_b,                  # 3 
             vel_des_b,                  # 3 
+            self._current_motor_speeds, # 4
         ], dim=-1)
-
-        # 7. 教师策略输入 (Common + Motor Speeds = 56维)
-        obs_teacher = torch.cat([common_obs, self._current_motor_speeds], dim=-1)
-
-        # 8. 学生策略输入 (仅 Common = 52维，即教师减去电机转速)
-        obs_student = common_obs
 
         obs_teacher = self.CHECK_NAN(obs_teacher, "Teacher Observation")
         obs_student = self.CHECK_NAN(obs_student, "Student Observation")
