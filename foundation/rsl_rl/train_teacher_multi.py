@@ -84,7 +84,7 @@ def run_training(teacher_id, dynamics, timestamp, gpu_id=0, csv_path="teacher_dy
         sys.executable, train_script,
         "--task", "teacher",
         "--num_envs", "4000",
-        "--max_iterations", "600",
+        "--max_iterations", "700",
         "--device", target_device,
         "--logger", "wandb",
         "--log_project_name", "Foundation",
@@ -223,7 +223,7 @@ if __name__ == "__main__":
             gpu_id=args.gpu_id,
             csv_path=csv_path,
             headless=args.headless,
-            reward_threshold=10000.0 # 设置阈值
+            reward_threshold=11000.0 # 设置阈值
         )
         
         if is_success:
