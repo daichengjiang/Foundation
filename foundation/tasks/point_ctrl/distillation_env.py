@@ -127,6 +127,12 @@ class QuadcopterSceneCfg(InteractiveSceneCfg):
 @configclass
 class QuadcopterEnvCfg(DirectRLEnvCfg):
 
+    teacher_observation_space = 38
+
+    student_observation_space = 22
+    # 设置 IsaacLab 默认观测空间（通常对应学生策略维度）
+    observation_space = student_observation_space 
+
     prob_null_trajectory = 0.5  # 50% 概率做定点控制
 
     # 轨迹类型选择: "langevin" 或 "figure8"
@@ -729,8 +735,6 @@ class QuadcopterEnv(DirectRLEnv):
             curr_vel_error_b,             # 3
             ang_vel_b,                  # 3
             self._last_actions,         # 4
-            # acc_des_b,                  # 3 
-            # vel_des_b,                  # 3 
         ], dim=-1)
 
         # 7. 教师

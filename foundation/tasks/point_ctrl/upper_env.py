@@ -37,7 +37,8 @@ import os
 
 from foundation.utils.train_terrain import MapGenerator
 from foundation.utils.raster import TerrainRasterMap
-from foundation.utils.px4_controller import PX4QuadrotorController
+from foundation.utils.simple_controller import SimpleQuadrotorController
+from rsl_rl.modules.student_teacher_recurrent_custom import StudentTeacherRecurrentCustom
 from enum import IntEnum
 import collections
 import itertools
@@ -141,21 +142,30 @@ class QuadcopterSceneCfg(InteractiveSceneCfg):
 @configclass
 class QuadcopterEnvCfg(DirectRLEnvCfg):
 
-    history_depth = 2
-    history_obs = 10
-
-    frame_observation_space = 3 + 9 + 2 + 1 + 1 + 4
+    frame_observation_space = 22  # 16状态 + 6动作
+    depth_size = 6000             # 100 * 60
+    
+    # 【修改这里】只保留当前帧维度
+    observation_space = frame_observation_space + depth_size # 结果为 6022
 
     gamma = 0.99
 
     episode_length_s = 96
     decimation = 1
 
+    # 低层网络架构参数 (必须与 distillation 训练时一致)
+    low_level_pre_rnn_dim = 16
+    low_level_rnn_hidden_dim = 16
+    low_level_post_rnn_dim = 16
+    low_level_student_hidden_dims = [256, 256, 128]
+    low_level_rnn_type = "gru"
+    low_level_activation = "elu"
+
     # 1.1 修改动作空间维度：从 4 (roll, pitch, yaw, thrust) 变为 6 (3 for delta_p, 3 for delta_v)
     action_space = 6 
     
     # 1.2 定义上层输出的物理缩放系数 (根据你的物理需求调整)
-    delta_p_scale = 1.0  # 假设输出动作 [-1, 1] 对应 +-1.0m
+    delta_p_scale = 5.0  # 假设输出动作 [-1, 1] 对应 +-1.0m
     delta_v_scale = 2.0  # 假设输出动作 [-1, 1] 对应 +-2.0m/s
     
     # 1.3 预训练下层控制器的路径
@@ -200,7 +210,7 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     cbf_safe_bound = 0.15
     cbf_eta = 0.1
 
-    max_vel = 3.0
+    max_vel = 1.0
 
     too_low = 0.0
     too_high = 2.0
@@ -217,7 +227,7 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     reward_coef_obstacle_collision_penalty: float = 100.0
     reward_coef_succeed_reward: float = 100.0
     reward_coef_alive_reward: float = 0.0
-    reward_coef_dijkstra = 10.0
+    reward_coef_dijkstra = 100.0
     reward_coef_cbf = 10.0
 
     ui_window_class_type = QuadcopterEnvWindow
@@ -286,7 +296,6 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
 
     depth_size = tiled_camera.width * tiled_camera.height
 
-    observation_space = frame_observation_space + history_obs * frame_observation_space + history_depth * depth_size
 
 class QuadcopterEnv(DirectRLEnv):
 
@@ -298,27 +307,6 @@ class QuadcopterEnv(DirectRLEnv):
         self.start_time = time.time()
 
         self.render_mode = "human"
-
-        att_p_gain = [10,10,10]
-        rate_p_gain = [20.0, 20.0, 20.0]
-        rate_i_gain =  [0.03,0.03,0.03]
-        rate_d_gain =  [0.0,0.0,0.0]
-        rate_k_gain = [0.0001, 0.0001, 0.0001]
-        rate_int_limit = [0.6, 0.6, 0.6]
-        att_rate_limit = [3.84, 3.84, 3.49]
-        att_yaw_weight = 0.4
-        self._controller = PX4QuadrotorController(
-            num_envs=self.num_envs,
-            device=self.device,
-            att_p_gain=torch.tensor(att_p_gain, device=self.device, dtype=torch.float32),
-            att_yaw_weight=torch.tensor(att_yaw_weight, device=self.device, dtype=torch.float32),
-            rate_p_gain=torch.tensor(rate_p_gain, device=self.device, dtype=torch.float32),
-            rate_i_gain=torch.tensor(rate_i_gain, device=self.device, dtype=torch.float32),
-            rate_d_gain=torch.tensor(rate_d_gain, device=self.device, dtype=torch.float32),
-            rate_k_gain=torch.tensor(rate_k_gain, device=self.device, dtype=torch.float32),
-            rate_int_limit=torch.tensor(rate_int_limit, device=self.device, dtype=torch.float32),
-            att_rate_limit=torch.tensor(att_rate_limit, device=self.device, dtype=torch.float32),
-        )
 
         self._actions = torch.zeros(self.num_envs, gym.spaces.flatdim(self.single_action_space), device=self.device)
         self._forces = torch.zeros(self.num_envs, 1, 3, device=self.device)
@@ -349,21 +337,14 @@ class QuadcopterEnv(DirectRLEnv):
 
         self._body_id = self._robot.find_bodies("body")[0]
         self._undesired_contact_body_ids, _ = self._contact_sensor.find_bodies("body")
-
-        self._obs_history = torch.zeros(self.num_envs, self.cfg.history_obs, self.cfg.frame_observation_space, device=self.device)
-        self._depth_history = torch.zeros(self.num_envs, self.cfg.history_depth, self.cfg.depth_size, device=self.device)
-
-        self._obs_history_clean = torch.zeros(self.num_envs, self.cfg.history_obs, self.cfg.frame_observation_space, device=self.device)
-        self._depth_history_clean = torch.zeros(self.num_envs, self.cfg.history_depth, self.cfg.depth_size, device=self.device)
-
         self._action_history_length = 8
         self._action_history = torch.zeros(self.num_envs, self._action_history_length, self.cfg.action_space, device=self.device)
         self._valid_mask = torch.zeros(
         self.num_envs, self._action_history_length, dtype=torch.bool, device=self.device
         )
-
+        
         self._last_pos_w = torch.zeros(self.num_envs, 3, device=self.device)
-        self._last_actions = torch.zeros(self.num_envs, 4, device=self.device)
+        self._last_actions = torch.zeros(self.num_envs, self.cfg.action_space, device=self.device)
         self._is_contact = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self._numerical_is_unstable = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self._is_success = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
@@ -423,15 +404,8 @@ class QuadcopterEnv(DirectRLEnv):
 
         self._calc_env_origins()
 
-        # 2.1 加载低层预训练网络 (通常是 TorchScript 格式)
-        if os.path.exists(self.cfg.low_level_model_path):
-            self.low_level_policy = torch.jit.load(self.cfg.low_level_model_path).to(self.device)
-            self.low_level_policy.eval() # 设为评估模式，关闭 Dropout 等
-            print(f"[INFO] Loaded low-level policy from {self.cfg.low_level_model_path}")
-        else:
-            raise FileNotFoundError(f"Low level model not found at {self.cfg.low_level_model_path}")
 
-        # 2.2 初始化 RAPTOR 动力学控制器
+        # 初始化 RAPTOR 动力学控制器
         # 构造参数张量
         mass_tensor = torch.full((self.num_envs,), self.cfg.mass, device=self.device)
         arm_l_tensor = torch.full((self.num_envs,), self.cfg.arm_length, device=self.device)
@@ -439,7 +413,7 @@ class QuadcopterEnv(DirectRLEnv):
         twr_tensor = torch.full((self.num_envs,), self.cfg.twr, device=self.device)
         kappa_tensor = torch.full((self.num_envs,), self.cfg.kappa, device=self.device)
 
-        self._raptor_controller = SimpleQuadrotorController(
+        self._down_controller = SimpleQuadrotorController(
             num_envs=self.num_envs,
             device=self.device,
             mass=mass_tensor,
@@ -452,6 +426,33 @@ class QuadcopterEnv(DirectRLEnv):
         # 2.3 初始化低层动作历史 (用于低层网络的输入)
         self._last_low_level_actions = torch.zeros(self.num_envs, 4, device=self.device)
 
+        # 2.1 实例化低层网络
+        # 注意：num_student_obs=22, num_teacher_obs 在推理阶段不重要，随便填
+        self.low_level_policy = StudentTeacherRecurrentCustom(
+            num_student_obs=22, 
+            num_teacher_obs=56, # 对应你 teacher_observation_space
+            num_actions=4,      # 电机数
+            student_hidden_dims=self.cfg.low_level_student_hidden_dims,
+            rnn_type=self.cfg.low_level_rnn_type,
+            rnn_hidden_dim=self.cfg.low_level_rnn_hidden_dim,
+            pre_rnn_dim=self.cfg.low_level_pre_rnn_dim,
+            post_rnn_dim=self.cfg.low_level_post_rnn_dim,
+            activation=self.cfg.low_level_activation
+        ).to(self.device)
+
+        # 2.2 使用 torch.load 加载权重字典
+        if os.path.exists(self.cfg.low_level_model_path):
+            checkpoint = torch.load(self.cfg.low_level_model_path, map_location=self.device)
+            # RSL-RL 的权重通常在 'model_state_dict' 键下
+            if 'model_state_dict' in checkpoint:
+                self.low_level_policy.load_state_dict(checkpoint['model_state_dict'], strict=False)
+            else:
+                self.low_level_policy.load_state_dict(checkpoint) # 兼容直接保存 state_dict 的情况
+            
+            self.low_level_policy.eval()
+            print(f"[INFO] Loaded low-level policy weights from {self.cfg.low_level_model_path}")
+        else:
+            raise FileNotFoundError(f"Model not found at {self.cfg.low_level_model_path}")
 
     def _print_depth_info(self, env_id=0, show_image=True):
 
@@ -649,47 +650,41 @@ class QuadcopterEnv(DirectRLEnv):
         self.sim.play()
 
     def _pre_physics_step(self, actions: torch.Tensor):
-        # actions 来自 RL 高层策略: [num_envs, 6], 范围 [-1, 1]
+        # 1. 解析上层动作
         actions = actions.clamp(-1.0, 1.0)
-        
-        # 1. 物理缩放
         delta_p_b = actions[:, :3] * self.cfg.delta_p_scale
         delta_v_b = actions[:, 3:6] * self.cfg.delta_v_scale
 
-        # 2. 获取低层网络所需的其他状态
-        # 旋转矩阵
+        # 2. 获取实时状态
         quat_w = self._robot.data.root_quat_w
-        rot_matrix_b2w = matrix_from_quat(quat_w)
-        rot_flat = rot_matrix_b2w.reshape(self.num_envs, 9)
-        # 角速度
+        rot_flat = matrix_from_quat(quat_w).reshape(self.num_envs, 9)
         ang_vel_b = self._robot.data.root_ang_vel_b
 
-        # 3. 组装低层策略输入
-        # 你的学生网络输入是: [pos_err_b(3), rot_flat(9), vel_err_b(3), ang_vel_b(3), last_actions(4)]
-        # 注意：这里的误差输入直接由高层策略决定
+        # 3. 组装低层输入 [22 维]
+        # 必须匹配 distillation_env.py 里的 obs_student 顺序
         low_level_obs = torch.cat([
-            delta_p_b,                  # 3 (作为位置误差输入)
+            delta_p_b,                  # 3
             rot_flat,                   # 9
-            delta_v_b,                  # 3 (作为速度误差输入)
+            delta_v_b,                  # 3
             ang_vel_b,                  # 3
-            self._last_low_level_actions # 4 (低层网络上一时刻的输出)
+            self._last_low_level_actions # 4
         ], dim=-1)
 
-        # 4. 推理低层策略
+        # 4. 执行低层策略 (带有 RNN 状态更新)
         with torch.no_grad():
-            # 输出是 4 个电机的归一化指令 [0, 1] (取决于你学生策略的激活函数)
-            motor_actions = self.low_level_policy(low_level_obs)
-            # 确保在 [0, 1] 范围内
-            motor_actions = motor_actions.clamp(0.0, 1.0)
+            # 调用 act_inference，它会自动处理 self.hidden_state 的读写
+            motor_actions = self.low_level_policy.act_inference(low_level_obs)
+            # 你的模型输出层带了 Tanh，所以范围是 (-1, 1)，需要映射到 (0, 1) 给 RAPTOR
+            motor_actions_mapped = (motor_actions + 1.0) * 0.5
+            motor_actions_mapped = motor_actions_mapped.clamp(0.0, 1.0)
 
-        # 5. 更新低层动作历史
-        self._last_low_level_actions = motor_actions.clone()
+        # 5. 更新历史
+        self._last_low_level_actions = motor_actions.detach().clone()
 
-        # 6. 通过 RAPTOR 控制器计算物理力和力矩
-        # motor_speeds_to_wrench 返回: force_b, torque_b
-        force_b, torque_b, _ = self._raptor_controller.motor_speeds_to_wrench(motor_actions)
+        # 6. 动力学计算
+        force_b, torque_b, _ = self._down_controller.motor_speeds_to_wrench(motor_actions_mapped)
 
-        # 7. 应用到仿真器
+        # 7. 施加力
         self._forces.zero_()
         self._torques.zero_()
         self._forces[:, 0, :] = force_b
@@ -701,7 +696,6 @@ class QuadcopterEnv(DirectRLEnv):
 
     def _get_observations(self) -> dict:
         perfect_depth_map_nhwc = self._tiled_camera.data.output["depth"]
-        perfect_depth_map_nchw = perfect_depth_map_nhwc.permute(0, 3, 1, 2)
         perfect_depth_map_nhw = perfect_depth_map_nhwc.squeeze(-1)
 
         if self.cfg.enable_actor_noise:
@@ -725,10 +719,6 @@ class QuadcopterEnv(DirectRLEnv):
         batch_size = final_noisy_map.shape[0]
         flat_noisy_depth = final_noisy_map.reshape(batch_size, -1)
         flat_perfect_depth = perfect_depth_map_nhw.reshape(batch_size, -1)
-
-        self._depth_history = torch.cat([self._depth_history[:, 1:], flat_noisy_depth.unsqueeze(dim=1)], dim=1)
-
-        self._depth_history_clean = torch.cat([self._depth_history_clean[:, 1:], flat_perfect_depth.unsqueeze(dim=1)], dim=1)
 
         pos_w_clean = self._robot.data.root_state_w[:, :3].clone()
         quat_w_clean = self._robot.data.root_quat_w.clone()
@@ -811,24 +801,19 @@ class QuadcopterEnv(DirectRLEnv):
             self._last_actions,
         ], dim=-1)
 
-        self._obs_history = torch.cat([
-            self._obs_history[:, 1:],
-            frame_obs_noisy.unsqueeze(dim=1)
-        ], dim=1)
+        # 1. 展平当前帧深度图 [6000]
+        flat_noisy_depth = final_noisy_map.reshape(self.num_envs, -1)
+        flat_perfect_depth = perfect_depth_map_nhw.reshape(self.num_envs, -1)
 
-        self._obs_history_clean = torch.cat([
-            self._obs_history_clean[:, 1:],
-            frame_obs_clean.unsqueeze(dim=1)
-        ], dim=1)
-
+        # 2. 拼接当前帧状态 [22] + 当前帧深度 [6000] = 6022
         actor_obs = torch.cat([
-            self._obs_history[:, -1].view(self.num_envs, -1),
-            self._depth_history[:, -1].view(self.num_envs, -1)
+            frame_obs_noisy,     # [num_envs, 22]
+            flat_noisy_depth     # [num_envs, 6000]
         ], dim=-1)
 
         critic_obs = torch.cat([
-            self._obs_history_clean[:, -1].view(self.num_envs, -1),
-            self._depth_history_clean[:, -1].view(self.num_envs, -1)
+            frame_obs_clean,     # [num_envs, 22]
+            flat_perfect_depth   # [num_envs, 6000]
         ], dim=-1)
 
         actor_obs = self.CHECK_NAN(actor_obs, "Actor Observation")
@@ -853,12 +838,12 @@ class QuadcopterEnv(DirectRLEnv):
         distance_reward = 10.0 * delta_distance
 
         act_abs = torch.abs(self._actions)
-        action_magnitude = torch.square(act_abs[:, 0]) + torch.square(act_abs[:, 1])
+        action_magnitude = torch.sum(torch.square(self._actions), dim=1)
         action_magnitude_penalty = -action_magnitude
 
         diff_actions = self._actions - self._last_actions
 
-        weights = torch.tensor([1.0, 2.0, 4.0, 1.0], device=self.device)
+        weights = torch.tensor([1.0, 1.0, 1.0, 0.5, 0.5, 0.5], device=self.device)
         diff_actions_weighted = diff_actions * weights
         action_change_penalty = - (diff_actions_weighted ** 2).sum(dim=1)
 
@@ -1076,7 +1061,7 @@ class QuadcopterEnv(DirectRLEnv):
 
         super()._reset_idx(env_ids)
 
-        self._actions[env_ids] = torch.zeros(4, device=self.device)
+        self._actions[env_ids] = torch.zeros(self.cfg.action_space, device=self.device)
         self._action_history[env_ids] = 0.0
         self._valid_mask[env_ids] = False
 
@@ -1225,24 +1210,23 @@ class QuadcopterEnv(DirectRLEnv):
         self._robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
 
         self._last_pos_w[env_ids] = default_root_state[:, :3]
-        self._last_actions[env_ids] = torch.zeros(4, device=self.device)
+        self._last_actions[env_ids] = torch.zeros(self.cfg.action_space, device=self.device)
         self._is_contact[env_ids] = False
         self._numerical_is_unstable[env_ids] = False
         self._is_success[env_ids] = False
 
-        self._obs_history[env_ids] = torch.zeros(self.cfg.history_obs, self.cfg.frame_observation_space, device=self.device)
-        self._depth_history[env_ids] = torch.zeros(self.cfg.history_depth, self.cfg.depth_size, device=self.device)
-
-        self._obs_history_clean[env_ids] = torch.zeros(self.cfg.history_obs, self.cfg.frame_observation_space, device=self.device)
-        self._depth_history_clean[env_ids] = torch.zeros(self.cfg.history_depth, self.cfg.depth_size, device=self.device)
-
         self._episode_outcomes[env_ids] = 0
-        self._controller.reset(env_ids)
 
         if (time.time() - self._map_generation_timer) > 3600 * 24 * 10:
             self._calc_env_origins()
             self._regenerate_terrain()
             self._map_generation_timer = time.time()
+
+        # [重要] 重置低层网络的隐状态
+        # 构造一个 dones 掩码传给模型的 reset 方法
+        low_level_dones = torch.zeros(self.num_envs, device=self.device)
+        low_level_dones[env_ids] = 1.0
+        self.low_level_policy.reset(dones=low_level_dones)
 
     def _set_debug_vis_impl(self, debug_vis: bool):
 
