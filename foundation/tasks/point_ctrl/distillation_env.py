@@ -700,9 +700,6 @@ class QuadcopterEnv(DirectRLEnv):
         self._torques.zero_()
         self._forces[:, 0, :] = force_b
         self._torques[:, 0, :] = torque_b
-        
-        self._robot.set_external_force_and_torque(self._forces, self._torques, body_ids=self._body_id)
-
 
     def _apply_action(self):
         """Apply thrust/moment to the quadcopter."""

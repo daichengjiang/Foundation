@@ -150,7 +150,25 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
 
     episode_length_s = 96
     decimation = 1
-    action_space = 4
+
+    # 1.1 修改动作空间维度：从 4 (roll, pitch, yaw, thrust) 变为 6 (3 for delta_p, 3 for delta_v)
+    action_space = 6 
+    
+    # 1.2 定义上层输出的物理缩放系数 (根据你的物理需求调整)
+    delta_p_scale = 1.0  # 假设输出动作 [-1, 1] 对应 +-1.0m
+    delta_v_scale = 2.0  # 假设输出动作 [-1, 1] 对应 +-2.0m/s
+    
+    # 1.3 预训练下层控制器的路径
+    low_level_model_path = "./models/low_level_policy.pt"
+    
+    # 1.4 无人机动力学参数（需与低层训练时一致）
+    # 如果是 Crazyflie
+    mass = 0.049 
+    arm_length = 0.046 # 约 46mm
+    inertia = (1.3615e-5, 1.3615e-5, 3.257e-5)
+    twr = 2.0
+    kappa = 0.016
+
     state_space = 0
 
     grid_rows = 10
@@ -405,6 +423,36 @@ class QuadcopterEnv(DirectRLEnv):
 
         self._calc_env_origins()
 
+        # 2.1 加载低层预训练网络 (通常是 TorchScript 格式)
+        if os.path.exists(self.cfg.low_level_model_path):
+            self.low_level_policy = torch.jit.load(self.cfg.low_level_model_path).to(self.device)
+            self.low_level_policy.eval() # 设为评估模式，关闭 Dropout 等
+            print(f"[INFO] Loaded low-level policy from {self.cfg.low_level_model_path}")
+        else:
+            raise FileNotFoundError(f"Low level model not found at {self.cfg.low_level_model_path}")
+
+        # 2.2 初始化 RAPTOR 动力学控制器
+        # 构造参数张量
+        mass_tensor = torch.full((self.num_envs,), self.cfg.mass, device=self.device)
+        arm_l_tensor = torch.full((self.num_envs,), self.cfg.arm_length, device=self.device)
+        inertia_tensor = torch.tensor(self.cfg.inertia, device=self.device).repeat(self.num_envs, 1)
+        twr_tensor = torch.full((self.num_envs,), self.cfg.twr, device=self.device)
+        kappa_tensor = torch.full((self.num_envs,), self.cfg.kappa, device=self.device)
+
+        self._raptor_controller = SimpleQuadrotorController(
+            num_envs=self.num_envs,
+            device=self.device,
+            mass=mass_tensor,
+            arm_length=arm_l_tensor,
+            inertia=inertia_tensor,
+            thrust_to_weight=twr_tensor,
+            moment_scale=kappa_tensor
+        )
+
+        # 2.3 初始化低层动作历史 (用于低层网络的输入)
+        self._last_low_level_actions = torch.zeros(self.num_envs, 4, device=self.device)
+
+
     def _print_depth_info(self, env_id=0, show_image=True):
 
         depth_image = self._tiled_camera.data.output["depth"]
@@ -601,58 +649,51 @@ class QuadcopterEnv(DirectRLEnv):
         self.sim.play()
 
     def _pre_physics_step(self, actions: torch.Tensor):
+        # actions 来自 RL 高层策略: [num_envs, 6], 范围 [-1, 1]
         actions = actions.clamp(-1.0, 1.0)
-        actions[:, 3] = (actions[:, 3] + 1.0) * 0.5
+        
+        # 1. 物理缩放
+        delta_p_b = actions[:, :3] * self.cfg.delta_p_scale
+        delta_v_b = actions[:, 3:6] * self.cfg.delta_v_scale
 
-        if not hasattr(self, "_action_history"):
-            self._action_history_length = 8
-            self._action_history = torch.zeros(
-                self.num_envs, self._action_history_length, self.cfg.action_space, device=self.device
-            )
+        # 2. 获取低层网络所需的其他状态
+        # 旋转矩阵
+        quat_w = self._robot.data.root_quat_w
+        rot_matrix_b2w = matrix_from_quat(quat_w)
+        rot_flat = rot_matrix_b2w.reshape(self.num_envs, 9)
+        # 角速度
+        ang_vel_b = self._robot.data.root_ang_vel_b
 
-        self._action_history = torch.roll(self._action_history, shifts=-1, dims=1)
-        self._valid_mask = torch.roll(self._valid_mask, shifts=-1, dims=1)
-        self._action_history[:, -1, :] = actions.clone()
-        self._valid_mask[:, -1] = True
+        # 3. 组装低层策略输入
+        # 你的学生网络输入是: [pos_err_b(3), rot_flat(9), vel_err_b(3), ang_vel_b(3), last_actions(4)]
+        # 注意：这里的误差输入直接由高层策略决定
+        low_level_obs = torch.cat([
+            delta_p_b,                  # 3 (作为位置误差输入)
+            rot_flat,                   # 9
+            delta_v_b,                  # 3 (作为速度误差输入)
+            ang_vel_b,                  # 3
+            self._last_low_level_actions # 4 (低层网络上一时刻的输出)
+        ], dim=-1)
 
-        window_start = random.randint(-8, -8)
-        window_end = window_start + 7
-        sel_actions = self._action_history[:, window_start:window_end, :]
-        sel_mask     = self._valid_mask[:, window_start:window_end]
-        counts      = sel_mask.sum(dim=1).unsqueeze(-1)
-        sum_actions = (sel_actions * sel_mask.unsqueeze(-1)).sum(dim=1)
-        mean_action = torch.where(
-            counts > 0,
-            sum_actions / counts.clamp_min(1),
-            actions
-        )
-        self._actions = mean_action.clone()
-        max_roll = math.radians(45.0)
-        max_pitch = math.radians(45.0)
-        max_yaw = math.radians(180.0)
-        max_thrust = 0.8563843456
+        # 4. 推理低层策略
+        with torch.no_grad():
+            # 输出是 4 个电机的归一化指令 [0, 1] (取决于你学生策略的激活函数)
+            motor_actions = self.low_level_policy(low_level_obs)
+            # 确保在 [0, 1] 范围内
+            motor_actions = motor_actions.clamp(0.0, 1.0)
 
-        cmd = mean_action.clone()
-        cmd[:, 0] = cmd[:, 0] * max_roll
-        cmd[:, 1] = cmd[:, 1] * max_pitch
-        cmd[:, 2] = cmd[:, 2] * max_yaw
-        cmd[:, 3] = cmd[:, 3]
+        # 5. 更新低层动作历史
+        self._last_low_level_actions = motor_actions.clone()
 
-        cur_state = self._robot.data.root_state_w.clone()
+        # 6. 通过 RAPTOR 控制器计算物理力和力矩
+        # motor_speeds_to_wrench 返回: force_b, torque_b
+        force_b, torque_b, _ = self._raptor_controller.motor_speeds_to_wrench(motor_actions)
 
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        force, torque, _, info = self._controller.compute_control(cur_state, cmd, self.step_dt, mode="attitude")
-        self.px4info = info
-        self.ctrl_info = info
-        end.record()
-        torch.cuda.synchronize()
-
+        # 7. 应用到仿真器
         self._forces.zero_()
         self._torques.zero_()
-        self._forces[:, 0, 2] = force[:, 2]
-        self._torques[:, 0, :] = torque
+        self._forces[:, 0, :] = force_b
+        self._torques[:, 0, :] = torque_b
 
     def _apply_action(self):
 
@@ -1038,6 +1079,12 @@ class QuadcopterEnv(DirectRLEnv):
         self._actions[env_ids] = torch.zeros(4, device=self.device)
         self._action_history[env_ids] = 0.0
         self._valid_mask[env_ids] = False
+
+        # 重置低层动作记录
+        if env_ids is None:
+            self._last_low_level_actions.zero_()
+        else:
+            self._last_low_level_actions[env_ids] = 0.0
 
         self._desired_pos_w[env_ids, :2] = torch.zeros_like(self._desired_pos_w[env_ids, :2])
 
