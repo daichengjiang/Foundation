@@ -126,14 +126,6 @@ class QuadcopterSceneCfg(InteractiveSceneCfg):
 
 @configclass
 class QuadcopterEnvCfg(DirectRLEnvCfg):
-    # 历史(15+15) + 旋转(9) + 角速度(3) + 上次动作(4) + 期望加速度(3) + 期望速度(3) + 电机转速(4) = 56
-    teacher_observation_space = 56
-    # 学生策略 = 教师策略 - 电机转速(4) = 52
-    student_observation_space = 52
-    # 设置 IsaacLab 默认观测空间（通常对应学生策略维度）
-    observation_space = student_observation_space 
-    
-    history_len = 5  # 对应 teacher_env 的 5 帧历史
 
     prob_null_trajectory = 0.5  # 50% 概率做定点控制
 
@@ -229,10 +221,9 @@ class QuadcopterEnv(DirectRLEnv):
         self.motor_tau_up_tensor = torch.zeros(self.num_envs, 1, device=self.device)
         self.motor_tau_down_tensor = torch.zeros(self.num_envs, 1, device=self.device)
         self.kappa_tensor = torch.zeros(self.num_envs, device=self.device)
-        # --- 新增：历史 Buffer ---
-        self.history_len = self.cfg.history_len
-        self.pos_error_b_history = torch.zeros(self.num_envs, self.history_len, 3, device=self.device)
-        self.vel_error_b_history = torch.zeros(self.num_envs, self.history_len, 3, device=self.device)
+
+        self.pos_error_integral = torch.zeros(self.num_envs, 3, device=self.device)
+        self.vel_error_integral = torch.zeros(self.num_envs, 3, device=self.device)
 
         if self.cfg.dynamics.multi_teacher_params is not None:
             teacher_params_list = self.cfg.dynamics.multi_teacher_params
@@ -512,52 +503,52 @@ class QuadcopterEnv(DirectRLEnv):
         self.pos_des[env_ids] = pos_next
 
     def _generate_desired_trajectory_figure8(self, env_ids: torch.Tensor = None):
-            if env_ids is None: env_ids = torch.arange(self.num_envs, device=self.device)
-            n_envs = len(env_ids)
-            
-            self._figure8_time[env_ids] += self.dt
-            t = self._figure8_time[env_ids]
-            
-            # Recentering logic
-            needs_recenter = (t >= self._figure8_warmup_duration) & (~self._traj_origin_adjusted[env_ids])
-            if needs_recenter.any():
-                recenter_idx = env_ids[needs_recenter]
-                curr_pos = self._robot.data.root_pos_w[recenter_idx].clone()
-                self._spawn_pos_w[recenter_idx] = curr_pos
-                self.pos_des[recenter_idx] = curr_pos
-                self._traj_origin_adjusted[recenter_idx] = True
+        if env_ids is None: env_ids = torch.arange(self.num_envs, device=self.device)
+        n_envs = len(env_ids)
+        
+        self._figure8_time[env_ids] += self.dt
+        t = self._figure8_time[env_ids]
+        
+        # Recentering logic
+        needs_recenter = (t >= self._figure8_warmup_duration) & (~self._traj_origin_adjusted[env_ids])
+        if needs_recenter.any():
+            recenter_idx = env_ids[needs_recenter]
+            curr_pos = self._robot.data.root_pos_w[recenter_idx].clone()
+            self._spawn_pos_w[recenter_idx] = curr_pos
+            self.pos_des[recenter_idx] = curr_pos
+            self._traj_origin_adjusted[recenter_idx] = True
 
-            in_warmup = t < self._figure8_warmup_duration
-            active_mask = ~in_warmup
-            active_env_ids = env_ids[active_mask]
+        in_warmup = t < self._figure8_warmup_duration
+        active_mask = ~in_warmup
+        active_env_ids = env_ids[active_mask]
+        
+        if len(active_env_ids) > 0:
+            omega = 2 * math.pi * self._figure8_frequency
+            spawn = self._spawn_pos_w[active_env_ids] # 只取活跃环境的出生点
+            t_adj = t[active_mask] - self._figure8_warmup_duration # 只取活跃环境的时间
             
-            if len(active_env_ids) > 0:
-                omega = 2 * math.pi * self._figure8_frequency
-                spawn = self._spawn_pos_w[active_env_ids] # 只取活跃环境的出生点
-                t_adj = t[active_mask] - self._figure8_warmup_duration # 只取活跃环境的时间
-                
-                # --- 修正：补全 pos_des_new ---
-                x_rel = self._figure8_scale_x * torch.sin(omega * t_adj)
-                y_rel = self._figure8_scale_y * torch.sin(2 * omega * t_adj)
-                z_target = spawn[:, 2] 
-                pos_des_new = torch.stack([spawn[:, 0] + x_rel, spawn[:, 1] + y_rel, z_target], dim=1)
-                
-                # 速度
-                vx = self._figure8_scale_x * omega * torch.cos(omega * t_adj)
-                vy = self._figure8_scale_y * 2 * omega * torch.cos(2 * omega * t_adj)
-                vz = torch.zeros_like(vx)
-                vel_des_new = torch.stack([vx, vy, vz], dim=1)
+            # --- 修正：补全 pos_des_new ---
+            x_rel = self._figure8_scale_x * torch.sin(omega * t_adj)
+            y_rel = self._figure8_scale_y * torch.sin(2 * omega * t_adj)
+            z_target = spawn[:, 2] 
+            pos_des_new = torch.stack([spawn[:, 0] + x_rel, spawn[:, 1] + y_rel, z_target], dim=1)
+            
+            # 速度
+            vx = self._figure8_scale_x * omega * torch.cos(omega * t_adj)
+            vy = self._figure8_scale_y * 2 * omega * torch.cos(2 * omega * t_adj)
+            vz = torch.zeros_like(vx)
+            vel_des_new = torch.stack([vx, vy, vz], dim=1)
 
-                # 加速度
-                ax = -self._figure8_scale_x * (omega**2) * torch.sin(omega * t_adj)
-                ay = -self._figure8_scale_y * (4 * omega**2) * torch.sin(2 * omega * t_adj)
-                az = torch.zeros_like(ax)
-                acc_des_new = torch.stack([ax, ay, az], dim=1)
-                
-                # 赋值
-                self.pos_des[active_env_ids] = pos_des_new
-                self.vel_des[active_env_ids] = vel_des_new
-                self.acc_des[active_env_ids] = acc_des_new
+            # 加速度
+            ax = -self._figure8_scale_x * (omega**2) * torch.sin(omega * t_adj)
+            ay = -self._figure8_scale_y * (4 * omega**2) * torch.sin(2 * omega * t_adj)
+            az = torch.zeros_like(ax)
+            acc_des_new = torch.stack([ax, ay, az], dim=1)
+            
+            # 赋值
+            self.pos_des[active_env_ids] = pos_des_new
+            self.vel_des[active_env_ids] = vel_des_new
+            self.acc_des[active_env_ids] = acc_des_new
     def _calc_env_origins(self):
         robots_per_env = self.cfg.robots_per_env
         num_groups = self.num_envs // robots_per_env + 1
@@ -589,81 +580,81 @@ class QuadcopterEnv(DirectRLEnv):
             self.grid_idx[grid_linear_idx].append(env_id)
 
     def _setup_scene(self):
-            """Create and clone the environment scene."""
-            # 1. Set up the robot articulation
-            self._robot = Articulation(self.cfg.robot)
-            
-            # 2. Clone the scene (Create N environments)
-            self.scene.clone_environments(copy_from_source=False)
-            
-            # 3. Register articulation to scene
-            self.scene.articulations["robot"] = self._robot
+        """Create and clone the environment scene."""
+        # 1. Set up the robot articulation
+        self._robot = Articulation(self.cfg.robot)
+        
+        # 2. Clone the scene (Create N environments)
+        self.scene.clone_environments(copy_from_source=False)
+        
+        # 3. Register articulation to scene
+        self.scene.articulations["robot"] = self._robot
 
-            # 4. Find all robot prim paths
-            robot_prims = find_matching_prim_paths("/World/envs/env_.*/Robot")
+        # 4. Find all robot prim paths
+        robot_prims = find_matching_prim_paths("/World/envs/env_.*/Robot")
 
-            if len(robot_prims) == 0:
-                print("[ERROR] No robot prims found! Check your prim_path regex in the config.")
-                return
+        if len(robot_prims) == 0:
+            print("[ERROR] No robot prims found! Check your prim_path regex in the config.")
+            return
 
-            # ================= [DEBUG START: 应用多教师动力学参数到 PhysX] =================
-            print(f"\n{'='*20} [Dynamics Setup] {'='*20}")
-            print(f"Num Envs: {self.num_envs}")
+        # ================= [DEBUG START: 应用多教师动力学参数到 PhysX] =================
+        print(f"\n{'='*20} [Dynamics Setup] {'='*20}")
+        print(f"Num Envs: {self.num_envs}")
+        
+        # 准备参数
+        has_multi_teachers = self.cfg.dynamics.multi_teacher_params is not None
+        if has_multi_teachers:
+            teacher_params = self.cfg.dynamics.multi_teacher_params
+            num_teachers = len(teacher_params)
+            envs_per_teacher = self.num_envs // num_teachers
+            print(f"Applying params from {num_teachers} teachers...")
+        else:
+            print("Applying single teacher params...")
+
+        # 遍历所有环境，修改底层 USD/PhysX 属性
+        for i, prim_path in enumerate(robot_prims):
+            body_path = f"{prim_path}/body"
             
-            # 准备参数
-            has_multi_teachers = self.cfg.dynamics.multi_teacher_params is not None
+            # 确定当前环境使用哪一套参数
             if has_multi_teachers:
-                teacher_params = self.cfg.dynamics.multi_teacher_params
-                num_teachers = len(teacher_params)
-                envs_per_teacher = self.num_envs // num_teachers
-                print(f"Applying params from {num_teachers} teachers...")
+                # 计算 teacher id
+                # 防止溢出 (e.g., if envs aren't perfectly divisible)
+                t_id = min(i // envs_per_teacher, num_teachers - 1)
+                params = teacher_params[t_id]
+                
+                mass_val = params['mass']
+                inertia_val = params['inertia']
             else:
-                print("Applying single teacher params...")
+                mass_val = self.cfg.dynamics.mass
+                inertia_val = self.cfg.dynamics.inertia
+            
+            # --- 将配置写入底层 PhysX ---
+            # 1. 修改质量
+            prims_utils.set_prim_property(body_path, "physics:mass", mass_val)
+            # 2. 修改惯性张量 (Isaac Sim 接受 (Ixx, Iyy, Izz) 对角形式)
+            prims_utils.set_prim_property(body_path, "physics:diagonalInertia", inertia_val)
+            # 3. 强制重心
+            prims_utils.set_prim_property(body_path, "physics:centerOfMass", (0.0, 0.0, 0.0))
 
-            # 遍历所有环境，修改底层 USD/PhysX 属性
-            for i, prim_path in enumerate(robot_prims):
-                body_path = f"{prim_path}/body"
-                
-                # 确定当前环境使用哪一套参数
-                if has_multi_teachers:
-                    # 计算 teacher id
-                    # 防止溢出 (e.g., if envs aren't perfectly divisible)
-                    t_id = min(i // envs_per_teacher, num_teachers - 1)
-                    params = teacher_params[t_id]
-                    
-                    mass_val = params['mass']
-                    inertia_val = params['inertia']
-                else:
-                    mass_val = self.cfg.dynamics.mass
-                    inertia_val = self.cfg.dynamics.inertia
-                
-                # --- 将配置写入底层 PhysX ---
-                # 1. 修改质量
-                prims_utils.set_prim_property(body_path, "physics:mass", mass_val)
-                # 2. 修改惯性张量 (Isaac Sim 接受 (Ixx, Iyy, Izz) 对角形式)
-                prims_utils.set_prim_property(body_path, "physics:diagonalInertia", inertia_val)
-                # 3. 强制重心
-                prims_utils.set_prim_property(body_path, "physics:centerOfMass", (0.0, 0.0, 0.0))
+            # --- 设置可见性 ---
+            if self.cfg.robot_vis:
+                prims_utils.set_prim_property(prim_path, "visibility", "visible")
+            else:
+                prims_utils.set_prim_property(prim_path, "visibility", "invisible")
 
-                # --- 设置可见性 ---
-                if self.cfg.robot_vis:
-                    prims_utils.set_prim_property(prim_path, "visibility", "visible")
-                else:
-                    prims_utils.set_prim_property(prim_path, "visibility", "invisible")
+            # --- 抽样检查 (Read-back Verification) ---
+            if i == 0 or (has_multi_teachers and i % envs_per_teacher == 0 and i < self.num_envs):
+                actual_mass_usd = prims_utils.get_prim_property(body_path, "physics:mass")
+                print(f"[Env {i}] Teacher ID: {t_id if has_multi_teachers else 0} | Set Mass: {mass_val:.4f} | PhysX Read: {actual_mass_usd:.4f}")
 
-                # --- 抽样检查 (Read-back Verification) ---
-                if i == 0 or (has_multi_teachers and i % envs_per_teacher == 0 and i < self.num_envs):
-                    actual_mass_usd = prims_utils.get_prim_property(body_path, "physics:mass")
-                    print(f"[Env {i}] Teacher ID: {t_id if has_multi_teachers else 0} | Set Mass: {mass_val:.4f} | PhysX Read: {actual_mass_usd:.4f}")
+        print(f"{'='*60}\n")
+        # ================= [DEBUG END] =================
 
-            print(f"{'='*60}\n")
-            # ================= [DEBUG END] =================
+        # 5. Add lights
+        light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
+        light_cfg.func("/World/Light", light_cfg)
 
-            # 5. Add lights
-            light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
-            light_cfg.func("/World/Light", light_cfg)
-
-            self._map_generation_timer = 0
+        self._map_generation_timer = 0
 
     def _pre_physics_step(self, actions: torch.Tensor):
 
@@ -722,20 +713,17 @@ class QuadcopterEnv(DirectRLEnv):
         curr_pos_error_b = torch.bmm(rot_matrix_w2b, (pos_w - self.pos_des).unsqueeze(-1)).squeeze(-1)
         curr_vel_error_b = torch.bmm(rot_matrix_w2b, (vel_w - self.vel_des).unsqueeze(-1)).squeeze(-1)
 
-        # 3. 更新历史 Buffer (Rolling window)
-        self.pos_error_b_history = torch.roll(self.pos_error_b_history, shifts=-1, dims=1)
-        self.vel_error_b_history = torch.roll(self.vel_error_b_history, shifts=-1, dims=1)
-        self.pos_error_b_history[:, -1, :] = curr_pos_error_b
-        self.vel_error_b_history[:, -1, :] = curr_vel_error_b
+        # 3. 更新积分项 (Accumulate Error)
+        # 简单的累加，相当于 Integral / dt。如果需要严格数学积分可以乘 dt，但对网络来说直接累加通常更数值稳定
+        self.pos_error_integral += curr_pos_error_b
+        self.vel_error_integral += curr_vel_error_b
 
-        # 4. 展平历史数据
-        pos_error_flat = self.pos_error_b_history.reshape(self.num_envs, -1) # (N, 15)
-        vel_error_flat = self.vel_error_b_history.reshape(self.num_envs, -1) # (N, 15)
+        # 4. 展平数据
+        rot_flat = rot_matrix_b2w.reshape(self.num_envs, 9)
 
         # 5. 处理期望量（转到机体系）
         acc_des_b = torch.bmm(rot_matrix_w2b, self.acc_des.unsqueeze(-1)).squeeze(-1)
         vel_des_b = torch.bmm(rot_matrix_w2b, self.vel_des.unsqueeze(-1)).squeeze(-1)
-        rot_flat = rot_matrix_b2w.reshape(self.num_envs, 9)
 
         # 6. 学生
         obs_student = torch.cat([
@@ -750,14 +738,16 @@ class QuadcopterEnv(DirectRLEnv):
 
         # 7. 教师
         obs_teacher = torch.cat([
-            pos_error_flat,             # 15
-            rot_flat,                   # 9
-            vel_error_flat,             # 15
-            ang_vel_b,                  # 3
-            self._last_actions,         # 4
-            acc_des_b,                  # 3 
-            vel_des_b,                  # 3 
-            self._current_motor_speeds, # 4
+            curr_pos_error_b,           # 3 (当前位置误差)
+            self.pos_error_integral,    # 3 (历史位置误差累积)
+            rot_flat,                   # 9 (旋转矩阵)
+            curr_vel_error_b,           # 3 (当前速度误差)
+            self.vel_error_integral,    # 3 (历史速度误差累积)
+            ang_vel_b,                  # 3 (角速度)
+            self._last_actions,         # 4 (上一帧动作)
+            acc_des_b,                  # 3 (期望加速度)
+            vel_des_b,                  # 3 (期望速度)
+            self._current_motor_speeds, # 4 (电机转速)
         ], dim=-1)
 
         obs_teacher = self.CHECK_NAN(obs_teacher, "Teacher Observation")
@@ -948,13 +938,9 @@ class QuadcopterEnv(DirectRLEnv):
         self.vel_des[env_ids] = 0.0
         self.acc_des[env_ids] = 0.0
         
-        # 转换到机体系并填充 5 帧历史
-        rot_w2b_init = matrix_from_quat(quat).transpose(1, 2)
-        initial_pos_err_b = torch.bmm(rot_w2b_init, pos_offset.unsqueeze(-1)).squeeze(-1)
-        initial_vel_err_b = torch.bmm(rot_w2b_init, lin_vel.unsqueeze(-1)).squeeze(-1)
-        
-        self.pos_error_b_history[env_ids] = initial_pos_err_b.unsqueeze(1).repeat(1, self.history_len, 1)
-        self.vel_error_b_history[env_ids] = initial_vel_err_b.unsqueeze(1).repeat(1, self.history_len, 1)
+        # 重置积分项
+        self.pos_error_integral[env_ids] = 0.0
+        self.vel_error_integral[env_ids] = 0.0
 
         # --- 4. 写入物理仿真器 ---
         root_state = self._robot.data.default_root_state[env_ids].clone()
