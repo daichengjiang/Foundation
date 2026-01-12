@@ -154,10 +154,11 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     decimation = 1
 
     # 低层网络架构参数 (必须与 distillation 训练时一致)
-    low_level_pre_rnn_dim = 16
     low_level_rnn_hidden_dim = 16
+    low_level_rnn_num_layers = 1
+    low_level_pre_rnn_dim = 16
     low_level_post_rnn_dim = 16
-    low_level_student_hidden_dims = [256, 256, 128]
+    low_level_student_hidden_dims = []
     low_level_rnn_type = "gru"
     low_level_activation = "elu"
 
@@ -227,7 +228,7 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     reward_coef_obstacle_collision_penalty: float = 100.0
     reward_coef_succeed_reward: float = 100.0
     reward_coef_alive_reward: float = 0.0
-    reward_coef_dijkstra = 100.0
+    reward_coef_dijkstra = 10.0
     reward_coef_cbf = 10.0
 
     ui_window_class_type = QuadcopterEnvWindow
@@ -435,6 +436,7 @@ class QuadcopterEnv(DirectRLEnv):
             student_hidden_dims=self.cfg.low_level_student_hidden_dims,
             rnn_type=self.cfg.low_level_rnn_type,
             rnn_hidden_dim=self.cfg.low_level_rnn_hidden_dim,
+            rnn_num_layers=self.cfg.low_level_rnn_num_layers,
             pre_rnn_dim=self.cfg.low_level_pre_rnn_dim,
             post_rnn_dim=self.cfg.low_level_post_rnn_dim,
             activation=self.cfg.low_level_activation
