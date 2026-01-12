@@ -16,7 +16,7 @@ class QuadcopterTeacherRunnerCfg(RslRlOnPolicyRunnerCfg):
     num_steps_per_env = 256
     max_iterations = 5000
     save_interval = 25
-    experiment_name = "point_ctrl_direct"
+    experiment_name = "single_teacher"
     empirical_normalization = True
     policy = RslRlPpoActorCriticCfg(
         init_noise_std=1.0,
@@ -45,7 +45,7 @@ class QuadcopterUpperRunnerCfg(RslRlOnPolicyRunnerCfg):
     num_steps_per_env = 128
     max_iterations = 5000
     save_interval = 25
-    experiment_name = "point_ctrl_direct"
+    experiment_name = "upper"
     empirical_normalization = True
     policy = RslRlPpoActorCriticCfg(
         init_noise_std=1.0,
