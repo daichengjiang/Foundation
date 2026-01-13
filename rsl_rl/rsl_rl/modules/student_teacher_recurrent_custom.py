@@ -228,7 +228,7 @@ class StudentTeacherRecurrentCustom(StudentTeacher):
         
         return actions, new_hidden_states
 
-    # Keep compatibility with existing code
+    # 单教师时需要用来获取教师动作，故加tanh
     def evaluate(self, teacher_observations):
         # return super().evaluate(teacher_observations)
 

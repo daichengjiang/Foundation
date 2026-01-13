@@ -194,7 +194,7 @@ if __name__ == "__main__":
     else:
         batch_timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
-    log_root_dir = os.path.join("logs", "rsl_rl", "raptor_teachers", batch_timestamp)
+    log_root_dir = os.path.join("logs", "rsl_rl", "multi_teachers", batch_timestamp)
     os.makedirs(log_root_dir, exist_ok=True)
     csv_path = os.path.join(log_root_dir, "teacher_dynamics.csv")
 
