@@ -76,39 +76,6 @@ torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.benchmark = False
 
 
-class ProxyNormalizer(nn.Module):
-    """
-    代理 Normalizer。
-    在 forward 时表现为 Identity (不做处理)，
-    但在 state_dict/load_state_dict 时指向真正的 Policy 内部 Normalizer。
-    这样可以欺骗 Runner 保存 Policy 内部的 Normalizer 参数。
-    """
-    def __init__(self, real_normalizer):
-        super().__init__()
-        self.real_normalizer = real_normalizer
-    
-    def forward(self, x):
-        # 直接返回原始数据，不进行归一化
-        # 归一化逻辑已移至 Policy 内部
-        return x
-    
-    def state_dict(self, destination=None, prefix='', keep_vars=False):
-        return self.real_normalizer.state_dict(destination, prefix, keep_vars)
-    
-    def load_state_dict(self, state_dict, strict=True):
-        return self.real_normalizer.load_state_dict(state_dict, strict)
-    
-    def train(self, mode=True):
-        # 这里的 mode 切换虽然会被 Runner 调用，
-        # 但真正的 Normalizer mode 切换由 Policy.train() 统一管理更为稳妥。
-        # 不过为了兼容性，也可以透传。
-        self.real_normalizer.train(mode)
-        return self
-        
-    def eval(self):
-        self.real_normalizer.eval()
-        return self
-
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg):
     """Train with RSL-RL agent."""
@@ -147,7 +114,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     teacher_params_list = []
     loaded_teachers_state_dicts = []
-    teacher_offsets_list = []  # [新增] 存储每个教师的稳态误差
     
     csv_path = os.path.join(args_cli.teacher_dir, "teacher_dynamics.csv")
     if not os.path.exists(csv_path):
@@ -175,12 +141,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         }
         teacher_params_list.append(params)
         
-        # [新增] 读取稳态误差
-        x_offset = float(row['x_off_mean']) if 'x_off_mean' in row else 0.0
-        y_offset = float(row['y_off_mean']) if 'y_off_mean' in row else 0.0
-        z_offset = float(row['z_off_mean']) if 'z_off_mean' in row else 0.0
-        teacher_offsets_list.append((x_offset, y_offset, z_offset))
-        
         teacher_run_name = f"teacher_{t_id:04d}"
         folder_path = os.path.join(args_cli.teacher_dir, teacher_run_name)
         
@@ -192,7 +152,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 raise FileNotFoundError(f"No model found for teacher {t_id} in {folder_path}")
             model_path = max(models, key=os.path.getctime)
             
-        print(f"  > [T-{t_id}] Dynamics: Mass={params['mass']:.3f} | Offset: ({x_offset:.4f}, {y_offset:.4f}, {z_offset:.4f}) | Model: {os.path.basename(model_path)}")
+        print(f"  > [T-{t_id}] Dynamics: Mass={params['mass']:.3f} | Model: {os.path.basename(model_path)}")
         
         ckpt = torch.load(model_path, map_location='cpu', weights_only=False)
         loaded_teachers_state_dicts.append(ckpt)
@@ -299,7 +259,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         init_noise_std=agent_cfg.policy.init_noise_std,
         teacher_models=teacher_modules,
         teacher_norm_state_dicts=teacher_norm_dicts,
-        teacher_offsets=teacher_offsets_list,  # [新增] 传递稳态误差给 Policy
     ).to(agent_cfg.device)
     
     resume_path = None
@@ -321,7 +280,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         print("[INFO] Disabling global privileged_obs_normalizer in Runner.")
         print("       (Normalization is now handled internally by MultiTeacherPolicy per teacher)")
         runner.privileged_obs_normalizer = torch.nn.Identity().to(agent_cfg.device)
-        runner.obs_normalizer = ProxyNormalizer(multi_policy.student_normalizer).to(agent_cfg.device)
     # ==================================================================================
 
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
