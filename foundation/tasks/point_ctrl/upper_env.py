@@ -145,16 +145,17 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     history_depth = 2
     history_obs = 10
 
-    frame_observation_space = 3 + 9 + 2 + 1 + 1 + 4
+    frame_observation_space = 3 + 9 + 2 + 1 + 1 + 6
 
     gamma = 0.99
 
     episode_length_s = 96
     decimation = 1
-    action_space = 4
+    action_space = 6
+
     state_space = 0
 
-    grid_rows = 10
+    grid_rows = 16
     grid_cols = 1
     terrain_width = 32
     terrain_length = 89
@@ -272,9 +273,10 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     observation_space = frame_observation_space + history_obs * frame_observation_space + history_depth * depth_size
 
     # [新增] 学生策略配置
-    student_checkpoint_path: str = "logs/rsl_rl/distillation/test/best_model.pt"  # 替换为你的 .pt 文件路径
+    student_checkpoint_path: str = "logs/rsl_rl/distillation/2025-12-29_11-22-19_MultiT_0-1154/best_model.pt"  # 替换为你的 .pt 文件路径
     
     # 网络架构参数 (必须与训练时的参数一致)
+    student_action_space = 4
     student_hidden_dims = []
     student_rnn_type = "gru"
     student_rnn_hidden_dim = 16
@@ -296,15 +298,6 @@ class QuadcopterEnv(DirectRLEnv):
 
         self.render_mode = "human"
 
-        att_p_gain = [10,10,10]
-        rate_p_gain = [20.0, 20.0, 20.0]
-        rate_i_gain =  [0.03,0.03,0.03]
-        rate_d_gain =  [0.0,0.0,0.0]
-        rate_k_gain = [0.0001, 0.0001, 0.0001]
-        rate_int_limit = [0.6, 0.6, 0.6]
-        att_rate_limit = [3.84, 3.84, 3.49]
-        att_yaw_weight = 0.4
-
         self._controller = SimpleQuadrotorController(
             num_envs=self.num_envs,
             device=self.device,
@@ -319,7 +312,7 @@ class QuadcopterEnv(DirectRLEnv):
         self.policy = StudentTeacherRecurrentCustom(
             num_student_obs=self.cfg.policy_obs_dim,
             num_teacher_obs=1, # 只要加载 student，这个参数不重要
-            num_actions=self.cfg.action_space,
+            num_actions=self.cfg.student_action_space,
             student_hidden_dims=self.cfg.student_hidden_dims,
             rnn_type=self.cfg.student_rnn_type,
             rnn_hidden_dim=self.cfg.student_rnn_hidden_dim,
@@ -434,7 +427,7 @@ class QuadcopterEnv(DirectRLEnv):
         )
 
         self._last_pos_w = torch.zeros(self.num_envs, 3, device=self.device)
-        self._last_actions = torch.zeros(self.num_envs, 4, device=self.device)
+        self._last_actions = torch.zeros(self.num_envs, self.cfg.action_space, device=self.device)
         self._is_contact = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self._numerical_is_unstable = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self._is_success = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
@@ -493,6 +486,8 @@ class QuadcopterEnv(DirectRLEnv):
         self.center_weights = self.center_weights / torch.sum(self.center_weights)
 
         self._calc_env_origins()
+
+        self._last_lower_actions = torch.zeros(self.num_envs, self.cfg.student_action_space, device=self.device)
 
     def _print_depth_info(self, env_id=0, show_image=True):
 
@@ -690,115 +685,103 @@ class QuadcopterEnv(DirectRLEnv):
             print(f"Raster Map Generation Time: {time.time() - start_time:.2f} seconds")
         self.sim.play()
 
-    def _compute_student_obs(self):
-        """
-        计算蒸馏策略所需的特定 22 维观测向量。
-        参照 distillation_env.py 的 _get_observations 实现。
-        Structure: [pos_error_b(3), rot_flat(9), vel_error_b(3), ang_vel_b(3), last_actions(4)]
-        """
-        pos_w = self._robot.data.root_pos_w
-        quat_w = self._robot.data.root_quat_w
-        vel_w = self._robot.data.root_lin_vel_w
-        ang_vel_b = self._robot.data.root_ang_vel_b
+    # def _pre_physics_step(self, actions: torch.Tensor):
+    #     actions = actions.clamp(-1.0, 1.0)
+    #     actions[:, 3] = (actions[:, 3] + 1.0) * 0.5
+
+    #     if not hasattr(self, "_action_history"):
+    #         self._action_history_length = 8
+    #         self._action_history = torch.zeros(
+    #             self.num_envs, self._action_history_length, self.cfg.action_space, device=self.device
+    #         )
+
+    #     self._action_history = torch.roll(self._action_history, shifts=-1, dims=1)
+    #     self._valid_mask = torch.roll(self._valid_mask, shifts=-1, dims=1)
+    #     self._action_history[:, -1, :] = actions.clone()
+    #     self._valid_mask[:, -1] = True
+
+    #     window_start = random.randint(-8, -8)
+    #     window_end = window_start + 7
+    #     sel_actions = self._action_history[:, window_start:window_end, :]
+    #     sel_mask     = self._valid_mask[:, window_start:window_end]
+    #     counts      = sel_mask.sum(dim=1).unsqueeze(-1)
+    #     sum_actions = (sel_actions * sel_mask.unsqueeze(-1)).sum(dim=1)
+    #     mean_action = torch.where(
+    #         counts > 0,
+    #         sum_actions / counts.clamp_min(1),
+    #         actions
+    #     )
+    #     self._actions = mean_action.clone()
+
+    #     student_obs = self._compute_student_obs()
+
+    #     student_obs_norm = (student_obs - self.obs_mean) / self.obs_std
         
-        # 1. 坐标系转换 (World -> Body)
-        rot_matrix_b2w = matrix_from_quat(quat_w)
-        rot_matrix_w2b = rot_matrix_b2w.transpose(1, 2)
+    #     # 通常 RSL-RL还会做一个 clip 操作，防止异常值 (范围通常是 [-10, 10] 或 [-5, 5])
+    #     student_obs_norm = torch.clamp(student_obs_norm, -10.0, 10.0)
         
-        # 2. 计算误差 (Body Frame)
-        pos_error_w = pos_w - self._desired_pos_w 
-        vel_error_w = vel_w - self._desired_vel
+    #     with torch.no_grad():
+    #         # act_inference 通常返回确定性动作 (Mean)
+    #         student_actions = self.policy.act_inference(student_obs_norm)
+
+    #     raw_actions_clamped = torch.clamp(student_actions, -1.0, 1.0)
+    #     # Normalize to [0, 1] for SimpleController
+    #     normalized_actions = (raw_actions_clamped + 1.0) * 0.5
         
-        curr_pos_error_b = torch.bmm(rot_matrix_w2b, pos_error_w.unsqueeze(-1)).squeeze(-1)
-        curr_vel_error_b = torch.bmm(rot_matrix_w2b, vel_error_w.unsqueeze(-1)).squeeze(-1)
-        
-        # 3. 展平旋转矩阵
-        rot_flat = rot_matrix_b2w.reshape(self.num_envs, 9)
-        
-        # 4. 拼接观测向量 (Total 22 dim)
-        obs = torch.cat([
-            curr_pos_error_b,    # 3
-            rot_flat,            # 9
-            curr_vel_error_b,    # 3
-            ang_vel_b,           # 3
-            self._last_actions,  # 4
-        ], dim=-1)
-        
-        # NaN 检查 (可选)
-        # obs = self.CHECK_NAN(obs, "Student Obs")
-        
-        return obs
+    #     # 更新 self._actions 供 reward 计算和下一帧 obs 使用
+    #     self._actions = normalized_actions.clone()
+
+    #     force, torque, _ = self._controller.motor_speeds_to_wrench(normalized_actions)
+
+    #     self._forces.zero_()
+    #     self._torques.zero_()
+    #     self._forces[:, 0, :] = force
+    #     self._torques[:, 0, :] = torque
 
     def _pre_physics_step(self, actions: torch.Tensor):
         actions = actions.clamp(-1.0, 1.0)
-        actions[:, 3] = (actions[:, 3] + 1.0) * 0.5
-
-        if not hasattr(self, "_action_history"):
-            self._action_history_length = 8
-            self._action_history = torch.zeros(
-                self.num_envs, self._action_history_length, self.cfg.action_space, device=self.device
-            )
-
-        self._action_history = torch.roll(self._action_history, shifts=-1, dims=1)
-        self._valid_mask = torch.roll(self._valid_mask, shifts=-1, dims=1)
-        self._action_history[:, -1, :] = actions.clone()
-        self._valid_mask[:, -1] = True
-
-        window_start = random.randint(-8, -8)
-        window_end = window_start + 7
-        sel_actions = self._action_history[:, window_start:window_end, :]
-        sel_mask     = self._valid_mask[:, window_start:window_end]
-        counts      = sel_mask.sum(dim=1).unsqueeze(-1)
-        sum_actions = (sel_actions * sel_mask.unsqueeze(-1)).sum(dim=1)
-        mean_action = torch.where(
-            counts > 0,
-            sum_actions / counts.clamp_min(1),
-            actions
-        )
-        self._actions = mean_action.clone()
-        # max_roll = math.radians(45.0)
-        # max_pitch = math.radians(45.0)
-        # max_yaw = math.radians(180.0)
-        # max_thrust = 0.8563843456
-
-        # cmd = mean_action.clone()
-        # cmd[:, 0] = cmd[:, 0] * max_roll
-        # cmd[:, 1] = cmd[:, 1] * max_pitch
-        # cmd[:, 2] = cmd[:, 2] * max_yaw
-        # cmd[:, 3] = cmd[:, 3]
-
-        # cur_state = self._robot.data.root_state_w.clone()
-
-        # start = torch.cuda.Event(enable_timing=True)
-        # end = torch.cuda.Event(enable_timing=True)
-        # start.record()
-        # force, torque, _, info = self._controller.compute_control(cur_state, cmd, self.step_dt, mode="attitude")
-        # self.px4info = info
-        # self.ctrl_info = info
-        # end.record()
-        # torch.cuda.synchronize()
-
-        # ============================================================================
-        student_obs = self._compute_student_obs()
-
-        student_obs_norm = (student_obs - self.obs_mean) / self.obs_std
+        # 1. actions 是上层 RL 输出的 6 维向量 [-1, 1]
+        self._actions = actions.clone() # 这里的 self._actions 对应 action_space=6
         
-        # 通常 RSL-RL还会做一个 clip 操作，防止异常值 (范围通常是 [-10, 10] 或 [-5, 5])
+        # 2. 解析并缩放上层指令 (纠偏量)
+        # 假设缩放范围：位置误差 +-2m，速度误差 +-2m/s (请根据你下层训练时的 range 调整)
+        upper_pos_scale = 2.0
+        upper_vel_scale = 2.0
+        delta_p_b = actions[:, :3] * upper_pos_scale
+        delta_v_b = actions[:, 3:6] * upper_vel_scale
+
+        # 3. 准备下层 Student 网络的输入 (22维)
+        quat_w = self._robot.data.root_quat_w
+        rot_matrix_b2w = matrix_from_quat(quat_w)
+        rot_flat = rot_matrix_b2w.reshape(self.num_envs, 9)
+        ang_vel_b = self._robot.data.root_ang_vel_b
+
+        # 核心：使用专门的 _last_lower_actions (4维电机转速)
+        student_obs = torch.cat([
+            delta_p_b,                # 3: 上层给的纠偏位置误差
+            rot_flat,                 # 9: 真实姿态
+            delta_v_b,                # 3: 上层给的纠偏速度误差
+            ang_vel_b,                # 3: 真实角速度
+            self._last_lower_actions, # 4: 【关键】下层网络的上一帧动作
+        ], dim=-1)
+
+        # 4. 下层网络推理
+        student_obs_norm = (student_obs - self.obs_mean) / self.obs_std
         student_obs_norm = torch.clamp(student_obs_norm, -10.0, 10.0)
         
         with torch.no_grad():
-            # act_inference 通常返回确定性动作 (Mean)
-            student_actions = self.policy.act_inference(student_obs_norm)
-
-        raw_actions_clamped = torch.clamp(student_actions, -1.0, 1.0)
-        # Normalize to [0, 1] for SimpleController
-        normalized_actions = (raw_actions_clamped + 1.0) * 0.5
+            student_raw_actions = self.policy.act_inference(student_obs_norm)
         
-        # 更新 self._actions 供 reward 计算和下一帧 obs 使用
-        self._actions = normalized_actions.clone()
+        # 5. 转换并存储下层动作
+        # 转换到 [0, 1] 供 SimpleController 使用
+        normalized_motor_actions = (torch.clamp(student_raw_actions, -1.0, 1.0) + 1.0) * 0.5
+        
+        # 更新下层动作记忆，供下一帧 student_obs 使用
+        # 注意：存的是 [-1, 1] 的原始输出，因为这是你下层训练时输入的特征
+        self._last_lower_actions = torch.clamp(normalized_motor_actions, -1.0, 1.0).clone()
 
-        force, torque, _ = self._controller.motor_speeds_to_wrench(normalized_actions)
-
+        # 6. 计算物理力和力矩
+        force, torque, _ = self._controller.motor_speeds_to_wrench(normalized_motor_actions)
         self._forces.zero_()
         self._torques.zero_()
         self._forces[:, 0, :] = force
@@ -810,7 +793,6 @@ class QuadcopterEnv(DirectRLEnv):
 
     def _get_observations(self) -> dict:
         perfect_depth_map_nhwc = self._tiled_camera.data.output["depth"]
-        perfect_depth_map_nchw = perfect_depth_map_nhwc.permute(0, 3, 1, 2)
         perfect_depth_map_nhw = perfect_depth_map_nhwc.squeeze(-1)
 
         if self.cfg.enable_actor_noise:
@@ -967,7 +949,7 @@ class QuadcopterEnv(DirectRLEnv):
 
         diff_actions = self._actions - self._last_actions
 
-        weights = torch.tensor([1.0, 2.0, 4.0, 1.0], device=self.device)
+        weights = torch.tensor([1.0, 1.0, 1.0, 1.0, 1.0, 1.0], device=self.device)
         diff_actions_weighted = diff_actions * weights
         action_change_penalty = - (diff_actions_weighted ** 2).sum(dim=1)
 
@@ -1186,11 +1168,10 @@ class QuadcopterEnv(DirectRLEnv):
         dones = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         dones[env_ids] = True
         self.policy.reset(dones=dones)
-        self._actions[env_ids] = 0.0
-        self._last_actions[env_ids] = 0.0
 
         super()._reset_idx(env_ids)
 
+        self._actions[env_ids] = torch.zeros(self.cfg.action_space, device=self.device)
         self._action_history[env_ids] = 0.0
         self._valid_mask[env_ids] = False
 
@@ -1328,33 +1309,14 @@ class QuadcopterEnv(DirectRLEnv):
                     new_positions[:, 2] = torch.zeros_like(new_positions[:, 2]).uniform_(self.cfg.desired_low, self.cfg.desired_high)
                     default_root_state[remaining_indices, :3] += new_positions
 
-        # ================= [新增/修改] 强制覆盖期望位置逻辑 =================
-        
-        # 1. 获取当前确定的出生位置 (World Frame)
-        spawn_pos = default_root_state[:, :3].clone()
-        
-        # 2. 定义目标位置：在出生点 X 轴正方向 +1.0 米处
-        # 假设 X 轴是机头朝向的前方 (Standard ENU)
-        target_pos = spawn_pos.clone()
-        target_pos[:, 0] += 0.0  # 向前 1 米
-        
-        # (可选) 如果你希望高度保持不变，或者强制指定高度，可以在这里修改
-        # target_pos[:, 2] = 1.0 # 强制高度为 1m
-        
-        # 3. 覆盖 self._desired_pos_w
-        self._desired_pos_w[env_ids] = target_pos
-
-        # 4. 期望速度设为 0 (意味着到达该点后悬停)
-        self._desired_vel[env_ids] = 0.0
-        
-        # =================================================================
-
         self._robot.write_root_pose_to_sim(default_root_state[:, :7], env_ids)
         self._robot.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
         self._robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
 
         self._last_pos_w[env_ids] = default_root_state[:, :3]
-        self._last_actions[env_ids] = torch.zeros(4, device=self.device)
+        self._last_actions[env_ids] = torch.zeros(self.cfg.action_space, device=self.device)
+        self._last_lower_actions[env_ids] = torch.zeros(self.cfg.student_action_space, device=self.device)
+    
         self._is_contact[env_ids] = False
         self._numerical_is_unstable[env_ids] = False
         self._is_success[env_ids] = False
@@ -1366,7 +1328,6 @@ class QuadcopterEnv(DirectRLEnv):
         self._depth_history_clean[env_ids] = torch.zeros(self.cfg.history_depth, self.cfg.depth_size, device=self.device)
 
         self._episode_outcomes[env_ids] = 0
-        # self._controller.reset(env_ids)
 
         if (time.time() - self._map_generation_timer) > 3600 * 24 * 10:
             self._calc_env_origins()
