@@ -193,8 +193,8 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     ceiling_height = too_high
 
     reward_coef_distance_reward: float = 0.0
-    reward_coef_action_magnitude_penalty: float = 0.4
-    reward_coef_action_change_penalty: float = 0.5
+    reward_coef_action_magnitude_penalty: float = 0.0
+    reward_coef_action_change_penalty: float = 0.0
     reward_coef_vel_speed_excess_penalty: float = 1.0
     reward_coef_vel_speed_match_reward: float = 0.0
     reward_coef_z_position_penalty: float = 0.3
@@ -273,7 +273,7 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     observation_space = frame_observation_space + history_obs * frame_observation_space + history_depth * depth_size
 
     # [新增] 学生策略配置
-    student_checkpoint_path: str = "logs/rsl_rl/distillation/2025-12-29_11-22-19_MultiT_0-1154/best_model.pt"  # 替换为你的 .pt 文件路径
+    student_checkpoint_path: str = "logs/rsl_rl/distillation/test/best_model.pt"  # 替换为你的 .pt 文件路径
     
     # 网络架构参数 (必须与训练时的参数一致)
     student_action_space = 4

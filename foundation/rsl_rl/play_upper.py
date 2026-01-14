@@ -118,46 +118,17 @@ def main() -> None:
 
         def _step_env(self):
             with torch.inference_mode():
-                # 1. 获取模型输出
-                cmd = self._policy(self._obs)
+
+                actions = self._policy(self._obs)
+                self._obs, rewards, dones, infos = self._env.step(actions)
                 
-                # 2. 调用 Train 环境的 _pre_physics_step
-                # 该函数内部已包含控制器计算，会更新环境内的 self._forces 和 self._torques
-                _ = self._unwrapped._pre_physics_step(cmd)
-
-                # 3. 物理步进循环
-                for _ in range(self._unwrapped.cfg.decimation):
-                    self._unwrapped._sim_step_counter += 1
-                    # 直接调用环境内部的动作应用逻辑（应用力和扭矩）
-                    self._unwrapped._apply_action() 
-                    self._unwrapped.scene.write_data_to_sim()
-                    self._unwrapped.sim.step(render=False)
-                    if self._unwrapped._sim_step_counter % 4 == 0:
-                        self._unwrapped.sim.render()
-                    self._unwrapped.scene.update(dt=self._unwrapped.physics_dt)
-
-                # 4. 状态同步与奖励触发
-                self._unwrapped.episode_length_buf += 1
-                self._unwrapped.common_step_counter += 1
-                self._unwrapped.reset_terminated[:], self._unwrapped.reset_time_outs[:] = self._unwrapped._get_dones()
-                
-                self._unwrapped._last_pos_w = self._unwrapped._robot.data.root_state_w[:, :3].clone()
-                self._unwrapped._last_actions = self._unwrapped._actions.clone()
-
-                reset_env_ids = (self._unwrapped.reset_terminated | self._unwrapped.reset_time_outs).nonzero(as_tuple=False).squeeze(-1)
-                if len(reset_env_ids) > 0:
-                    self._unwrapped._reset_idx(reset_env_ids)
-                    self._unwrapped.scene.write_data_to_sim()
-                    self._unwrapped.sim.forward()
-                    self._unwrapped.sim.render()
-                
-                self._obs, _ = self._env.get_observations()
-
-            # 5. 记录统计数据
-            self._cache_state()
+            # 4. 记录统计数据与深度图（利用 env.unwrapped 访问底层数据）
             sim_time = float(self._unwrapped._sim_step_counter) * self._step_dt
+            self._cache_state()
             self._cache_depth(sim_time)
-            reset_flags = self._unwrapped.reset_terminated.detach().cpu().numpy().astype(bool)
+            
+            # 记录日志
+            reset_flags = dones.detach().cpu().numpy().astype(bool)
             self._record_stats(sim_time, reset_flags)
 
         def _cache_depth(self, timestamp):
