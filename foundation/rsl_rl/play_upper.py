@@ -1,79 +1,18 @@
 #!/usr/bin/env python3
-"""
-IsaacLab runner adapted for quad_point_ctrl_env_single_train.py
-适配 Train 环境：移除了脚本端重复的控制器，增加了奖励函数触发以同步状态。
-"""
-
 from __future__ import annotations
 
 import argparse
-import csv
-import math
-import struct
 import sys
-import time
-from multiprocessing import shared_memory
-from typing import Optional, Tuple
-
-import numpy as np
 import torch
-
+import numpy as np
 from isaaclab.app import AppLauncher
 
-class DepthSharedMemoryWriter:
-    """写入深度图到共享内存"""
-    _HEADER = struct.Struct("<IId")
-
-    def __init__(self, name: str) -> None:
-        self._name = name
-        self._shm: Optional[shared_memory.SharedMemory] = None
-        self._size = 0
-        self._owns_segment = False
-
-    def write(self, depth: np.ndarray, timestamp: float) -> None:
-        if depth is None: return
-        height, width = depth.shape
-        depth_mm = (depth * 1000.0).clip(0, 65535).astype(np.uint16)
-        payload_size = width * height * 2
-        total_size = self._HEADER.size + payload_size
-        self._ensure_segment(total_size)
-        if self._shm is None: return
-        buf = self._shm.buf
-        self._HEADER.pack_into(buf, 0, width, height, timestamp)
-        start = self._HEADER.size
-        mv = memoryview(buf)[start : start + payload_size]
-        mv[:] = depth_mm.tobytes()
-
-    def _ensure_segment(self, required_size: int) -> None:
-        if self._shm is not None and self._size >= required_size: return
-        self.close()
-        try:
-            self._shm = shared_memory.SharedMemory(name=self._name, create=True, size=required_size)
-            self._size = required_size
-            self._owns_segment = True
-        except FileExistsError:
-            existing = shared_memory.SharedMemory(name=self._name, create=False)
-            self._shm = existing
-            self._size = existing.size
-            self._owns_segment = False
-
-    def close(self) -> None:
-        if self._shm is not None:
-            self._shm.close()
-            if self._owns_segment:
-                try: self._shm.unlink()
-                except FileNotFoundError: pass
-            self._shm = None
-
 def _parse_arguments() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="IsaacLab Evaluation for Train Env")
-    parser.add_argument("--task", type=str, default="point_ctrl_single_train", help="必须对应Train环境的Task名")
-    parser.add_argument("--num_envs", type=int, default=1)
-    parser.add_argument("--drone_id", type=int, default=0)
-    parser.add_argument("--model_path", type=str, required=True)
-    parser.add_argument("--reset_log_path", type=str, default="./logs/rsl_rl/data/test.csv")
-    parser.add_argument("--reset_log_count", type=int, default=25)
-    parser.add_argument("--depth_shm_name", type=str, default="depth_image_shm")
+    parser = argparse.ArgumentParser(description="IsaacLab Evaluation for Quadcopter")
+    parser.add_argument("--task", type=str, default="point_ctrl_single_train", help="Task name")
+    parser.add_argument("--num_envs", type=int, default=64, help="Number of environments to run in parallel")
+    parser.add_argument("--model_path", type=str, required=True, help="Path to the checkpoint (.pt)")
+    parser.add_argument("--max_episodes", type=int, default=1000, help="Number of episodes to evaluate before stopping")
     
     AppLauncher.add_app_launcher_args(parser)
     args, hydra_args = parser.parse_known_args()
@@ -92,92 +31,80 @@ def main() -> None:
     from foundation import tasks
     import gymnasium as gym
 
-    class EnvBridge:
-        """适配 Train 环境的桥接器"""
-        def __init__(self, env, simulation_app, policy, drone_id, reset_log_path, reset_log_count):
+    class EvaluationBridge:
+        def __init__(self, env, simulation_app, policy, max_episodes):
             self._env = env
             self._sim_app = simulation_app
             self._unwrapped = env.unwrapped
             self._policy = policy
             self._device = self._unwrapped.device
-            self._drone_id = int(drone_id)
-            self._step_dt = float(self._unwrapped.step_dt)
             
-            self._depth_shm_writer = DepthSharedMemoryWriter(args_cli.depth_shm_name)
-            self._reset_log_path = reset_log_path
-            self._reset_log_target = int(reset_log_count)
-            self._reset_count = 0
-            self._csv_header_written = False
-            self._traj_buffers = [list() for _ in range(self._unwrapped.num_envs)]
-            self._last_states = None
+            # 统计变量
+            self.max_episodes = max_episodes
+            self.total_episodes = 0
+            self.total_successes = 0
+            # 使用环境内部定义的 Enum 方便对比
+            self.Outcome = self._unwrapped.EpisodeOutcome
 
         def run(self):
-            self._obs, _ = self._env.get_observations()
+            print(f"开始评估: 并行环境数={self._unwrapped.num_envs}, 目标总 Episode={self.max_episodes}")
+            obs, _ = self._env.get_observations()
+            
             while self._sim_app.is_running():
-                self._step_env()
-
-        def _step_env(self):
-            with torch.inference_mode():
-
-                actions = self._policy(self._obs)
-                self._obs, rewards, dones, infos = self._env.step(actions)
+                with torch.inference_mode():
+                    actions = self._policy(obs)
+                    obs, rewards, dones, infos = self._env.step(actions)
                 
-            # 4. 记录统计数据与深度图（利用 env.unwrapped 访问底层数据）
-            sim_time = float(self._unwrapped._sim_step_counter) * self._step_dt
-            self._cache_state()
-            self._cache_depth(sim_time)
-            
-            # 记录日志
-            reset_flags = dones.detach().cpu().numpy().astype(bool)
-            self._record_stats(sim_time, reset_flags)
+                # --- 修改后的统计逻辑 ---
+                # 直接从环境的 extras 中读取本步完成的所有 episode 结果
+                # upper_env.py 在 _get_dones 中存入了这些数据
+                log_data = self._unwrapped.extras.get("log", {})
+                outcomes = log_data.get("Metrics/outcome_episodes_per_step", [])
 
-        def _cache_depth(self, timestamp):
-            depth_tensor = self._unwrapped._tiled_camera.data.output.get("depth", None)
-            if depth_tensor is not None:
-                depth = depth_tensor[self._drone_id, :, :, 0].detach().cpu().numpy().astype(np.float32)
-                self._depth_shm_writer.write(depth, timestamp)
+                if len(outcomes) > 0:
+                    for outcome in outcomes:
+                        self.total_episodes += 1
+                        if outcome == self.Outcome.SUCCESS:
+                            self.total_successes += 1
+                    
+                    # 实时打印进度
+                    success_rate = (self.total_successes / self.total_episodes) * 100
+                    print(f">>> [进度] Ep: {self.total_episodes}/{self.max_episodes} | "
+                          f"成功率: {success_rate:.2f}%", end='\r')
 
-        def _cache_state(self):
-            states = self._unwrapped._robot.data.root_state_w.detach().cpu().numpy()
-            states[:, 10:13] = self._unwrapped._robot.data.root_ang_vel_b.detach().cpu().numpy()
-            self._last_states = states
-
-        def _record_stats(self, timestamp, reset_flags):
-            if self._last_states is None or self._reset_count >= self._reset_log_target: return
-            
-            # 使用 Train 环境定义的成功阈值 69.0
-            success_threshold = self._unwrapped.cfg.success_threshold
-            
-            for env_id, state in enumerate(self._last_states):
-                pos_x, pos_y, pos_z = state[0], state[1], state[2]
-                success = 1.0 if pos_x > success_threshold else 0.0
-                self._traj_buffers[env_id].append([timestamp, env_id, pos_x, pos_y, pos_z, state[7], state[8], state[9], success, float(reset_flags[env_id])])
-                
-                if reset_flags[env_id]:
-                    self._write_csv(self._traj_buffers[env_id])
-                    self._traj_buffers[env_id].clear()
-                    self._reset_count += 1
-
-        def _write_csv(self, rows):
-            mode = "w" if not self._csv_header_written else "a"
-            with open(self._reset_log_path, mode, newline="") as f:
-                writer = csv.writer(f)
-                if not self._csv_header_written:
-                    writer.writerow(["time", "id", "x", "y", "z", "vx", "vy", "vz", "success", "reset"])
-                    self._csv_header_written = True
-                writer.writerows(rows)
+                # 达到目标数量停止
+                if self.total_episodes >= self.max_episodes:
+                    print(f"\n\n{'='*50}")
+                    print(f"评估完成！")
+                    print(f"总 Episodes: {self.total_episodes}")
+                    print(f"总成功数: {self.total_successes}")
+                    print(f"最终成功率: {(self.total_successes / self.total_episodes) * 100:.2f}%")
+                    print(f"{'='*50}")
+                    break
 
     @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
     def _launch(env_cfg, agent_cfg: RslRlOnPolicyRunnerCfg):
+        # 修改环境配置：增加并行数量
         env_cfg.scene.num_envs = args_cli.num_envs
+        
+        # 创建环境
         env = gym.make(args_cli.task, cfg=env_cfg)
-        if isinstance(env.unwrapped, DirectMARLEnv): env = multi_agent_to_single_agent(env)
+        if isinstance(env.unwrapped, DirectMARLEnv):
+            env = multi_agent_to_single_agent(env)
         env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
         
+        # 加载模型
         ppo_runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
+        print(f"正在加载模型权重: {args_cli.model_path}")
         ppo_runner.load(args_cli.model_path)
         
-        bridge = EnvBridge(env, simulation_app, ppo_runner.get_inference_policy(device=env.unwrapped.device), args_cli.drone_id, args_cli.reset_log_path, args_cli.reset_log_count)
+        # 运行评估桥接器
+        bridge = EvaluationBridge(
+            env=env, 
+            simulation_app=simulation_app, 
+            policy=ppo_runner.get_inference_policy(device=env.unwrapped.device),
+            max_episodes=args_cli.max_episodes
+        )
         bridge.run()
         simulation_app.close()
 
