@@ -257,7 +257,7 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
 
     tiled_camera: TiledCameraCfg = TiledCameraCfg(
         prim_path="/World/envs/env_.*/Robot/body/Camera",
-        offset=TiledCameraCfg.OffsetCfg(pos=(0.09, 0.0, -0.01), rot=(1.0, 0.0, 0.0, 0.0), convention="world"),
+        offset=TiledCameraCfg.OffsetCfg(pos=(0.0, 0.0, 0.0), rot=(1.0, 0.0, 0.0, 0.0), convention="world"),
         data_types=["depth"],
 
         spawn=sim_utils.PinholeCameraCfg(
@@ -316,6 +316,9 @@ class QuadcopterEnv(DirectRLEnv):
         self.kappa_tensor = torch.zeros(num_envs, device=temp_device)
         self.motor_tau_up_tensor = torch.zeros((num_envs, 1), device=temp_device)
         self.motor_tau_down_tensor = torch.zeros((num_envs, 1), device=temp_device)
+
+        # 初始化相机偏移存储张量
+        self.camera_offsets = torch.zeros(num_envs, 3, device=temp_device)
 
         # 3. 加载 CSV 逻辑（同样在 super 之前完成，确保数据就绪）
         if cfg.dynamics_csv_path and os.path.exists(cfg.dynamics_csv_path):
@@ -653,41 +656,7 @@ class QuadcopterEnv(DirectRLEnv):
             self.grid_idx[grid_linear_idx].append(env_id)
         print(f"Grid indices: {self.grid_idx}")
 
-    # 单一动力学参数
-    # def _setup_scene(self):
-
-    #     self._robot = Articulation(self.cfg.robot)
-    #     robot_prims = find_matching_prim_paths("/World/envs/env_.*/Robot")
-    #     for prim_path in robot_prims:
-    #         prims_utils.set_prim_property(prim_path + "/body", "physics:mass",  0.027)
-    #         prims_utils.set_prim_property(prim_path + "/body", "physics:diagonalInertia", (1.657e-5,1.665e-5,2.926e-5))
-    #         if self.cfg.robot_vis == True:
-    #             prims_utils.set_prim_property(prim_path, "visibility", "visible")
-    #         else:
-    #             prims_utils.set_prim_property(prim_path, "visibility", "invisible")
-
-    #     self._tiled_camera = TiledCamera(self.cfg.tiled_camera)
-
-    #     self._map_generator = MapGenerator(sim=self.sim, device=self.device)
-
-    #     self.scene.clone_environments(copy_from_source=False)
-
-    #     self.scene.articulations["robot"] = self._robot
-    #     self.scene.sensors["tiled_camera"] = self._tiled_camera
-
-    #     light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
-    #     light_cfg.func("/World/Light", light_cfg)
-
-    #     activate_contact_sensors("/World")
-
-    #     self._contact_sensor = ContactSensor(self.cfg.contact_sensor)
-    #     self.scene.sensors["contact_sensor"] = self._contact_sensor
-
-    #     self._map_generation_timer = 0
-
-    # 多动力学参数
     def _setup_scene(self):
-
         self._robot = Articulation(self.cfg.robot)
         self._tiled_camera = TiledCamera(self.cfg.tiled_camera)
         self._map_generator = MapGenerator(sim=self.sim, device=self.device)
@@ -698,20 +667,49 @@ class QuadcopterEnv(DirectRLEnv):
 
         robot_prims = find_matching_prim_paths("/World/envs/env_.*/Robot")
 
-        # 逐个环境应用动力学参数到 PhysX
-        print(f"[Dynamics] Setting PhysX properties for {len(robot_prims)} envs...")
+        # 预计算 cos(45°)
+        cos45 = math.cos(math.pi / 4.0)
+
+        print(f"[Dynamics & Camera] Configuring {len(robot_prims)} envs...")
         for i, prim_path in enumerate(robot_prims):
             body_path = f"{prim_path}/body"
+            camera_path = f"{body_path}/Camera"
             
-            # 获取该环境对应的张量值
+            # --- 1. 设置动力学参数 (保持原有逻辑) ---
             m = self.mass_tensor[i].item()
             ixx, iyy, izz = self.inertia_tensor[i].cpu().numpy()
-            
-            # 写入 PhysX 属性
             prims_utils.set_prim_property(body_path, "physics:mass", m)
             prims_utils.set_prim_property(body_path, "physics:diagonalInertia", (ixx, iyy, izz))
-            prims_utils.set_prim_property(body_path, "physics:centerOfMass", (0.0, 0.0, 0.0))
 
+            # --- 2. 动态设置相机位置 ---
+            arm_l = self.arm_l_tensor[i] # Tensor
+            
+            # 计算随机偏移的标准逻辑：臂长1/5，约束在±5cm
+            limit = arm_l / 5.0
+            # 为 X 和 Z 分别生成独立的随机偏移 (使用 torch 并在设备上操作)
+            rand_offsets = (torch.rand(2, device=self.device) * 2 - 1) * limit
+            clamped_offsets = torch.clamp(rand_offsets, min=-0.05, max=0.05)
+            
+            # X轴：前两个电机中央 (arm_l * cos45) + 随机偏移
+            base_x = arm_l * cos45
+            x_final = (base_x + clamped_offsets[0]).item()
+            
+            # Y轴：固定为 0
+            y_final = 0.0
+            
+            # Z轴：直接使用随机偏移
+            z_final = clamped_offsets[1].item()
+            
+            # 保存到张量供打印使用 (在 __init__ 中已初始化 self.camera_offsets)
+            self.camera_offsets[i, 0] = x_final
+            self.camera_offsets[i, 1] = y_final
+            self.camera_offsets[i, 2] = z_final
+
+            # 写入 USD 属性
+            if prims_utils.is_prim_path_valid(camera_path):
+                prims_utils.set_prim_property(camera_path, "xformOp:translate", (x_final, y_final, z_final))
+            
+            # --- 3. 设置可见性 (保持原有逻辑) ---
             if self.cfg.robot_vis:
                 prims_utils.set_prim_property(prim_path, "visibility", "visible")
             else:
@@ -728,40 +726,43 @@ class QuadcopterEnv(DirectRLEnv):
         self._map_generation_timer = 0
 
     def print_dynamics_info(self, max_rows: int = 10):
-            """
-            打印环境中的动力学参数和控制器中存储的动力学参数。
-            """
-            print("\n" + "="*100)
-            print(f"{'Env ID':<8} | {'Source':<10} | {'Mass':<8} | {'Arm L':<8} | {'Ixx':<8} | {'Iyy':<8} | {'Izz':<8} | {'TWR':<6} | {'Kappa':<6}")
-            print("-" * 100)
+                """
+                打印环境中的动力学参数和控制器中存储的动力学参数。
+                """
+                print("\n" + "="*125)
+                # [修改] 增加 Cam Offset 表头
+                print(f"{'Env ID':<8} | {'Source':<10} | {'Mass':<8} | {'Arm L':<8} | {'Ixx':<8} | {'Iyy':<8} | {'Izz':<8} | {'TWR':<6} | {'Kappa':<6} | {'Cam Offset (X, Y, Z)':<20}")
+                print("-" * 125)
 
-            num_to_print = min(self.num_envs, max_rows)
-            
-            for i in range(num_to_print):
-                # 获取环境中的张量数据 (来自 QuadcopterEnv 自身定义的属性)
-                m_e = self.mass_tensor[i].item()
-                a_e = self.arm_l_tensor[i].item()
-                ixx_e, iyy_e, izz_e = self.inertia_tensor[i].cpu().numpy()
-                twr_e = self.twr_tensor[i].item()
-                k_e = self.kappa_tensor[i].item()
+                num_to_print = min(self.num_envs, max_rows)
+                
+                for i in range(num_to_print):
+                    # 获取环境中的张量数据
+                    m_e = self.mass_tensor[i].item()
+                    a_e = self.arm_l_tensor[i].item()
+                    ixx_e, iyy_e, izz_e = self.inertia_tensor[i].cpu().numpy()
+                    twr_e = self.twr_tensor[i].item()
+                    k_e = self.kappa_tensor[i].item()
+                    
+                    # [新增] 获取保存的相机偏移数据
+                    cam_x, cam_y, cam_z = self.camera_offsets[i].cpu().numpy()
 
-                # --- 修复部分：获取控制器中的张量数据 (使用 SimpleQuadrotorController 实际的变量名) ---
-                m_c = self._controller.mass_[i].item()
-                a_c = self._controller.arm_l_[i].item()
-                ixx_c, iyy_c, izz_c = self._controller.inertia_[i].cpu().numpy()
-                twr_c = self._controller.thrust_to_weight_[i].item()
-                k_c = self._controller.kappa_[i].item()
-                # -------------------------------------------------------------------------
+                    # 获取控制器中的张量数据
+                    m_c = self._controller.mass_[i].item()
+                    a_c = self._controller.arm_l_[i].item()
+                    ixx_c, iyy_c, izz_c = self._controller.inertia_[i].cpu().numpy()
+                    twr_c = self._controller.thrust_to_weight_[i].item()
+                    k_c = self._controller.kappa_[i].item()
 
-                # 打印环境数据行
-                print(f"{i:<8} | {'ENV':<10} | {m_e:<8.4f} | {a_e:<8.4f} | {ixx_e:<8.2e} | {iyy_e:<8.2e} | {izz_e:<8.2e} | {twr_e:<6.2f} | {k_e:<6.4f}")
-                # 打印控制器数据行
-                print(f"{'':<8} | {'CTRL':<10} | {m_c:<8.4f} | {a_c:<8.4f} | {ixx_c:<8.2e} | {iyy_c:<8.2e} | {izz_c:<8.2e} | {twr_c:<6.2f} | {k_c:<6.4f}")
-                print("-" * 100)
+                    # 打印环境数据行，包含相机偏移
+                    print(f"{i:<8} | {'ENV':<10} | {m_e:<8.4f} | {a_e:<8.4f} | {ixx_e:<8.2e} | {iyy_e:<8.2e} | {izz_e:<8.2e} | {twr_e:<6.2f} | {k_e:<6.4f} | ({cam_x:6.3f}, {cam_y:6.3f}, {cam_z:6.3f})")
+                    # 打印控制器数据行
+                    print(f"{'':<8} | {'CTRL':<10} | {m_c:<8.4f} | {a_c:<8.4f} | {ixx_c:<8.2e} | {iyy_c:<8.2e} | {izz_c:<8.2e} | {twr_c:<6.2f} | {k_c:<6.4f} |")
+                    print("-" * 125)
 
-            if self.num_envs > max_rows:
-                print(f"... (Total {self.num_envs} envs, only showing first {max_rows})")
-            print("="*100 + "\n")
+                if self.num_envs > max_rows:
+                    print(f"... (Total {self.num_envs} envs, only showing first {max_rows})")
+                print("="*125 + "\n")
 
     def _regenerate_terrain(self):
         self.sim.pause()
@@ -888,7 +889,7 @@ class QuadcopterEnv(DirectRLEnv):
 
         # 6. 更新动作记忆 (用于下一帧的观测)
         # 存的是期望动作 [-1, 1]，因为这是下层策略训练时的特征输入方式
-        self._last_lower_actions = torch.clamp(student_raw_actions, -1.0, 1.0).clone()
+        self._last_lower_actions = torch.clamp(target_motor_speeds, -1.0, 1.0).clone()
 
         # 7. [修改] 使用“实际/滤波后”的转速计算物理力和力矩
         force, torque, _ = self._controller.motor_speeds_to_wrench(self._current_motor_speeds)
