@@ -34,7 +34,7 @@ import random
 import math
 import time
 import os
-import csv 
+# import csv 
 
 from foundation.utils.train_terrain import MapGenerator
 from foundation.utils.raster import TerrainRasterMap
@@ -122,7 +122,7 @@ class QuadcopterSceneCfg(InteractiveSceneCfg):
 
     num_envs: int = 512
     env_spacing: float = 64.0
-    replicate_physics: bool = False
+    replicate_physics: bool = True
     filter_collisions: bool = True
 
     terrain = TerrainImporterCfg(
@@ -288,63 +288,63 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     # 策略原本的观测维度 (Distillation Env 中的 student_observation_space = 22)
     policy_obs_dim = 22
 
-    mass = 0.027
-    arm_length = 0.046
-    inertia = (1.657e-5,1.665e-5,2.926e-5)
-    thrust_to_weight = 2.0
-    moment_scale = 0.025
-    motor_tau_up: float = 0.05    # 电机加速时间常数
-    motor_tau_down: float = 0.10  # 电机减速时间常数
+    # mass = 0.027
+    # arm_length = 0.046
+    # inertia = (1.657e-5,1.665e-5,2.926e-5)
+    # thrust_to_weight = 2.0
+    # moment_scale = 0.025
+    # motor_tau_up: float = 0.05    # 电机加速时间常数
+    # motor_tau_down: float = 0.10  # 电机减速时间常数
 
-    dynamics_csv_path: str = "logs/rsl_rl/raptor_teachers/2025-01-01_01-01-03/teacher_dynamics.csv" 
+    # dynamics_csv_path: str = "logs/rsl_rl/raptor_teachers/2025-01-01_01-01-03/teacher_dynamics.csv" 
 
 class QuadcopterEnv(DirectRLEnv):
 
     cfg: QuadcopterEnvCfg
 
     def __init__(self, cfg: QuadcopterEnvCfg, render_mode: str | None = None, **kwargs):
-        # 1. 先确定设备和环境数量（此时 self.device 还不能用，用局部变量）
-        temp_device = cfg.sim.device
-        num_envs = cfg.scene.num_envs
+        # # 1. 先确定设备和环境数量（此时 self.device 还不能用，用局部变量）
+        # temp_device = cfg.sim.device
+        # num_envs = cfg.scene.num_envs
         
-        # 2. 在 super().__init__ 之前初始化所有张量
-        # 这样当 super() 触发 _setup_scene 时，这些张量已经存在了
-        self.mass_tensor = torch.zeros(num_envs, device=temp_device)
-        self.arm_l_tensor = torch.zeros(num_envs, device=temp_device)
-        self.inertia_tensor = torch.zeros(num_envs, 3, device=temp_device)
-        self.twr_tensor = torch.zeros(num_envs, device=temp_device)
-        self.kappa_tensor = torch.zeros(num_envs, device=temp_device)
-        self.motor_tau_up_tensor = torch.zeros((num_envs, 1), device=temp_device)
-        self.motor_tau_down_tensor = torch.zeros((num_envs, 1), device=temp_device)
+        # # 2. 在 super().__init__ 之前初始化所有张量
+        # # 这样当 super() 触发 _setup_scene 时，这些张量已经存在了
+        # self.mass_tensor = torch.zeros(num_envs, device=temp_device)
+        # self.arm_l_tensor = torch.zeros(num_envs, device=temp_device)
+        # self.inertia_tensor = torch.zeros(num_envs, 3, device=temp_device)
+        # self.twr_tensor = torch.zeros(num_envs, device=temp_device)
+        # self.kappa_tensor = torch.zeros(num_envs, device=temp_device)
+        # self.motor_tau_up_tensor = torch.zeros((num_envs, 1), device=temp_device)
+        # self.motor_tau_down_tensor = torch.zeros((num_envs, 1), device=temp_device)
 
-        # 3. 加载 CSV 逻辑（同样在 super 之前完成，确保数据就绪）
-        if cfg.dynamics_csv_path and os.path.exists(cfg.dynamics_csv_path):
-            print(f"[INFO] Loading dynamics from CSV: {cfg.dynamics_csv_path}")
-            with open(cfg.dynamics_csv_path, 'r') as f:
-                reader = csv.DictReader(f)
-                rows = list(reader)
+        # # 3. 加载 CSV 逻辑（同样在 super 之前完成，确保数据就绪）
+        # if cfg.dynamics_csv_path and os.path.exists(cfg.dynamics_csv_path):
+        #     print(f"[INFO] Loading dynamics from CSV: {cfg.dynamics_csv_path}")
+        #     with open(cfg.dynamics_csv_path, 'r') as f:
+        #         reader = csv.DictReader(f)
+        #         rows = list(reader)
             
-            num_rows = len(rows)
-            for i in range(num_envs):
-                row = rows[i % num_rows]
-                self.mass_tensor[i] = float(row['mass'])
-                self.arm_l_tensor[i] = float(row['arm_length'])
-                self.inertia_tensor[i, 0] = float(row['Ixx'])
-                self.inertia_tensor[i, 1] = float(row['Iyy'])
-                self.inertia_tensor[i, 2] = float(row['Izz'])
-                self.twr_tensor[i] = float(row['twr'])
-                self.kappa_tensor[i] = float(row['kappa'])
-                self.motor_tau_up_tensor[i] = float(row['motor_tau_up'])
-                self.motor_tau_down_tensor[i] = float(row['motor_tau_down'])
-        else:
-            print("[WARNING] CSV not found! Using default config values.")
-            self.mass_tensor.fill_(cfg.mass)
-            self.arm_l_tensor.fill_(cfg.arm_length)
-            self.inertia_tensor[:] = torch.tensor(cfg.inertia, device=temp_device)
-            self.twr_tensor.fill_(cfg.thrust_to_weight)
-            self.kappa_tensor.fill_(cfg.moment_scale)
-            self.motor_tau_up_tensor.fill_(cfg.motor_tau_up)
-            self.motor_tau_down_tensor.fill_(cfg.motor_tau_down)
+        #     num_rows = len(rows)
+        #     for i in range(num_envs):
+        #         row = rows[i % num_rows]
+        #         self.mass_tensor[i] = float(row['mass'])
+        #         self.arm_l_tensor[i] = float(row['arm_length'])
+        #         self.inertia_tensor[i, 0] = float(row['Ixx'])
+        #         self.inertia_tensor[i, 1] = float(row['Iyy'])
+        #         self.inertia_tensor[i, 2] = float(row['Izz'])
+        #         self.twr_tensor[i] = float(row['twr'])
+        #         self.kappa_tensor[i] = float(row['kappa'])
+        #         self.motor_tau_up_tensor[i] = float(row['motor_tau_up'])
+        #         self.motor_tau_down_tensor[i] = float(row['motor_tau_down'])
+        # else:
+        #     print("[WARNING] CSV not found! Using default config values.")
+        #     self.mass_tensor.fill_(cfg.mass)
+        #     self.arm_l_tensor.fill_(cfg.arm_length)
+        #     self.inertia_tensor[:] = torch.tensor(cfg.inertia, device=temp_device)
+        #     self.twr_tensor.fill_(cfg.thrust_to_weight)
+        #     self.kappa_tensor.fill_(cfg.moment_scale)
+        #     self.motor_tau_up_tensor.fill_(cfg.motor_tau_up)
+        #     self.motor_tau_down_tensor.fill_(cfg.motor_tau_down)
 
         super().__init__(cfg, render_mode, **kwargs)
 
@@ -352,24 +352,30 @@ class QuadcopterEnv(DirectRLEnv):
 
         self.render_mode = "human"
 
-        # self._controller = SimpleQuadrotorController(
-        #     num_envs=self.num_envs,
-        #     device=self.device,
-        #     mass=torch.full((self.num_envs,), 0.027, device=self.device), # 示例质量
-        #     arm_length=torch.full((self.num_envs,), 0.046, device=self.device),
-        #     inertia=torch.tensor([1.657e-5,1.665e-5,2.926e-5], device=self.device).repeat(self.num_envs, 1),
-        #     thrust_to_weight=torch.full((self.num_envs,), 2, device=self.device),
-        #     moment_scale=torch.full((self.num_envs,), 0.025, device=self.device)
-        # )
         self._controller = SimpleQuadrotorController(
             num_envs=self.num_envs,
             device=self.device,
-            mass=self.mass_tensor,
-            arm_length=self.arm_l_tensor,
-            inertia=self.inertia_tensor,
-            thrust_to_weight=self.twr_tensor,
-            moment_scale=self.kappa_tensor
+            mass=torch.full((self.num_envs,), 0.027, device=self.device), # 示例质量
+            arm_length=torch.full((self.num_envs,), 0.046, device=self.device),
+            inertia=torch.tensor([1.657e-5,1.665e-5,2.926e-5], device=self.device).repeat(self.num_envs, 1),
+            thrust_to_weight=torch.full((self.num_envs,), 2, device=self.device),
+            moment_scale=torch.full((self.num_envs,), 0.025, device=self.device)
         )
+        # self._controller = SimpleQuadrotorController(
+        #     num_envs=self.num_envs,
+        #     device=self.device,
+        #     # 将标量 float 转换为形状为 (num_envs,) 的 Tensor
+        #     mass=torch.full((self.num_envs,), self.cfg.mass, device=self.device),
+            
+        #     arm_length=torch.full((self.num_envs,), self.cfg.arm_length, device=self.device),
+            
+        #     # inertia 是元组 (3,)，需要转换为 (num_envs, 3) 的 Tensor
+        #     inertia=torch.tensor(self.cfg.inertia, device=self.device).repeat(self.num_envs, 1),
+            
+        #     thrust_to_weight=torch.full((self.num_envs,), self.cfg.thrust_to_weight, device=self.device),
+            
+        #     moment_scale=torch.full((self.num_envs,), self.cfg.moment_scale, device=self.device)
+        # )
         # [新增] 2. 加载学生策略网络
         print(f"Loading Student Policy from: {self.cfg.student_checkpoint_path}")
         self.policy = StudentTeacherRecurrentCustom(
@@ -552,16 +558,16 @@ class QuadcopterEnv(DirectRLEnv):
 
         self._last_lower_actions = torch.zeros(self.num_envs, self.cfg.student_action_space, device=self.device)
 
-        self.motor_alpha_up = self.step_dt / (self.step_dt + self.motor_tau_up_tensor) # 使用从CSV加载的张量
-        self.motor_alpha_down = self.step_dt / (self.step_dt + self.motor_tau_down_tensor)
+        # # self.motor_alpha_up = self.step_dt / (self.step_dt + self.motor_tau_up_tensor) # 使用从CSV加载的张量
+        # # self.motor_alpha_down = self.step_dt / (self.step_dt + self.motor_tau_down_tensor)
         # self.motor_alpha_up = self.step_dt / (self.step_dt + self.cfg.motor_tau_up)
         # self.motor_alpha_down = self.step_dt / (self.step_dt + self.cfg.motor_tau_down)  
-        # self.motor_alpha_up = self.step_dt / (self.step_dt + 0.05)
-        # self.motor_alpha_down = self.step_dt / (self.step_dt + 0.10)  
+        self.motor_alpha_up = self.step_dt / (self.step_dt + 0.05)
+        self.motor_alpha_down = self.step_dt / (self.step_dt + 0.10)  
         # [新增] 初始化当前实际电机转速 (0-1 归一化)
         self._current_motor_speeds = torch.zeros(self.num_envs, 4, device=self.device)
 
-        self.print_dynamics_info(max_rows=10)
+        # self.print_dynamics_info(max_rows=10)
 
     def _print_depth_info(self, env_id=0, show_image=True):
 
@@ -653,27 +659,70 @@ class QuadcopterEnv(DirectRLEnv):
             self.grid_idx[grid_linear_idx].append(env_id)
         print(f"Grid indices: {self.grid_idx}")
 
-    # 单一动力学参数
+    def _setup_scene(self):
+
+        self._robot = Articulation(self.cfg.robot)
+        robot_prims = find_matching_prim_paths("/World/envs/env_.*/Robot")
+        for prim_path in robot_prims:
+            prims_utils.set_prim_property(prim_path + "/body", "physics:mass",  0.027)
+            prims_utils.set_prim_property(prim_path + "/body", "physics:diagonalInertia", (1.657e-5,1.665e-5,2.926e-5))
+            if self.cfg.robot_vis == True:
+                prims_utils.set_prim_property(prim_path, "visibility", "visible")
+            else:
+                prims_utils.set_prim_property(prim_path, "visibility", "invisible")
+
+        self._tiled_camera = TiledCamera(self.cfg.tiled_camera)
+
+        self._map_generator = MapGenerator(sim=self.sim, device=self.device)
+
+        self.scene.clone_environments(copy_from_source=False)
+
+        self.scene.articulations["robot"] = self._robot
+        self.scene.sensors["tiled_camera"] = self._tiled_camera
+
+        light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
+        light_cfg.func("/World/Light", light_cfg)
+
+        activate_contact_sensors("/World")
+
+        self._contact_sensor = ContactSensor(self.cfg.contact_sensor)
+        self.scene.sensors["contact_sensor"] = self._contact_sensor
+
+        self._map_generation_timer = 0
     # def _setup_scene(self):
 
     #     self._robot = Articulation(self.cfg.robot)
-    #     robot_prims = find_matching_prim_paths("/World/envs/env_.*/Robot")
-    #     for prim_path in robot_prims:
-    #         prims_utils.set_prim_property(prim_path + "/body", "physics:mass",  0.027)
-    #         prims_utils.set_prim_property(prim_path + "/body", "physics:diagonalInertia", (1.657e-5,1.665e-5,2.926e-5))
-    #         if self.cfg.robot_vis == True:
-    #             prims_utils.set_prim_property(prim_path, "visibility", "visible")
-    #         else:
-    #             prims_utils.set_prim_property(prim_path, "visibility", "invisible")
-
     #     self._tiled_camera = TiledCamera(self.cfg.tiled_camera)
-
     #     self._map_generator = MapGenerator(sim=self.sim, device=self.device)
 
     #     self.scene.clone_environments(copy_from_source=False)
-
     #     self.scene.articulations["robot"] = self._robot
     #     self.scene.sensors["tiled_camera"] = self._tiled_camera
+
+    #     robot_prims = find_matching_prim_paths("/World/envs/env_.*/Robot")
+
+    #     # 逐个环境应用动力学参数到 PhysX
+    #     print(f"[Dynamics] Setting PhysX properties for {len(robot_prims)} envs...")
+    #     for i, prim_path in enumerate(robot_prims):
+    #         body_path = f"{prim_path}/body"
+            
+    #         # 获取该环境对应的张量值
+    #         m = self.mass_tensor[i].item()
+    #         ixx, iyy, izz = self.inertia_tensor[i].cpu().numpy()
+            
+    #         # # 写入 PhysX 属性
+    #         # prims_utils.set_prim_property(body_path, "physics:mass", m)
+    #         # prims_utils.set_prim_property(body_path, "physics:diagonalInertia", (ixx, iyy, izz))
+    #         # prims_utils.set_prim_property(body_path, "physics:centerOfMass", (0.0, 0.0, 0.0))
+    #         # 写入 PhysX 属性
+    #         prims_utils.set_prim_property(body_path, "physics:mass", self.cfg.mass)
+    #         prims_utils.set_prim_property(body_path, "physics:diagonalInertia",self.cfg.inertia)
+    #         prims_utils.set_prim_property(body_path, "physics:centerOfMass", (0.0, 0.0, 0.0))
+
+    #         if self.cfg.robot_vis:
+    #             prims_utils.set_prim_property(prim_path, "visibility", "visible")
+    #         else:
+    #             prims_utils.set_prim_property(prim_path, "visibility", "invisible")
 
     #     light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
     #     light_cfg.func("/World/Light", light_cfg)
@@ -685,83 +734,41 @@ class QuadcopterEnv(DirectRLEnv):
 
     #     self._map_generation_timer = 0
 
-    # 多动力学参数
-    def _setup_scene(self):
+    # def print_dynamics_info(self, max_rows: int = 10):
+    #         """
+    #         打印环境中的动力学参数和控制器中存储的动力学参数。
+    #         """
+    #         print("\n" + "="*100)
+    #         print(f"{'Env ID':<8} | {'Source':<10} | {'Mass':<8} | {'Arm L':<8} | {'Ixx':<8} | {'Iyy':<8} | {'Izz':<8} | {'TWR':<6} | {'Kappa':<6}")
+    #         print("-" * 100)
 
-        self._robot = Articulation(self.cfg.robot)
-        self._tiled_camera = TiledCamera(self.cfg.tiled_camera)
-        self._map_generator = MapGenerator(sim=self.sim, device=self.device)
-
-        self.scene.clone_environments(copy_from_source=False)
-        self.scene.articulations["robot"] = self._robot
-        self.scene.sensors["tiled_camera"] = self._tiled_camera
-
-        robot_prims = find_matching_prim_paths("/World/envs/env_.*/Robot")
-
-        # 逐个环境应用动力学参数到 PhysX
-        print(f"[Dynamics] Setting PhysX properties for {len(robot_prims)} envs...")
-        for i, prim_path in enumerate(robot_prims):
-            body_path = f"{prim_path}/body"
+    #         num_to_print = min(self.num_envs, max_rows)
             
-            # 获取该环境对应的张量值
-            m = self.mass_tensor[i].item()
-            ixx, iyy, izz = self.inertia_tensor[i].cpu().numpy()
-            
-            # 写入 PhysX 属性
-            prims_utils.set_prim_property(body_path, "physics:mass", m)
-            prims_utils.set_prim_property(body_path, "physics:diagonalInertia", (ixx, iyy, izz))
-            prims_utils.set_prim_property(body_path, "physics:centerOfMass", (0.0, 0.0, 0.0))
+    #         for i in range(num_to_print):
+    #             # 获取环境中的张量数据 (来自 QuadcopterEnv 自身定义的属性)
+    #             m_e = self.mass_tensor[i].item()
+    #             a_e = self.arm_l_tensor[i].item()
+    #             ixx_e, iyy_e, izz_e = self.inertia_tensor[i].cpu().numpy()
+    #             twr_e = self.twr_tensor[i].item()
+    #             k_e = self.kappa_tensor[i].item()
 
-            if self.cfg.robot_vis:
-                prims_utils.set_prim_property(prim_path, "visibility", "visible")
-            else:
-                prims_utils.set_prim_property(prim_path, "visibility", "invisible")
+    #             # --- 修复部分：获取控制器中的张量数据 (使用 SimpleQuadrotorController 实际的变量名) ---
+    #             m_c = self._controller.mass_[i].item()
+    #             a_c = self._controller.arm_l_[i].item()
+    #             ixx_c, iyy_c, izz_c = self._controller.inertia_[i].cpu().numpy()
+    #             twr_c = self._controller.thrust_to_weight_[i].item()
+    #             k_c = self._controller.kappa_[i].item()
+    #             # -------------------------------------------------------------------------
 
-        light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
-        light_cfg.func("/World/Light", light_cfg)
+    #             # 打印环境数据行
+    #             print(f"{i:<8} | {'ENV':<10} | {m_e:<8.4f} | {a_e:<8.4f} | {ixx_e:<8.2e} | {iyy_e:<8.2e} | {izz_e:<8.2e} | {twr_e:<6.2f} | {k_e:<6.4f}")
+    #             # 打印控制器数据行
+    #             print(f"{'':<8} | {'CTRL':<10} | {m_c:<8.4f} | {a_c:<8.4f} | {ixx_c:<8.2e} | {iyy_c:<8.2e} | {izz_c:<8.2e} | {twr_c:<6.2f} | {k_c:<6.4f}")
+    #             print("-" * 100)
 
-        activate_contact_sensors("/World")
-
-        self._contact_sensor = ContactSensor(self.cfg.contact_sensor)
-        self.scene.sensors["contact_sensor"] = self._contact_sensor
-
-        self._map_generation_timer = 0
-
-    def print_dynamics_info(self, max_rows: int = 10):
-            """
-            打印环境中的动力学参数和控制器中存储的动力学参数。
-            """
-            print("\n" + "="*100)
-            print(f"{'Env ID':<8} | {'Source':<10} | {'Mass':<8} | {'Arm L':<8} | {'Ixx':<8} | {'Iyy':<8} | {'Izz':<8} | {'TWR':<6} | {'Kappa':<6}")
-            print("-" * 100)
-
-            num_to_print = min(self.num_envs, max_rows)
-            
-            for i in range(num_to_print):
-                # 获取环境中的张量数据 (来自 QuadcopterEnv 自身定义的属性)
-                m_e = self.mass_tensor[i].item()
-                a_e = self.arm_l_tensor[i].item()
-                ixx_e, iyy_e, izz_e = self.inertia_tensor[i].cpu().numpy()
-                twr_e = self.twr_tensor[i].item()
-                k_e = self.kappa_tensor[i].item()
-
-                # --- 修复部分：获取控制器中的张量数据 (使用 SimpleQuadrotorController 实际的变量名) ---
-                m_c = self._controller.mass_[i].item()
-                a_c = self._controller.arm_l_[i].item()
-                ixx_c, iyy_c, izz_c = self._controller.inertia_[i].cpu().numpy()
-                twr_c = self._controller.thrust_to_weight_[i].item()
-                k_c = self._controller.kappa_[i].item()
-                # -------------------------------------------------------------------------
-
-                # 打印环境数据行
-                print(f"{i:<8} | {'ENV':<10} | {m_e:<8.4f} | {a_e:<8.4f} | {ixx_e:<8.2e} | {iyy_e:<8.2e} | {izz_e:<8.2e} | {twr_e:<6.2f} | {k_e:<6.4f}")
-                # 打印控制器数据行
-                print(f"{'':<8} | {'CTRL':<10} | {m_c:<8.4f} | {a_c:<8.4f} | {ixx_c:<8.2e} | {iyy_c:<8.2e} | {izz_c:<8.2e} | {twr_c:<6.2f} | {k_c:<6.4f}")
-                print("-" * 100)
-
-            if self.num_envs > max_rows:
-                print(f"... (Total {self.num_envs} envs, only showing first {max_rows})")
-            print("="*100 + "\n")
+    #         if self.num_envs > max_rows:
+    #             print(f"... (Total {self.num_envs} envs, only showing first {max_rows})")
+    #         print("="*100 + "\n")
 
     def _regenerate_terrain(self):
         self.sim.pause()
