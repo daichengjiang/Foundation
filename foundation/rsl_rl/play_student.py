@@ -126,7 +126,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # # Flightmare
     # env_cfg.dynamics.mass = 0.73
-    # env_cfg.dynamics.arm_length = 0.17
+    # env_cfg.dynamics.arm_length = 0.085
     # env_cfg.dynamics.inertia = (7.911e-3,7.911e-3,1.231e-2)
     # env_cfg.dynamics.thrust_to_weight = 4.5
     # env_cfg.dynamics.motor_tau_up = 0.06

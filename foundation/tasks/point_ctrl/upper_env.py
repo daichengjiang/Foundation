@@ -888,7 +888,7 @@ class QuadcopterEnv(DirectRLEnv):
 
         # 6. 更新动作记忆 (用于下一帧的观测)
         # 存的是期望动作 [-1, 1]，因为这是下层策略训练时的特征输入方式
-        self._last_lower_actions = torch.clamp(student_raw_actions, -1.0, 1.0).clone()
+        self._last_lower_actions = target_motor_speeds.clone()
 
         # 7. [修改] 使用“实际/滤波后”的转速计算物理力和力矩
         force, torque, _ = self._controller.motor_speeds_to_wrench(self._current_motor_speeds)

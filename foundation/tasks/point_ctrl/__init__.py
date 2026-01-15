@@ -45,6 +45,16 @@ gym.register(
 )
 
 gym.register(
+    id="upper_sole",
+    entry_point=f"{__name__}.upper_sole_env:QuadcopterEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.upper_sole_env:QuadcopterEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:QuadcopterUpperRunnerCfg",
+    },
+)
+
+gym.register(
     id="distillation",
     entry_point=f"{__name__}.distillation_env:QuadcopterEnv",
     disable_env_checker=True,
