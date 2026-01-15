@@ -674,7 +674,7 @@ class QuadcopterEnv(DirectRLEnv):
         raw_actions_clamped = torch.clamp(actions, -1.0, 1.0)
         action_setpoint_normalized = (raw_actions_clamped + 1.0) * 0.5
         
-        self._actions = action_setpoint_normalized.clone()
+        self._actions = raw_actions_clamped.clone()
 
         # 判断是加速还是减速
         # 如果 target > current, 使用 alpha_up

@@ -894,7 +894,6 @@ class QuadcopterEnv(DirectRLEnv):
         self._current_motor_speeds = alpha * target_motor_speeds + (1.0 - alpha) * self._current_motor_speeds
 
         # 6. 更新动作记忆 (用于下一帧的观测)
-        # 存的是期望动作 [-1, 1]，因为这是下层策略训练时的特征输入方式
         self._last_lower_actions = target_motor_speeds.clone()
 
         # 7. [修改] 使用“实际/滤波后”的转速计算物理力和力矩
