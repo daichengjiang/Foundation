@@ -274,7 +274,7 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     observation_space = frame_observation_space + history_obs * frame_observation_space + history_depth * depth_size
 
     # [新增] 学生策略配置
-    student_checkpoint_path: str = "logs/rsl_rl/distillation/2025-12-29_11-22-19_MultiT_0-1154/best_model.pt"  # 替换为你的 .pt 文件路径
+    student_checkpoint_path: str = "/path/to/your/model.pt" 
     
     # 网络架构参数 (必须与训练时的参数一致)
     student_action_space = 4
@@ -296,7 +296,7 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     motor_tau_up: float = 0.05    # 电机加速时间常数
     motor_tau_down: float = 0.10  # 电机减速时间常数
 
-    dynamics_csv_path: str = "logs/rsl_rl/raptor_teachers/2025-01-01_01-01-03/teacher_dynamics.csv" 
+    dynamics_csv_path: str = "/path/to/your/dynamics.csv"
 
 class QuadcopterEnv(DirectRLEnv):
 
@@ -888,7 +888,7 @@ class QuadcopterEnv(DirectRLEnv):
         self._current_motor_speeds = alpha * target_motor_speeds + (1.0 - alpha) * self._current_motor_speeds
 
         # 6. 更新动作记忆 (用于下一帧的观测)
-        self._last_lower_actions = target_motor_speeds.clone()
+        self._last_lower_actions = torch.clamp(student_raw_actions, -1.0, 1.0).clone()
 
         # 7. [修改] 使用“实际/滤波后”的转速计算物理力和力矩
         force, torque, _ = self._controller.motor_speeds_to_wrench(self._current_motor_speeds)
