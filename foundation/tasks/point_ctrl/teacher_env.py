@@ -160,7 +160,7 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
 
     reward_coef_position_cost = 1.0
     reward_coef_orientation_cost = 0.2
-    reward_coef_d_action_cost = 1.0
+    reward_coef_d_action_cost = 0.5
     reward_coef_termination_penalty = 100.0
     reward_constant = 1.5
 
@@ -853,12 +853,14 @@ class QuadcopterEnv(DirectRLEnv):
             vel = torch.linalg.norm(self._robot.data.root_lin_vel_w[comp_ids], dim=1).cpu().tolist()
             self._vel_abs.extend(vel)
             self._episodes_completed += len(comp_ids)
+        avg_velocity = np.mean(list(self._vel_abs)) if self._vel_abs else 0.0
 
         if len(self._termination_reason_history) > 0:
             died_count = sum(1 for r in self._termination_reason_history if r)
             self.extras["log"].update({
                 "Episode_Termination/died": died_count / len(self._termination_reason_history),
-                "Metrics/episodes_completed": self._episodes_completed
+                "Metrics/episodes_completed": self._episodes_completed,
+                "Metrics/average_velocity": avg_velocity
             })
         
         return len(comp_ids), 0
