@@ -15,7 +15,7 @@ from isaaclab.utils import configclass
 class QuadcopterTeacherRunnerCfg(RslRlOnPolicyRunnerCfg):
     num_steps_per_env = 256
     max_iterations = 5000
-    save_interval = 25
+    save_interval = 200
     experiment_name = "single_teacher"
     empirical_normalization = True
     policy = RslRlPpoActorCriticCfg(
@@ -44,7 +44,7 @@ class QuadcopterTeacherRunnerCfg(RslRlOnPolicyRunnerCfg):
 class QuadcopterUpperRunnerCfg(RslRlOnPolicyRunnerCfg):
     num_steps_per_env = 128
     max_iterations = 5000
-    save_interval = 25
+    save_interval = 500
     experiment_name = "upper"
     empirical_normalization = True
     policy = RslRlPpoActorCriticCfg(
