@@ -47,7 +47,7 @@ def sample_raptor_dynamics():
         "kappa": kappa
     }
 
-def run_training(teacher_id, dynamics, timestamp, gpu_id=0, csv_path="teacher_dynamics.csv", headless=False, reward_threshold=11000.0):
+def run_training(teacher_id, dynamics, timestamp, gpu_id=0, csv_path="teacher_dynamics.csv", headless=False, reward_threshold=10000.0):
     """
     调用 train_teacher_single.py 并传入参数，返回是否训练成功
     """
@@ -110,37 +110,36 @@ def run_training(teacher_id, dynamics, timestamp, gpu_id=0, csv_path="teacher_dy
     print(f"Mass: {dynamics['mass']:.4f} kg | Arm: {dynamics['arm_length']:.4f} m") 
     print(f"TWR : {dynamics['thrust_to_weight']:.2f}    | Kappa: {dynamics['kappa']:.4f}")
     print(f"Tau Up: {dynamics['motor_tau_up']:.3f} s | Tau Down: {dynamics['motor_tau_down']:.3f} s")
-    print(f"Target Reward: > {reward_threshold}")
+    print(f"Target: Avg Mean Reward (Iter 400-700) > {reward_threshold}")
     print(f"==================================================")
     
     success = False
     
     try:
-        # 传入 env_vars
+        # 执行训练
         subprocess.run(cmd, check=True, env=env_vars)
         
-        # [新增] 检查结果
-        max_reward = -float('inf')
+        # 读取临时文件中的值 (此时文件里存的是 400-700 轮的平均奖励)
+        final_eval_reward = -float('inf')
         if os.path.exists(result_file):
             with open(result_file, 'r') as f:
                 try:
                     content = f.read().strip()
                     if content:
-                        max_reward = float(content)
+                        final_eval_reward = float(content)
                 except ValueError:
                     pass
-            # 清理临时文件
             os.remove(result_file)
         
-        print(f"Teacher {teacher_id} Finished. Max Reward: {max_reward:.2f}")
+        print(f"Teacher {teacher_id} Finished. Window Avg Reward: {final_eval_reward:.2f}")
 
-        if max_reward > reward_threshold:
-            print(f"SUCCESS: Reward {max_reward:.2f} > {reward_threshold}. Saving...")
-            # 只有成功了才保存 CSV
+        # [修改判定条件]
+        if final_eval_reward > reward_threshold:
+            print(f"SUCCESS: Avg Reward {final_eval_reward:.2f} > {reward_threshold}. Saving...")
             save_params_to_csv(csv_path, teacher_id, dynamics)
             success = True
         else:
-            print(f"FAILURE: Reward {max_reward:.2f} < {reward_threshold}. Deleting and Retrying...")
+            print(f"FAILURE: Avg Reward {final_eval_reward:.2f} < {reward_threshold}. Retrying...")
             success = False
 
     except subprocess.CalledProcessError as e:
@@ -223,7 +222,7 @@ if __name__ == "__main__":
             gpu_id=args.gpu_id,
             csv_path=csv_path,
             headless=args.headless,
-            reward_threshold=11000.0 # 设置阈值
+            reward_threshold=10000.0 # 设置阈值
         )
         
         if is_success:

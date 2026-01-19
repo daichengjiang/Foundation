@@ -164,6 +164,7 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     reward_coef_termination_penalty = 100.0
     reward_constant = 1.5
 
+    num_steps_per_env: int = 256
 
 
 class QuadcopterEnv(DirectRLEnv):
@@ -329,6 +330,13 @@ class QuadcopterEnv(DirectRLEnv):
         self._traj_origin_adjusted = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
 
         self._calc_env_origins()
+
+        # [新增] 用于统计 400-700 轮平均奖励的变量
+        self.iteration_mean_rewards = []
+        self.last_recorded_iteration = -1
+        # RSL-RL 默认每轮步数 (n_steps)。
+        # 如果你的配置里改了，请相应修改这个值，或者从外部传入
+        self.steps_per_iteration = self.cfg.num_steps_per_env
 
     def CHECK_NAN(self, tensor, name):
         if torch.isnan(tensor).any().item():
@@ -685,15 +693,40 @@ class QuadcopterEnv(DirectRLEnv):
                 batch_rewards += self._episode_sums[k][env_ids]
             self.reward_rolling_buffer.extend(batch_rewards.cpu().tolist())
             
-            # 记录最大奖励均值
+            # # 记录最大奖励均值
+            # if len(self.reward_rolling_buffer) > 0:
+            #     cur_mean = np.mean(self.reward_rolling_buffer)
+            #     if cur_mean > self.global_max_reward:
+            #         self.global_max_reward = cur_mean
+            #         if self.reward_report_path:
+            #             try:
+            #                 with open(self.reward_report_path, "w") as f: f.write(str(cur_mean))
+            #             except: pass
+            # [修改逻辑] 处理 400-700 轮的平均奖励
             if len(self.reward_rolling_buffer) > 0:
                 cur_mean = np.mean(self.reward_rolling_buffer)
-                if cur_mean > self.global_max_reward:
-                    self.global_max_reward = cur_mean
-                    if self.reward_report_path:
-                        try:
-                            with open(self.reward_report_path, "w") as f: f.write(str(cur_mean))
-                        except: pass
+                
+                # 计算当前是第几轮 (Iteration)
+                # self.common_step_counter 是 IsaacLab 内置的全局步数计数器
+                current_iter = self.common_step_counter // self.steps_per_iteration
+
+                # 检查是否进入 400 - 700 轮区间
+                if 400 <= current_iter <= 700:
+                    # 每一轮只记录一次当前 Mean (在这一轮的第一次 reset 时触发记录)
+                    if current_iter > self.last_recorded_iteration:
+                        self.iteration_mean_rewards.append(cur_mean)
+                        self.last_recorded_iteration = current_iter
+
+                        # 计算从第 400 轮到当前的平均值
+                        window_avg_reward = np.mean(self.iteration_mean_rewards)
+                        
+                        # 写入临时文件
+                        if self.reward_report_path:
+                            try:
+                                with open(self.reward_report_path, "w") as f:
+                                    f.write(str(window_avg_reward))
+                            except:
+                                pass
             
             # 清理本轮奖励累计
             if "log" not in self.extras: self.extras["log"] = dict()
