@@ -110,8 +110,10 @@ class QuadcopterSceneCfg(InteractiveSceneCfg):
 @configclass
 class QuadcopterEnvCfg(DirectRLEnvCfg):
     # 15(pos_hist) + 9(rot) + 15(vel_hist) + 3(ang_vel) + 4(last_act) + 4(motor) + 3(acc_des) + 3(vel_des)
-    frame_observation_space = 38
+    frame_observation_space = 56
     observation_space = frame_observation_space
+
+    history_len = 5
 
     prob_null_trajectory = 0.5
     trajectory_type = "langevin"
@@ -186,8 +188,11 @@ class QuadcopterEnv(DirectRLEnv):
         self.motor_tau_down_tensor = torch.zeros(self.num_envs, 1, device=self.device)
         self.kappa_tensor = torch.zeros(self.num_envs, device=self.device)
 
-        self.pos_error_integral = torch.zeros(self.num_envs, 3, device=self.device)
-        self.vel_error_integral = torch.zeros(self.num_envs, 3, device=self.device)
+        # ================= [修改：Buffer 存储机体坐标系误差] =================
+        self.history_len = self.cfg.history_len
+        # 存储机体坐标系下的误差 (Body Frame)
+        self.pos_error_b_history = torch.zeros(self.num_envs, self.history_len, 3, device=self.device)
+        self.vel_error_b_history = torch.zeros(self.num_envs, self.history_len, 3, device=self.device)
 
         if self.cfg.dynamics.multi_teacher_params is not None:
             # 这里的 params 列表应该在 play_teacher_multi.py 中注入到 env_cfg
@@ -598,10 +603,15 @@ class QuadcopterEnv(DirectRLEnv):
         curr_pos_error_b = torch.bmm(rot_matrix_w2b, curr_pos_error_w.unsqueeze(-1)).squeeze(-1)
         curr_vel_error_b = torch.bmm(rot_matrix_w2b, curr_vel_error_w.unsqueeze(-1)).squeeze(-1)
 
-        # 3. 更新积分项 (Accumulate Error)
-        # 简单的累加，相当于 Integral / dt。如果需要严格数学积分可以乘 dt，但对网络来说直接累加通常更数值稳定
-        self.pos_error_integral += curr_pos_error_b
-        self.vel_error_integral += curr_vel_error_b
+        # 3. 更新历史记录 (已经在 Body Frame 下的数据)
+        self.pos_error_b_history = torch.roll(self.pos_error_b_history, shifts=-1, dims=1)
+        self.vel_error_b_history = torch.roll(self.vel_error_b_history, shifts=-1, dims=1)
+        
+        self.pos_error_b_history[:, -1, :] = curr_pos_error_b
+        self.vel_error_b_history[:, -1, :] = curr_vel_error_b
+
+        pos_error_flat = self.pos_error_b_history.reshape(self.num_envs, -1)
+        vel_error_flat = self.vel_error_b_history.reshape(self.num_envs, -1)
 
         # 4. 展平数据
         rot_flat = rot_matrix_b2w.reshape(self.num_envs, 9)
@@ -612,16 +622,14 @@ class QuadcopterEnv(DirectRLEnv):
 
         # 6. 拼接 Observation (Total: 38 dims)
         obs_teacher = torch.cat([
-            curr_pos_error_b,           # 3 (当前位置误差)
-            self.pos_error_integral,    # 3 (历史位置误差累积)
-            rot_flat,                   # 9 (旋转矩阵)
-            curr_vel_error_b,           # 3 (当前速度误差)
-            self.vel_error_integral,    # 3 (历史速度误差累积)
-            ang_vel_b,                  # 3 (角速度)
-            self._last_actions,         # 4 (上一帧动作)
-            acc_des_b,                  # 3 (期望加速度)
-            vel_des_b,                  # 3 (期望速度)
-            self._current_motor_speeds, # 4 (电机转速)
+            pos_error_flat,             # 15
+            rot_flat,                   # 9
+            vel_error_flat,             # 15
+            ang_vel_b,                  # 3
+            self._last_actions,         # 4
+            acc_des_b,                  # 3 
+            vel_des_b,                  # 3 
+            self._current_motor_speeds, # 4
         ], dim=-1)
 
         obs_teacher = self.CHECK_NAN(obs_teacher, "Observation")
@@ -774,10 +782,18 @@ class QuadcopterEnv(DirectRLEnv):
             quat = torch.zeros(num_resets, 4, device=self.device)
             quat[:, 0] = 1.0
 
-        # 5. --- [修改] 重置积分项 ---
-        # 移除原来的 History Buffer 填充，直接清零积分项
-        self.pos_error_integral[env_ids] = 0.0
-        self.vel_error_integral[env_ids] = 0.0
+        # 5. --- [核心优化] 初始化历史 Buffer (同步随机状态) ---
+        # 计算重置时刻的 Body-frame 旋转矩阵
+        rot_w2b = matrix_from_quat(quat).transpose(1, 2)
+        
+        # 初始世界误差：机器人位置(spawn+offset) - 目标(spawn) = offset
+        # 初始速度误差：机器人速度(lin_vel) - 目标速度(0) = lin_vel
+        initial_pos_err_b = torch.bmm(rot_w2b, pos_offset.unsqueeze(-1)).squeeze(-1)
+        initial_vel_err_b = torch.bmm(rot_w2b, lin_vel.unsqueeze(-1)).squeeze(-1)
+        
+        # 用当前的 Body 误差填满 5 帧历史
+        self.pos_error_b_history[env_ids] = initial_pos_err_b.unsqueeze(1).repeat(1, self.history_len, 1)
+        self.vel_error_b_history[env_ids] = initial_vel_err_b.unsqueeze(1).repeat(1, self.history_len, 1)
 
         # 6. --- 任务类型分配 ---
         # 决定该环境运行 Langevin 轨迹还是固定/其他轨迹
