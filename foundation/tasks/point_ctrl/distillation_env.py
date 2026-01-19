@@ -133,6 +133,8 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     # 设置 IsaacLab 默认观测空间（通常对应学生策略维度）
     observation_space = student_observation_space 
 
+    history_len = 5
+
     prob_null_trajectory = 0.5  # 50% 概率做定点控制
 
     # 轨迹类型选择: "langevin" 或 "figure8"
@@ -228,8 +230,10 @@ class QuadcopterEnv(DirectRLEnv):
         self.motor_tau_down_tensor = torch.zeros(self.num_envs, 1, device=self.device)
         self.kappa_tensor = torch.zeros(self.num_envs, device=self.device)
 
-        self.pos_error_integral = torch.zeros(self.num_envs, 3, device=self.device)
-        self.vel_error_integral = torch.zeros(self.num_envs, 3, device=self.device)
+        # --- 新增：历史 Buffer ---
+        self.history_len = self.cfg.history_len
+        self.pos_error_b_history = torch.zeros(self.num_envs, self.history_len, 3, device=self.device)
+        self.vel_error_b_history = torch.zeros(self.num_envs, self.history_len, 3, device=self.device)
 
         if self.cfg.dynamics.multi_teacher_params is not None:
             teacher_params_list = self.cfg.dynamics.multi_teacher_params
@@ -716,10 +720,14 @@ class QuadcopterEnv(DirectRLEnv):
         curr_pos_error_b = torch.bmm(rot_matrix_w2b, (pos_w - self.pos_des).unsqueeze(-1)).squeeze(-1)
         curr_vel_error_b = torch.bmm(rot_matrix_w2b, (vel_w - self.vel_des).unsqueeze(-1)).squeeze(-1)
 
-        # 3. 更新积分项 (Accumulate Error)
-        # 简单的累加，相当于 Integral / dt。如果需要严格数学积分可以乘 dt，但对网络来说直接累加通常更数值稳定
-        self.pos_error_integral += curr_pos_error_b
-        self.vel_error_integral += curr_vel_error_b
+        # 3. 更新历史 Buffer (Rolling window)
+        self.pos_error_b_history = torch.roll(self.pos_error_b_history, shifts=-1, dims=1)
+        self.vel_error_b_history = torch.roll(self.vel_error_b_history, shifts=-1, dims=1)
+        self.pos_error_b_history[:, -1, :] = curr_pos_error_b
+        self.vel_error_b_history[:, -1, :] = curr_vel_error_b
+
+        pos_error_flat = self.pos_error_b_history.reshape(self.num_envs, -1) # (N, 15)
+        vel_error_flat = self.vel_error_b_history.reshape(self.num_envs, -1) # (N, 15)
 
         # 4. 展平数据
         rot_flat = rot_matrix_b2w.reshape(self.num_envs, 9)
@@ -739,16 +747,14 @@ class QuadcopterEnv(DirectRLEnv):
 
         # 7. 教师
         obs_teacher = torch.cat([
-            curr_pos_error_b,           # 3 (当前位置误差)
-            self.pos_error_integral,    # 3 (历史位置误差累积)
-            rot_flat,                   # 9 (旋转矩阵)
-            curr_vel_error_b,           # 3 (当前速度误差)
-            self.vel_error_integral,    # 3 (历史速度误差累积)
-            ang_vel_b,                  # 3 (角速度)
-            self._last_actions,         # 4 (上一帧动作)
-            acc_des_b,                  # 3 (期望加速度)
-            vel_des_b,                  # 3 (期望速度)
-            self._current_motor_speeds, # 4 (电机转速)
+            pos_error_flat,             # 15
+            rot_flat,                   # 9
+            vel_error_flat,             # 15
+            ang_vel_b,                  # 3
+            self._last_actions,         # 4
+            acc_des_b,                  # 3 
+            vel_des_b,                  # 3 
+            self._current_motor_speeds, # 4
         ], dim=-1)
 
         obs_teacher = self.CHECK_NAN(obs_teacher, "Teacher Observation")
@@ -939,9 +945,13 @@ class QuadcopterEnv(DirectRLEnv):
         self.vel_des[env_ids] = 0.0
         self.acc_des[env_ids] = 0.0
         
-        # 重置积分项
-        self.pos_error_integral[env_ids] = 0.0
-        self.vel_error_integral[env_ids] = 0.0
+        # 转换到机体系并填充 5 帧历史
+        rot_w2b_init = matrix_from_quat(quat).transpose(1, 2)
+        initial_pos_err_b = torch.bmm(rot_w2b_init, pos_offset.unsqueeze(-1)).squeeze(-1)
+        initial_vel_err_b = torch.bmm(rot_w2b_init, lin_vel.unsqueeze(-1)).squeeze(-1)
+        
+        self.pos_error_b_history[env_ids] = initial_pos_err_b.unsqueeze(1).repeat(1, self.history_len, 1)
+        self.vel_error_b_history[env_ids] = initial_vel_err_b.unsqueeze(1).repeat(1, self.history_len, 1)
 
         # --- 4. 写入物理仿真器 ---
         root_state = self._robot.data.default_root_state[env_ids].clone()
