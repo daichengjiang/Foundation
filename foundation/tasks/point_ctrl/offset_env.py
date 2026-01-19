@@ -113,7 +113,7 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     frame_observation_space = 3 + 9 + 3 + 3 + 4 + 4  # 26
     observation_space = frame_observation_space
 
-    prob_null_trajectory = 0.5
+    prob_null_trajectory = 0.0
     trajectory_type = "langevin"
     train_or_play: bool = True
     gamma = 0.99

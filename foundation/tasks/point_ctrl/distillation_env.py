@@ -135,7 +135,7 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
 
     history_len = 5
 
-    prob_null_trajectory = 0.5  # 50% 概率做定点控制
+    prob_null_trajectory = 0.0  # 50% 概率做定点控制
 
     # 轨迹类型选择: "langevin" 或 "figure8"
     trajectory_type = "langevin"  # Default to Langevin during training

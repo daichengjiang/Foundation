@@ -115,7 +115,7 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
 
     history_len = 5
 
-    prob_null_trajectory = 0.5
+    prob_null_trajectory = 0.0
     trajectory_type = "langevin"
     train_or_play: bool = True
     gamma = 0.99

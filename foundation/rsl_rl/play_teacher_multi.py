@@ -238,7 +238,7 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg):
     env_cfg.dynamics.multi_teacher_params = teachers_data
     
     env_cfg.train_or_play = False
-    env_cfg.prob_null_trajectory = 1.0   
+    env_cfg.prob_null_trajectory = 0.0   
     env_cfg.trajectory_type = "fixed"    
     env_cfg.debug_vis = True            
     env_cfg.seed = args_cli.seed
