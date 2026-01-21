@@ -222,7 +222,7 @@ if __name__ == "__main__":
             gpu_id=args.gpu_id,
             csv_path=csv_path,
             headless=args.headless,
-            reward_threshold=10000.0 # 设置阈值
+            reward_threshold=7000.0 # 设置阈值
         )
         
         if is_success:
