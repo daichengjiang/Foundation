@@ -27,7 +27,7 @@ def main():
     parser.add_argument("--timestamp", type=str, required=True, help="The timestamp folder name")
     parser.add_argument("--mapping", type=str, required=True, 
                         help="Example: '500-510:0-10,800-805:20-25'")
-    parser.add_argument("--log_root", type=str, default="logs/rsl_rl/raptor_teachers", help="Root path")
+    parser.add_argument("--log_root", type=str, default="logs/rsl_rl/multi_teachers", help="Root path")
     
     args = parser.parse_args()
 
