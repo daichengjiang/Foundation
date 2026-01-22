@@ -106,14 +106,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env_cfg.sim.use_fabric = not args_cli.disable_fabric if args_cli.disable_fabric is not None else env_cfg.sim.use_fabric
 
     # Example dynamics (Teacher usually works on specific dynamics)
-    env_cfg.dynamics.mass = 0.9723406524454805
-    env_cfg.dynamics.arm_length = 0.1440677911119537
-    env_cfg.dynamics.inertia = (0.005845751033218391,0.005845751033218391,0.010709415892856093)
-    env_cfg.dynamics.thrust_to_weight = 3.419472671407245
-    env_cfg.dynamics.motor_tau_up = 0.030316265523195485
-    env_cfg.dynamics.motor_tau_down = 0.20380266906645023
-    env_cfg.dynamics.moment_scale = 0.0168386257003069
-
+    env_cfg.dynamics.mass = 0.298464762168343
+    env_cfg.dynamics.arm_length = 0.09996663755706471
+    env_cfg.dynamics.inertia = (0.00730807506180972,0.00730807506180972,0.013388393513235407)
+    env_cfg.dynamics.thrust_to_weight = 3.8581746821306417
+    env_cfg.dynamics.motor_tau_up = 0.09422900594402965
+    env_cfg.dynamics.motor_tau_down = 0.1876944321853448
+    env_cfg.dynamics.moment_scale = 0.03942895255442618
 
     # get checkpoint path
     checkpoint_path = retrieve_file_path(args_cli.checkpoint)
@@ -231,7 +230,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                         
             timestep += 1
             
-            if timestep % 1000 == 0:
+            if timestep % 200 == 0:
                 cur_rmse = np.sqrt(torch.mean(squared_error).item())
                 cur_rmse_xy = np.sqrt(torch.mean(squared_error_xy).item())
                 status = " (Collecting Stats)" if timestep >= STATS_START_STEP else " (Warmup)"

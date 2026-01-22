@@ -25,7 +25,7 @@ class SimpleQuadrotorController:
                  arm_length: torch.Tensor,        # Shape: [num_envs]
                  inertia: torch.Tensor,           # Shape: [num_envs, 3]
                  thrust_to_weight: torch.Tensor,  # Shape: [num_envs]
-                 moment_scale: torch.Tensor = None, # Shape: [num_envs] (Optional, aka kappa/c_m)
+                 kappa: torch.Tensor = None, # Shape: [num_envs] (Optional, aka kappa/c_m)
                  gravity: float = 9.81):
         
         self.num_envs = num_envs
@@ -40,11 +40,11 @@ class SimpleQuadrotorController:
         
         # Paper  samples moment coefficient c_m ~ Uniform(0.005, 0.05).
         # If not provided, we use the mean or the Crazyflie default.
-        if moment_scale is None:
+        if kappa is None:
              # Default generic value if not sampled externally
             self.kappa_ = torch.full((num_envs,), 0.016, device=device)
         else:
-            self.kappa_ = moment_scale.to(device)
+            self.kappa_ = kappa.to(device)
 
         # --- 2. Define Baseline Coefficients (From Paper Eq. S8, S9) ---
         # "C_f0 = 0.038, C_f1 = 0.154, C_f2 = 0.987" 
@@ -146,4 +146,4 @@ class SimpleQuadrotorController:
         
         torque = wrench[:, 1:4]    # Torques
         
-        return force, torque, None
+        return force, torque

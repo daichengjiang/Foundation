@@ -60,17 +60,17 @@ SPHERE_MARKER_CFG = VisualizationMarkersCfg(
 
 @configclass
 class QuadcopterDynamicsCfg:
-    mass: float = 0.0282
-    arm_length: float = 0.04384
-    inertia: tuple[float, float, float] = (2.44864e-5, 2.44864e-5, 3.61504e-5)
-    thrust_to_weight: float = 2.25 
+    mass: float = 2
+    arm_length: float = 0.25
+    inertia: tuple[float, float, float] = (0.022,0.022,0.04)
+    thrust_to_weight: float = 2.2 
     
     # [修改] 替换单一的 motor_tau
-    motor_tau_up: float = 0.05
-    motor_tau_down: float = 0.10 # 默认值设大一点体现差异
+    motor_tau_up: float = 0.06
+    motor_tau_down: float = 0.15 # 默认值设大一点体现差异
     
     # [新增] 力矩系数
-    moment_scale: float = 0.016 
+    moment_scale: float = 0.025 
 
     multi_teacher_params: list[dict] | None = None
 
@@ -250,16 +250,16 @@ class QuadcopterEnv(DirectRLEnv):
         # Store for reference
         self._robot_mass = self.mass_tensor 
 
-        # # 初始化控制器 (传入异构张量)
-        # self._controller = SimpleQuadrotorController(
-        #     num_envs=self.num_envs,
-        #     device=self.device,
-        #     mass=self.mass_tensor,
-        #     arm_length=self.arm_l_tensor,
-        #     inertia=self.inertia_tensor,
-        #     thrust_to_weight=self.twr_tensor,
-        #     moment_scale=self.kappa_tensor # <--- 传入
-        # )
+        # 初始化控制器 (传入异构张量)
+        self._controller = PaperPhysControllerTensor(
+            num_envs=self.num_envs,
+            device=self.device,
+            mass=self.mass_tensor,
+            arm_length=self.arm_l_tensor,
+            inertia=self.inertia_tensor,
+            thrust_to_weight=self.twr_tensor,
+            kappa=self.kappa_tensor # <--- 传入
+        )
         # =================================================================
 
         self.dt = self.cfg.sim.dt
@@ -343,54 +343,6 @@ class QuadcopterEnv(DirectRLEnv):
         # RSL-RL 默认每轮步数 (n_steps)。
         # 如果你的配置里改了，请相应修改这个值，或者从外部传入
         self.steps_per_iteration = self.cfg.num_steps_per_env
-
-        # ================= [参数修正：动态计算 k_f 和 k_m] =================
-        # 1. 设定基准最大转速 (rad/s)
-        # 这保证了无论无人机多重，满油门时都能达到设定的推重比
-        self.max_rpm = 2200.0 
-        g = 9.81
-        
-        # 2. 计算每个环境对应的 k_f (推力系数) [N_envs]
-        # 公式: F_max = Mass * g * TWR = 4 * k_f * max_rpm^2
-        # 推导: k_f = (Mass * g * TWR) / (4 * max_rpm^2)
-        total_max_thrust = self.mass_tensor * g * self.twr_tensor
-        self.k_f_tensor = (total_max_thrust / 4.0) / (self.max_rpm ** 2)
-        
-        # 3. 计算每个环境对应的 k_m (力矩系数) [N_envs]
-        # 公式: k_m = k_f * kappa (kappa 是力矩推力比)
-        # 确保使用了之前从 multi_teacher_params 读取的 kappa_tensor
-        self.k_m_tensor = self.k_f_tensor * self.kappa_tensor
-
-        # ================= [控制器参数] =================
-        # PID 增益通常可以保持固定，或者如果你希望控制器性能也随机化，也可以做成 Tensor
-        # 这里暂时保持固定，作为"专家"参数
-        ctrl_params = {
-            'pos_nat_freq': 2.0,
-            'pos_damping': 0.7,
-            'tc_angle_rp': 0.08,
-            'tc_angle_y': 0.40,
-            'tc_rate_rp': 0.04,
-            'tc_rate_y': 0.20
-        }
-        
-        # ================= [物理参数打包] =================
-        # 传入计算好的 Tensor，而不是固定标量
-        phys_params = {
-            'mass': self.mass_tensor,          # [N]
-            'inertia': self.inertia_tensor,    # [N, 3]
-            'arm_length': self.arm_l_tensor,   # [N]
-            'mot_k_f': self.k_f_tensor,        # [N] <--- 修正为张量
-            'mot_k_m': self.k_m_tensor,         # [N] <--- 修正为张量
-            'kappa': self.kappa_tensor         # [N]
-        }
-
-        # === 初始化导入的控制器 ===
-        self._controller = PaperPhysControllerTensor(
-            num_envs=self.num_envs,
-            device=self.device,
-            ctrl_params=ctrl_params,
-            phys_params=phys_params
-        )
 
     def CHECK_NAN(self, tensor, name):
         if torch.isnan(tensor).any().item():
@@ -633,7 +585,7 @@ class QuadcopterEnv(DirectRLEnv):
     #     self._current_motor_speeds = alpha * target + (1.0 - alpha) * current
 
     #     # 计算力与力矩
-    #     force_b, torque_b, _ = self._controller.motor_speeds_to_wrench(self._current_motor_speeds)    
+    #     force_b, torque_b = self._controller.motor_speeds_to_wrench(self._current_motor_speeds)    
     #     self._forces.zero_()
     #     self._torques.zero_()
     #     self._forces[:, 0, :] = force_b
@@ -653,10 +605,12 @@ class QuadcopterEnv(DirectRLEnv):
         cur_ang_vel = self._robot.data.root_ang_vel_b
         
         # 2. 计算期望转速 (Controller)
-        force_b, torque_b = self._controller.compute_target_speeds(
+        motor_speeds_cmd = self._controller.compute_target_speeds(
             cur_pos, cur_vel, cur_quat, cur_ang_vel,
             self.pos_des, self.vel_des, self.acc_des
         )
+
+        force_b, torque_b = self._controller.motor_speeds_to_wrench(motor_speeds_cmd)
         
         # # 3. 模拟电机响应 (Motor Physics - 1st order lag)
         # # 这是 motor.py line 55 的逻辑
@@ -664,13 +618,7 @@ class QuadcopterEnv(DirectRLEnv):
         # current = self._current_motor_speeds
         # alpha = torch.where(target > current, self.motor_alpha_up, self.motor_alpha_down)
         # self._current_motor_speeds = alpha * target + (1.0 - alpha) * current
-        
-        # # 4. 计算最终力和力矩 (Vehicle Physics)
-        # # 这是 vehicle.py 的逻辑
-        # # force_b, torque_b = self._controller.compute_actual_wrench(self._current_motor_speeds, self.dt)
-        # force_b, torque_b = self._controller.compute_actual_wrench(des_motor_speeds, self.dt)
-
-        # 5. 应用
+    
         self._forces.zero_()
         self._torques.zero_()
         self._forces[:, 0, :] = force_b
