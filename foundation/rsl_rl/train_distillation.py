@@ -27,7 +27,7 @@ parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
 parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
 
-parser.add_argument("--teacher_dir", type=str, default=None, required=True, help="Path to the teacher experiment directory.")
+parser.add_argument("--teacher_dir", type=str, default=None, help="Path to the teacher experiment directory.")
 parser.add_argument("--teacher_ids", type=str, default="0", help="Comma-separated list of teacher IDs.")
 
 cli_args.add_rsl_rl_args(parser)
@@ -75,6 +75,39 @@ torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.benchmark = False
 
+class PIDTeacherWrapper(nn.Module):
+    """
+    将环境内置的 PID 控制器包装成 Policy 的形式。
+    忽略输入的 obs，直接从 env 获取 Ground Truth 计算动作。
+    """
+    def __init__(self, env):
+        super().__init__()
+        self.env = env
+        # 这是一个伪参数，用于通过 PyTorch 的 optimizer 检查（虽然我们不会更新它）
+        self.dummy_param = nn.Parameter(torch.zeros(1))
+
+    def act_inference(self, obs):
+        """
+        模仿 ActorCritic.act_inference 接口
+        """
+        # 这里的 obs 是经过归一化的 teacher_obs，PID 不需要它
+        # PID 需要的是 env 内部的真实状态
+        
+        # 如果 env 被 wrap 过了 (例如 RslRlVecEnvWrapper), 需要解包找到原本的 QuadcopterEnv
+        if hasattr(self.env, "unwrapped"):
+            base_env = self.env.unwrapped
+        else:
+            base_env = self.env
+            
+        # 再次检查，防止多层 wrap
+        while hasattr(base_env, "env"):
+            base_env = base_env.env
+            
+        return base_env.get_pid_actions()
+    
+    def forward(self, obs):
+        return self.act_inference(obs)
+
 
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg):
@@ -93,6 +126,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # ==================================================================================
     print(f"\n{'='*20} [Multi-Teacher Distillation Setup] {'='*20}")
     
+    # teacher_modules = []
+    # teacher_norm_dicts = []
+    # loaded_teachers_state_dicts = [] # 仅在 NN 模式下使用
+    # teacher_ids = [0]
+
     teacher_ids = []
     if '-' in args_cli.teacher_ids:
         start, end = map(int, args_cli.teacher_ids.split('-'))
@@ -141,21 +179,21 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         }
         teacher_params_list.append(params)
         
-        teacher_run_name = f"teacher_{t_id:04d}"
-        folder_path = os.path.join(args_cli.teacher_dir, teacher_run_name)
+    #     teacher_run_name = f"teacher_{t_id:04d}"
+    #     folder_path = os.path.join(args_cli.teacher_dir, teacher_run_name)
         
-        model_path = os.path.join(folder_path, "best_model.pt")
-        if not os.path.exists(model_path):
-            search_pattern = os.path.join(folder_path, "model_*.pt")
-            models = glob.glob(search_pattern)
-            if not models:
-                raise FileNotFoundError(f"No model found for teacher {t_id} in {folder_path}")
-            model_path = max(models, key=os.path.getctime)
+    #     model_path = os.path.join(folder_path, "best_model.pt")
+    #     if not os.path.exists(model_path):
+    #         search_pattern = os.path.join(folder_path, "model_*.pt")
+    #         models = glob.glob(search_pattern)
+    #         if not models:
+    #             raise FileNotFoundError(f"No model found for teacher {t_id} in {folder_path}")
+    #         model_path = max(models, key=os.path.getctime)
             
-        print(f"  > [T-{t_id}] Dynamics: Mass={params['mass']:.3f} | Model: {os.path.basename(model_path)}")
+    #     print(f"  > [T-{t_id}] Dynamics: Mass={params['mass']:.3f} | Model: {os.path.basename(model_path)}")
         
-        ckpt = torch.load(model_path, map_location='cpu', weights_only=False)
-        loaded_teachers_state_dicts.append(ckpt)
+    #     ckpt = torch.load(model_path, map_location='cpu', weights_only=False)
+    #     loaded_teachers_state_dicts.append(ckpt)
 
     try:
         env_cfg.dynamics.multi_teacher_params = teacher_params_list
@@ -202,47 +240,69 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
     runner.add_git_repo_to_log(__file__)
     
-    # ==================================================================================
-    # [核心] 构建 MultiTeacherPolicy 并替换 Runner 中的策略
-    # ==================================================================================
     print("\n[Distillation] Constructing Multi-Teacher Policy...")
     
-    obs, _ = env.get_observations() 
+    obs, extras = env.get_observations() 
     real_student_obs_dim = obs.shape[1] 
-    
-    first_ckpt = loaded_teachers_state_dicts[0]
-    teacher_input_weight = None
-    for key in ['actor.0.weight', 'actor.layers.0.weight', 'actor.actor_mlp.0.weight']:
-        if key in first_ckpt['model_state_dict']:
-            teacher_input_weight = first_ckpt['model_state_dict'][key]
-            break
-            
-    if teacher_input_weight is None:
-        raise ValueError("Could not infer Teacher input dimension from checkpoint.")
-    
-    real_teacher_obs_dim = teacher_input_weight.shape[1]
-    
-    teacher_modules = []
-    teacher_norm_dicts = []
-    for i, ckpt in enumerate(loaded_teachers_state_dicts):
-        teacher_p = ActorCritic(
-            num_actor_obs=real_teacher_obs_dim,
-            num_critic_obs=real_teacher_obs_dim,
-            num_actions=env.num_actions,
-            actor_hidden_dims=agent_cfg.policy.teacher_hidden_dims,
-            critic_hidden_dims=agent_cfg.policy.teacher_hidden_dims, 
-            activation="elu", 
-            init_noise_std=1.0,  # Note: 推理时使用 act_inference()，不使用此参数；将被 checkpoint 覆盖
-        ).to(agent_cfg.device)
-        
-        teacher_p.load_state_dict(ckpt['model_state_dict'])
-        teacher_p.eval() 
-        teacher_modules.append(teacher_p)
 
-        if 'obs_norm_state_dict' in ckpt:
-            teacher_norm_dicts.append(ckpt['obs_norm_state_dict'])
-        else:
-            teacher_norm_dicts.append(None) 
+    # ===================================================pid===================================================
+    print("[Distillation] Wrapping environment PID controller as Teacher.")
+        
+    # 实例化 PID Wrapper
+    pid_wrapper = PIDTeacherWrapper(env).to(agent_cfg.device)
+    
+    # 放入列表
+    teacher_modules = [pid_wrapper]
+    
+    # PID 模式下不需要加载 Teacher 的 Normalizer (PID 输出就是标准动作)
+    teacher_norm_dicts = [None]
+    
+    # [修改点 2] 动态检测 Teacher 维度，修复 38 vs 56 的冲突
+    if "teacher" in extras["observations"]:
+        real_teacher_obs_dim = extras["observations"]["teacher"].shape[1]
+        print(f"[INFO] Auto-detected Teacher Obs Dim from env: {real_teacher_obs_dim}")
+    elif hasattr(env.unwrapped, "cfg") and hasattr(env.unwrapped.cfg, "teacher_observation_space"):
+        real_teacher_obs_dim = env.unwrapped.cfg.teacher_observation_space
+        print(f"[WARNING] 'teacher' obs not found in extras. Using config value: {real_teacher_obs_dim}")
+    else:
+        # Fallback
+        print("[WARNING] Could not find teacher dim. Using default 38 (May crash!).")
+        real_teacher_obs_dim = 38
+    # ===================================================pid===================================================
+
+    # first_ckpt = loaded_teachers_state_dicts[0]
+    # teacher_input_weight = None
+    # for key in ['actor.0.weight', 'actor.layers.0.weight', 'actor.actor_mlp.0.weight']:
+    #     if key in first_ckpt['model_state_dict']:
+    #         teacher_input_weight = first_ckpt['model_state_dict'][key]
+    #         break
+            
+    # if teacher_input_weight is None:
+    #     raise ValueError("Could not infer Teacher input dimension from checkpoint.")
+    
+    # real_teacher_obs_dim = teacher_input_weight.shape[1]
+    
+    # teacher_modules = []
+    # teacher_norm_dicts = []
+    # for i, ckpt in enumerate(loaded_teachers_state_dicts):
+    #     teacher_p = ActorCritic(
+    #         num_actor_obs=real_teacher_obs_dim,
+    #         num_critic_obs=real_teacher_obs_dim,
+    #         num_actions=env.num_actions,
+    #         actor_hidden_dims=agent_cfg.policy.teacher_hidden_dims,
+    #         critic_hidden_dims=agent_cfg.policy.teacher_hidden_dims, 
+    #         activation="elu", 
+    #         init_noise_std=1.0,  # Note: 推理时使用 act_inference()，不使用此参数；将被 checkpoint 覆盖
+    #     ).to(agent_cfg.device)
+        
+    #     teacher_p.load_state_dict(ckpt['model_state_dict'])
+    #     teacher_p.eval() 
+    #     teacher_modules.append(teacher_p)
+
+    #     if 'obs_norm_state_dict' in ckpt:
+    #         teacher_norm_dicts.append(ckpt['obs_norm_state_dict'])
+    #     else:
+    #         teacher_norm_dicts.append(None) 
 
     multi_policy = MultiTeacherPolicy(
         num_student_obs=real_student_obs_dim,

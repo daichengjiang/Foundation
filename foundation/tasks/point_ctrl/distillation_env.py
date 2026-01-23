@@ -67,21 +67,19 @@ def normallize_angle(angle: torch.Tensor):
 
 @configclass
 class QuadcopterDynamicsCfg:
-    # 默认值 (Crazyflie 2.1 参数作为默认，用于单机或默认情况)
-    mass: float = 0.0282
-    arm_length: float = 0.04384
-    # Inertia: Ixx, Iyy, Izz
-    inertia: tuple[float, float, float] = (2.44864e-5, 2.44864e-5, 3.61504e-5)
-    thrust_to_weight: float = 2.25 
-    motor_tau_up: float = 0.05
-    motor_tau_down: float = 0.10 # 默认值设大一点体现差异
+    mass: float = 2
+    arm_length: float = 0.25
+    inertia: tuple[float, float, float] = (0.022,0.022,0.04)
+    thrust_to_weight: float = 2.2 
+    
+    # [修改] 替换单一的 motor_tau
+    motor_tau_up: float = 0.1
+    motor_tau_down: float = 0.1 # 默认值设大一点体现差异
+    
     # [新增] 力矩系数
-    moment_scale: float = 0.016  
+    moment_scale: float = 0.025 
 
-    # [新增] 用于多教师蒸馏的参数列表 (List of dicts)
-    # 格式: [{'mass': 0.03, 'arm_length': 0.04, 'inertia': (x,y,z), 'twr': 2.0, 'motor_tau': 0.05}, {...}]
-    # 如果此列表不为空，将覆盖上面的单值设置，并按环境索引分段分配
-    multi_teacher_params: list[dict] | None = None 
+    multi_teacher_params: list[dict] | None = None
 
 
 class QuadcopterEnvWindow(BaseEnvWindow):
@@ -151,7 +149,7 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     decimation = 1
     action_space = 4 
     state_space = 0
-    debug_vis = False
+    debug_vis = True
 
     map_size = MAP_SIZE
 
@@ -1152,3 +1150,49 @@ class QuadcopterEnv(DirectRLEnv):
     def close(self):
         """Clean up resources when environment is closed."""
         super().close()
+
+    # [在 distillation_env.py 中 QuadcopterEnv 类里添加此方法]
+    def get_pid_actions(self) -> torch.Tensor:
+        """
+        利用内置的 PID 控制器计算当前状态下的理想动作 (Motor Speeds [0,1])。
+        用于 PID 蒸馏教学。
+        """
+        # 1. 获取当前真实状态 (Ground Truth)
+        pos_w = self._robot.data.root_pos_w
+        quat_w = self._robot.data.root_quat_w
+        vel_w = self._robot.data.root_lin_vel_w
+        ang_vel_w = self._robot.data.root_ang_vel_w
+        
+        # 注意: pid_controller.py 中的 compute_target_speeds 需要的是世界系还是机体系的角速度?
+        # 通常物理公式基于世界系位置/速度 和 机体姿态。
+        # 查看 pid_controller 发现它内部处理了姿态误差。
+        # 这里传入世界系角速度或者机体系角速度取决于 controller 实现，
+        # 但通常 PaperPhysController 期望的是 body frame ang vel (因为它是传感器直接读数)
+        # 你的 pid_controller.py 第 99 行: des_ang_vel - cur_ang_vel
+        # 这里需要确认 cur_ang_vel 的坐标系。通常 IsaacLab root_ang_vel_b 是机体系。
+        ang_vel_b = self._robot.data.root_ang_vel_b
+
+        # 2. 获取期望状态
+        # 已经在 _pre_physics_step 中更新了: self.pos_des, self.vel_des, self.acc_des
+        
+        # 3. 调用 PID 计算
+        # compute_target_speeds(self, cur_pos, cur_vel, cur_quat, cur_ang_vel, des_pos, des_vel, des_acc_ff)
+        target_motor_speeds = self._controller.compute_target_speeds(
+            cur_pos=pos_w,
+            cur_vel=vel_w,
+            cur_quat=quat_w,
+            cur_ang_vel=ang_vel_b, # 使用机体系角速度
+            des_pos=self.pos_des,
+            des_vel=self.vel_des,
+            des_acc_ff=self.acc_des
+        )
+        
+        # 4. 映射到动作空间 [-1, 1]
+        # 环境动作通常是归一化的 [-1, 1]，而 PID 输出是 [0, 1] (Motor Speeds)
+        # 根据 env._pre_physics_step: 
+        # action_setpoint_normalized = (raw_actions_clamped + 1.0) * 0.5
+        # 所以: raw_action = setpoint * 2.0 - 1.0
+        
+        pid_actions = target_motor_speeds * 2.0 - 1.0
+        
+        return torch.clamp(pid_actions, -1.0, 1.0)

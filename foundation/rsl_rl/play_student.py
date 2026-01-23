@@ -107,13 +107,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # Example dynamics parameters (Modify as needed or keep commented to use defaults)
     # crazyfile
-    env_cfg.dynamics.mass = 0.027
-    env_cfg.dynamics.arm_length = 0.046
-    env_cfg.dynamics.inertia = (1.657e-5,1.665e-5,2.926e-5)
-    env_cfg.dynamics.thrust_to_weight = 2
-    env_cfg.dynamics.motor_tau_up = 0.06
-    env_cfg.dynamics.motor_tau_down = 0.15
-    env_cfg.dynamics.moment_scale = 0.025
+    # env_cfg.dynamics.mass = 0.027
+    # env_cfg.dynamics.arm_length = 0.046
+    # env_cfg.dynamics.inertia = (1.657e-5,1.665e-5,2.926e-5)
+    # env_cfg.dynamics.thrust_to_weight = 2
+    # env_cfg.dynamics.motor_tau_up = 0.06
+    # env_cfg.dynamics.motor_tau_down = 0.15
+    # env_cfg.dynamics.moment_scale = 0.025
 
     # # x500
     # env_cfg.dynamics.mass = 2
