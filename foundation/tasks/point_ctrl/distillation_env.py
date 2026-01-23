@@ -41,6 +41,7 @@ import os
 import csv
 
 from foundation.utils.simple_controller import SimpleQuadrotorController
+from foundation.utils.pid_controller import PaperPhysControllerTensor
 
 from enum import IntEnum
 import collections
@@ -303,14 +304,14 @@ class QuadcopterEnv(DirectRLEnv):
         self._robot_mass = self.mass_tensor 
 
         # Controller initialization with tensors
-        self._controller = SimpleQuadrotorController(
+        self._controller = PaperPhysControllerTensor(
             num_envs=self.num_envs,
             device=self.device,
-            mass=self.mass_tensor,        # Pass self.var
-            arm_length=self.arm_l_tensor, # Pass self.var
-            inertia=self.inertia_tensor,  # Pass self.var
-            thrust_to_weight=self.twr_tensor,  # Pass self.var
-            moment_scale=self.kappa_tensor
+            mass=self.mass_tensor,
+            arm_length=self.arm_l_tensor,
+            inertia=self.inertia_tensor,
+            thrust_to_weight=self.twr_tensor,
+            kappa=self.kappa_tensor # <--- 传入
         )
 
         self.dt = self.cfg.sim.dt
@@ -694,7 +695,7 @@ class QuadcopterEnv(DirectRLEnv):
         self._current_motor_speeds = alpha * target + (1.0 - alpha) * current
 
         # 计算力与力矩
-        force_b, torque_b, _ = self._controller.motor_speeds_to_wrench(self._current_motor_speeds) 
+        force_b, torque_b = self._controller.motor_speeds_to_wrench(self._current_motor_speeds) 
 
         # 5. 施加力
         self._forces.zero_()

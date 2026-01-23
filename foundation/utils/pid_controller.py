@@ -106,6 +106,7 @@ class PaperPhysControllerTensor:
         des_att[:, 0] = 1.0 # Identity
         if mask.any():
             # des_att[mask] = quat_from_angle_axis(angle[mask], rot_ax[mask]/ax_norm[mask])
+            
             masked_angle = angle[mask]
             masked_rot_ax = rot_ax[mask]
             masked_ax_norm = ax_norm[mask]
