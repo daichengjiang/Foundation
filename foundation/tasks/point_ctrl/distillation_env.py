@@ -195,9 +195,9 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     
     # State check thresholds (for any dimension x, y, z)
     position_threshold = 15.0  # meters
-    position_threshold_langevin = 14  # 根据实际需求调整
+    position_threshold_langevin = 500  # 根据实际需求调整
 
-    linear_velocity_threshold = 4.0  # m/s
+    linear_velocity_threshold = 40.0  # m/s
     angular_velocity_threshold = 35.0  # rad/s
 
     reward_coef_position_cost = 1.0
@@ -922,8 +922,8 @@ class QuadcopterEnv(DirectRLEnv):
             lin_vel = sample_in_sphere(1.0, num_resets)
             ang_vel = sample_in_sphere(1.0, num_resets)
             
-            roll = (torch.rand(num_resets, device=self.device) * 2 - 1) * (math.pi / 2.0)
-            pitch = (torch.rand(num_resets, device=self.device) * 2 - 1) * (math.pi / 2.0)
+            roll = (torch.rand(num_resets, device=self.device) * 2 - 1) * (math.pi / 4.0)
+            pitch = (torch.rand(num_resets, device=self.device) * 2 - 1) * (math.pi / 4.0)
             yaw = (torch.rand(num_resets, device=self.device) * 2 - 1) * math.pi
             quat = quat_from_euler_xyz(roll, pitch, yaw)
 
