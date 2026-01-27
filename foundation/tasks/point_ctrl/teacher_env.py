@@ -158,7 +158,7 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     height = 3.0
     position_threshold = 15.0
     position_threshold_langevin = 14
-    linear_velocity_threshold = 4.0
+    linear_velocity_threshold = 6.0
     angular_velocity_threshold = 35.0
 
     reward_coef_position_cost = 1.0
@@ -250,18 +250,6 @@ class QuadcopterEnv(DirectRLEnv):
         # Store for reference
         self._robot_mass = self.mass_tensor 
 
-        # 初始化控制器 (传入异构张量)
-        self._controller = PaperPhysControllerTensor(
-            num_envs=self.num_envs,
-            device=self.device,
-            mass=self.mass_tensor,
-            arm_length=self.arm_l_tensor,
-            inertia=self.inertia_tensor,
-            thrust_to_weight=self.twr_tensor,
-            kappa=self.kappa_tensor # <--- 传入
-        )
-        # =================================================================
-
         self.dt = self.cfg.sim.dt
         # if self.motor_tau.shape != (self.num_envs, 1):
         #      self.motor_tau = self.motor_tau.view(self.num_envs, 1)
@@ -275,6 +263,19 @@ class QuadcopterEnv(DirectRLEnv):
         self.motor_alpha_down = self.dt / (self.dt + self.motor_tau_down_tensor)
 
         self._current_motor_speeds = torch.zeros(self.num_envs, 4, device=self.device)
+
+        # 初始化控制器 (传入异构张量)
+        self._controller = PaperPhysControllerTensor(
+            num_envs=self.num_envs,
+            device=self.device,
+            mass=self.mass_tensor,
+            arm_length=self.arm_l_tensor,
+            inertia=self.inertia_tensor,
+            thrust_to_weight=self.twr_tensor,
+            kappa=self.kappa_tensor,
+            motor_alpha_up=self.motor_alpha_up,
+            motor_alpha_down=self.motor_alpha_down,
+        )
 
         # 状态标志位
         self._is_langevin_task = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
@@ -607,18 +608,18 @@ class QuadcopterEnv(DirectRLEnv):
         # 2. 计算期望转速 (Controller)
         motor_speeds_cmd = self._controller.compute_target_speeds(
             cur_pos, cur_vel, cur_quat, cur_ang_vel,
-            self.pos_des, self.vel_des, self.acc_des
+            self.pos_des, self.vel_des, self.acc_des,
+            self._current_motor_speeds
         )
 
-        force_b, torque_b = self._controller.motor_speeds_to_wrench(motor_speeds_cmd)
+        # 3. 模拟电机响应
+        target = motor_speeds_cmd
+        current = self._current_motor_speeds
+        alpha = torch.where(target > current, self.motor_alpha_up, self.motor_alpha_down)
+        self._current_motor_speeds = alpha * target + (1.0 - alpha) * current
+
+        force_b, torque_b = self._controller.motor_speeds_to_wrench(self._current_motor_speeds)
         
-        # # 3. 模拟电机响应 (Motor Physics - 1st order lag)
-        # # 这是 motor.py line 55 的逻辑
-        # target = des_motor_speeds
-        # current = self._current_motor_speeds
-        # alpha = torch.where(target > current, self.motor_alpha_up, self.motor_alpha_down)
-        # self._current_motor_speeds = alpha * target + (1.0 - alpha) * current
-    
         self._forces.zero_()
         self._torques.zero_()
         self._forces[:, 0, :] = force_b
@@ -830,9 +831,9 @@ class QuadcopterEnv(DirectRLEnv):
             ang_vel = sample_in_sphere(1.0, num_resets)            # 1rad/s 内的随机角速度
             
             # 随机旋转 (Roll, Pitch, Yaw)
-            r = (torch.rand(num_resets, device=self.device)*2-1) * (math.pi/2)
-            p = (torch.rand(num_resets, device=self.device)*2-1) * (math.pi/2)
-            y = (torch.rand(num_resets, device=self.device)*2-1) * math.pi
+            r = (torch.rand(num_resets, device=self.device)*2-1) * (math.pi / 4)
+            p = (torch.rand(num_resets, device=self.device)*2-1) * (math.pi / 4)
+            y = (torch.rand(num_resets, device=self.device)*2-1) * (math.pi / 3)
             quat = quat_from_euler_xyz(r, p, y)
             
             # 10% 几率完美开局，加速初期收敛

@@ -197,7 +197,7 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     position_threshold = 15.0  # meters
     position_threshold_langevin = 14  # 根据实际需求调整
 
-    linear_velocity_threshold = 8.0  # m/s
+    linear_velocity_threshold = 6.0  # m/s
     angular_velocity_threshold = 35.0  # rad/s
 
     reward_coef_position_cost = 1.0
@@ -301,17 +301,6 @@ class QuadcopterEnv(DirectRLEnv):
         # Store the robot mass for reference (e.g. wind force calculation if added later)
         self._robot_mass = self.mass_tensor 
 
-        # Controller initialization with tensors
-        self._controller = PaperPhysControllerTensor(
-            num_envs=self.num_envs,
-            device=self.device,
-            mass=self.mass_tensor,
-            arm_length=self.arm_l_tensor,
-            inertia=self.inertia_tensor,
-            thrust_to_weight=self.twr_tensor,
-            kappa=self.kappa_tensor # <--- 传入
-        )
-
         self.dt = self.cfg.sim.dt
 
         # if self.motor_tau.shape != (self.num_envs, 1):
@@ -326,8 +315,20 @@ class QuadcopterEnv(DirectRLEnv):
         self.motor_alpha_up = self.dt / (self.dt + self.motor_tau_up_tensor)
         self.motor_alpha_down = self.dt / (self.dt + self.motor_tau_down_tensor)
 
-
         self._current_motor_speeds = torch.zeros(self.num_envs, 4, device=self.device)
+
+        # Controller initialization with tensors
+        self._controller = PaperPhysControllerTensor(
+            num_envs=self.num_envs,
+            device=self.device,
+            mass=self.mass_tensor,
+            arm_length=self.arm_l_tensor,
+            inertia=self.inertia_tensor,
+            thrust_to_weight=self.twr_tensor,
+            kappa=self.kappa_tensor,
+            motor_alpha_up=self.motor_alpha_up,
+            motor_alpha_down=self.motor_alpha_down
+        )
         
         self._is_langevin_task = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
@@ -924,7 +925,7 @@ class QuadcopterEnv(DirectRLEnv):
             
             roll = (torch.rand(num_resets, device=self.device) * 2 - 1) * (math.pi / 4.0)
             pitch = (torch.rand(num_resets, device=self.device) * 2 - 1) * (math.pi / 4.0)
-            yaw = (torch.rand(num_resets, device=self.device) * 2 - 1) * math.pi
+            yaw = (torch.rand(num_resets, device=self.device) * 2 - 1) * (math.pi / 3.0)
             quat = quat_from_euler_xyz(roll, pitch, yaw)
 
             # 10% 完美开局
@@ -1157,37 +1158,20 @@ class QuadcopterEnv(DirectRLEnv):
         利用内置的 PID 控制器计算当前状态下的理想动作 (Motor Speeds [0,1])。
         用于 PID 蒸馏教学。
         """
-        # 1. 获取当前真实状态 (Ground Truth)
-        pos_w = self._robot.data.root_pos_w
-        quat_w = self._robot.data.root_quat_w
-        vel_w = self._robot.data.root_lin_vel_w
-        ang_vel_w = self._robot.data.root_ang_vel_w
+        # 1. 获取状态
+        cur_pos = self._robot.data.root_pos_w
+        cur_vel = self._robot.data.root_lin_vel_w
+        cur_quat = self._robot.data.root_quat_w
+        cur_ang_vel = self._robot.data.root_ang_vel_b
         
-        # 注意: pid_controller.py 中的 compute_target_speeds 需要的是世界系还是机体系的角速度?
-        # 通常物理公式基于世界系位置/速度 和 机体姿态。
-        # 查看 pid_controller 发现它内部处理了姿态误差。
-        # 这里传入世界系角速度或者机体系角速度取决于 controller 实现，
-        # 但通常 PaperPhysController 期望的是 body frame ang vel (因为它是传感器直接读数)
-        # 你的 pid_controller.py 第 99 行: des_ang_vel - cur_ang_vel
-        # 这里需要确认 cur_ang_vel 的坐标系。通常 IsaacLab root_ang_vel_b 是机体系。
-        ang_vel_b = self._robot.data.root_ang_vel_b
-
-        # 2. 获取期望状态
-        # 已经在 _pre_physics_step 中更新了: self.pos_des, self.vel_des, self.acc_des
-        
-        # 3. 调用 PID 计算
-        # compute_target_speeds(self, cur_pos, cur_vel, cur_quat, cur_ang_vel, des_pos, des_vel, des_acc_ff)
+        # 2. 计算期望转速 (Controller)
         target_motor_speeds = self._controller.compute_target_speeds(
-            cur_pos=pos_w,
-            cur_vel=vel_w,
-            cur_quat=quat_w,
-            cur_ang_vel=ang_vel_b, # 使用机体系角速度
-            des_pos=self.pos_des,
-            des_vel=self.vel_des,
-            des_acc_ff=self.acc_des
+            cur_pos, cur_vel, cur_quat, cur_ang_vel,
+            self.pos_des, self.vel_des, self.acc_des,
+            self._current_motor_speeds
         )
         
-        # 4. 映射到动作空间 [-1, 1]
+        # 映射到动作空间 [-1, 1]
         # 环境动作通常是归一化的 [-1, 1]，而 PID 输出是 [0, 1] (Motor Speeds)
         # 根据 env._pre_physics_step: 
         # action_setpoint_normalized = (raw_actions_clamped + 1.0) * 0.5

@@ -13,7 +13,9 @@ class PaperPhysControllerTensor:
                  arm_length: torch.Tensor,        # Shape: [num_envs]
                  inertia: torch.Tensor,           # Shape: [num_envs, 3]
                  thrust_to_weight: torch.Tensor,  # Shape: [num_envs]
-                 kappa: torch.Tensor = None, # Shape: [num_envs] (Optional, aka kappa/c_m)
+                 kappa: torch.Tensor, # Shape: [num_envs] (Optional, aka kappa/c_m)
+                 motor_alpha_up: torch.Tensor, # Shape: [num_envs]
+                 motor_alpha_down: torch.Tensor, # Shape: [num_envs]
                  gravity: float = 9.81):
         
         self.num_envs = num_envs
@@ -22,8 +24,10 @@ class PaperPhysControllerTensor:
         self.mass = mass.to(device)
         self.inertia = inertia.to(device) # [N, 3] 对角阵
         self.arm_length = arm_length.to(device)
-        self.kappa = kappa.to(device) if kappa is not None else None
+        self.kappa = kappa.to(device)
         self.thrust_to_weight = thrust_to_weight.to(device)
+        self.motor_alpha_up = motor_alpha_up.to(device)
+        self.motor_alpha_down = motor_alpha_down.to(device)
         
         # 质量 < 200g (0.2kg) -> wn = 6.0
         # 质量 >= 200g (0.2kg) -> wn = 2.0
@@ -63,7 +67,7 @@ class PaperPhysControllerTensor:
         self.mat = mat
         self.mat_inv = torch.linalg.inv(mat)
 
-    def compute_target_speeds(self, cur_pos, cur_vel, cur_quat, cur_ang_vel, des_pos, des_vel, des_acc_ff):
+    def compute_target_speeds(self, cur_pos, cur_vel, cur_quat, cur_ang_vel, des_pos, des_vel, des_acc_ff, cur_motor_speed):
         """
         流程：PositionController -> AttitudeController -> Mixer -> Speed
         对应文件：positioncontroller.py, attitudecontroller.py, mixer.py
@@ -167,9 +171,13 @@ class PaperPhysControllerTensor:
         # line 46: speedCommand = sqrt(cmd / speedSqrToThrust)
 
         max_thrust_motor = self.thrust_to_weight * self.mass * self.gravity / 4.0
-        motor_speeds_cmd = torch.sqrt(motor_forces / (max_thrust_motor.unsqueeze(-1)))
-        motor_speeds_cmd = torch.clamp(motor_speeds_cmd, 0.0, 1.0)
+        target = torch.sqrt(motor_forces / (max_thrust_motor.unsqueeze(-1)))
+        target = torch.clamp(target, 0.0, 1.0)
         
+        alpha = torch.where(target > cur_motor_speed, self.motor_alpha_up, self.motor_alpha_down)
+        motor_speeds_cmd = cur_motor_speed + (target - cur_motor_speed) / alpha
+        motor_speeds_cmd = torch.clamp(motor_speeds_cmd, 0.0, 1.0)
+
         # return f_total_vec, moments
         return motor_speeds_cmd
 
