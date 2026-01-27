@@ -218,7 +218,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
 
     # ---------------------------------------------------------
-    # 修改点 3: 结果筛选与保存
+    # 修改点 3: 结果筛选与保存 (增量保存版)
     # ---------------------------------------------------------
     print(f"\n{'=' * 80}")
     print(f"Simulation Complete. Filtering results (Group Logic)...")
@@ -233,16 +233,40 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     csv_filename = args_cli.output_csv
     fieldnames = [
         "id", "mass", "arm_length", "Ixx", "Iyy", "Izz", 
-        "twr", "motor_tau_up", "motor_tau_down", "kappa", "mean_rmse" # 改为 mean_rmse 更合理，或者保留 rmse
+        "twr", "motor_tau_up", "motor_tau_down", "kappa", "mean_rmse" 
     ]
     
-    valid_group_count = 0
+    # === 新增逻辑：判断是否追加模式 ===
+    file_exists = os.path.isfile(csv_filename) and os.path.getsize(csv_filename) > 0
+    write_mode = 'a' if file_exists else 'w'
+    
+    # === 新增逻辑：读取已有 ID 以保持连续 ===
     id_counter = 0
-    rmse_threshold = 0.1
+    if file_exists:
+        try:
+            with open(csv_filename, 'r') as f_read:
+                # 使用 DictReader 安全读取最后一行的 ID
+                reader = csv.DictReader(f_read)
+                for row in reader:
+                    # 遍历直到最后一行，获取最后一个 ID
+                    if row["id"]:
+                        id_counter = int(row["id"])
+                # 下一个新的 ID 应该是最后一个 + 1
+                id_counter += 1
+                print(f"[INFO] Appending to existing CSV. Starting ID: {id_counter}")
+        except Exception as e:
+            print(f"[WARNING] Could not read existing ID, starting from 0. Error: {e}")
 
-    with open(csv_filename, mode='w', newline='') as csv_file:
+    valid_group_count = 0
+    rmse_threshold = 0.2
+
+    # 使用计算好的 mode 打开文件
+    with open(csv_filename, mode=write_mode, newline='') as csv_file:
         writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
-        writer.writeheader()
+        
+        # 只有在文件是新的时候（写模式）才写入表头
+        if write_mode == 'w':
+            writer.writeheader()
         
         # 遍历每一组 (Unique Set)
         for i in range(num_unique_params):
@@ -262,7 +286,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 # 因为这一组的 10 个参数是一样的，取第一个即可
                 p = dynamics_params_list[start_idx]
                 
-                # 统计一下这一组的平均误差（可选）
+                # 统计一下这一组的平均误差
                 avg_group_rmse = np.mean(group_rmse)
                 
                 row = {
@@ -276,7 +300,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     "motor_tau_up": p["motor_tau_up"],
                     "motor_tau_down": p["motor_tau_down"],
                     "kappa": p["kappa"],
-                    "mean_rmse": float(avg_group_rmse) # 记录这一组的平均表现
+                    "mean_rmse": float(avg_group_rmse)
                 }
                 
                 writer.writerow(row)
@@ -286,7 +310,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     print(f"Filtering complete.")
     print(f"Total Unique Params Tested: {num_unique_params}")
     print(f"Valid Groups (All {ENV_REPEATS} reps survived & RMSE < {rmse_threshold}): {valid_group_count}")
-    print(f"Results saved to: {os.path.abspath(csv_filename)}")
+    print(f"Results {'appended' if file_exists else 'saved'} to: {os.path.abspath(csv_filename)}")
     print(f"{'=' * 80}\n")
     
     env.close()
