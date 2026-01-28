@@ -126,7 +126,8 @@ class ActorCriticRNN(nn.Module):
         actor_layers.append(activation)
         for layer_index in range(len(actor_hidden_dims)):
             if layer_index == len(actor_hidden_dims) - 1:
-                actor_layers.append(nn.Linear(actor_hidden_dims[layer_index], num_actions))  
+                actor_layers.append(nn.Linear(actor_hidden_dims[layer_index], num_actions))
+                actor_layers.append(nn.Tanh())  
             else:
                 actor_layers.append(nn.Linear(actor_hidden_dims[layer_index], actor_hidden_dims[layer_index + 1]))
                 actor_layers.append(activation)
@@ -206,7 +207,6 @@ class ActorCriticRNN(nn.Module):
         depth_features = self.actor_cnn(depth_obs)  
 
         if self.obs_history_length != 0:
-            obs_history = unpadded_obs[:, self.obs_size:self.obs_history_length * self.obs_size]
             obs_history = unpadded_obs[:, self.obs_size:self.obs_size + self.obs_history_length * self.obs_size]
             obs_history_features = self.actor_obs_his_mlp(obs_history)  
             # Concatenate features
@@ -224,8 +224,7 @@ class ActorCriticRNN(nn.Module):
             features = self.actor_memory(features, masks, hidden_states).squeeze(0)
 
         # Compute mean with fusion MLP
-        # mean = self.actor(features)  
-        mean = torch.tanh(self.actor(features))
+        mean = self.actor(features)  
 
         # Compute standard deviation
         if self.noise_std_type == "scalar":
@@ -268,8 +267,7 @@ class ActorCriticRNN(nn.Module):
         fused_features = self.actor_memory(fused_features).squeeze(0)
 
         # Compute mean
-        # actions_mean = self.actor(fused_features)
-        actions_mean = torch.tanh(self.actor(fused_features))
+        actions_mean = self.actor(fused_features)
         return actions_mean
 
     def evaluate(self, critic_observations, masks=None, hidden_states=None, **kwargs):
