@@ -106,14 +106,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env_cfg.sim.use_fabric = not args_cli.disable_fabric if args_cli.disable_fabric is not None else env_cfg.sim.use_fabric
 
     # Example dynamics parameters (Modify as needed or keep commented to use defaults)
-    # crazyfile
-    env_cfg.dynamics.mass = 0.027
-    env_cfg.dynamics.arm_length = 0.046
-    env_cfg.dynamics.inertia = (1.657e-5,1.665e-5,2.926e-5)
-    env_cfg.dynamics.thrust_to_weight = 2
-    env_cfg.dynamics.motor_tau_up = 0.06
-    env_cfg.dynamics.motor_tau_down = 0.15
-    env_cfg.dynamics.moment_scale = 0.025
+    # # crazyfile
+    # env_cfg.dynamics.mass = 0.027
+    # env_cfg.dynamics.arm_length = 0.046
+    # env_cfg.dynamics.inertia = (1.657e-5,1.665e-5,2.926e-5)
+    # env_cfg.dynamics.thrust_to_weight = 2
+    # env_cfg.dynamics.motor_tau_up = 0.06
+    # env_cfg.dynamics.motor_tau_down = 0.15
+    # env_cfg.dynamics.moment_scale = 0.025
 
     # # x500
     # env_cfg.dynamics.mass = 2
@@ -156,6 +156,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # env_cfg.dynamics.motor_tau_up = 0.04830513035810187
     # env_cfg.dynamics.motor_tau_down = 0.2732373476309069
     # env_cfg.dynamics.moment_scale = 0.0451817502153234
+
+    env_cfg.dynamics.mass = 0.0282
+    env_cfg.dynamics.arm_length = 0.04384
+    env_cfg.dynamics.inertia = (2.44864e-5, 2.44864e-5, 3.61504e-5)
+    env_cfg.dynamics.thrust_to_weight = 2.25
+    env_cfg.dynamics.motor_tau_up = 0.05
+    env_cfg.dynamics.motor_tau_down = 0.10
+    env_cfg.dynamics.moment_scale = 0.016
+
 
     # get checkpoint path
     checkpoint_path = retrieve_file_path(args_cli.checkpoint)

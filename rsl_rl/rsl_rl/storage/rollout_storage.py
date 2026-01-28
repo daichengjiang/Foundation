@@ -184,39 +184,22 @@ class RolloutStorage:
             ].to(self.device), self.dones[i].to(self.device)
 
     def recurrent_distillation_batch_generator(self, num_mini_batches):
-        """
-        [FIXED] Generator for distillation training with recurrent student networks using BATCH processing.
-        Fix: Handles device placement correctly (Indices on CPU, Batches moved to GPU).
-        """
         if self.training_type != "distillation":
             raise ValueError("This function is only available for distillation training.")
 
-        # 1. Split and Pad Trajectories (Data is on self.storage_device, typically 'cpu')
-        # padded_obs: [max_traj_len, num_trajs, dim]
         padded_obs, masks = split_and_pad_trajectories(self.observations, self.dones)
-        
-        # Handle privileged actions
         padded_priv_actions, _ = split_and_pad_trajectories(self.privileged_actions, self.dones)
         
-        # 2. Prepare Batches
         num_trajs = padded_obs.shape[1]
         batch_size = num_trajs // num_mini_batches
-        
-        # [CRITICAL FIX] Generate indices on the SAME device as the data (storage_device/cpu)
-        # 不要使用 self.device，因为 data 在 CPU 上
         indices = torch.randperm(num_trajs, device=self.storage_device)
         
         for i in range(num_mini_batches):
             start = i * batch_size
             end = (i + 1) * batch_size
-            
-            if i == num_mini_batches - 1:
-                end = num_trajs
-                
+            if i == num_mini_batches - 1: end = num_trajs
             batch_idx = indices[start:end]
             
-            # 3. Yield Batch (Move to GPU here)
-            # Indexing happens on CPU (fast & memory efficient), then transfer small batch to GPU
             yield (
                 padded_obs[:, batch_idx].to(self.device),           
                 padded_priv_actions[:, batch_idx].to(self.device),  
@@ -251,29 +234,18 @@ class RolloutStorage:
         # For RND
         if self.rnd_state_shape is not None:
             rnd_state = self.rnd_state.flatten(0, 1)
+        else:
+            rnd_state = None
 
         for epoch in range(num_epochs):
-            allocated = torch.cuda.memory_allocated() / 1024**3  # 转换为 GB
-            reserved = torch.cuda.memory_reserved() / 1024**3    # 转换为 GB
-            max_allocated = torch.cuda.max_memory_allocated() / 1024**3  # 转换为 GB
-            print(f"Epoch {epoch}/{num_epochs}: "
-                  f"GPU Memory - Allocated: {allocated:.2f} GB, "
-                  f"Reserved: {reserved:.2f} GB, "
-                  f"Max Allocated: {max_allocated:.2f} GB")
-            
             for i in range(num_mini_batches):
-                # Select the indices for the mini-batch
                 start = i * mini_batch_size
                 end = (i + 1) * mini_batch_size
                 batch_idx = indices[start:end]
 
-                # Create the mini-batch
-                # -- Core
                 obs_batch = observations[batch_idx].to(self.device)
                 privileged_observations_batch = privileged_observations[batch_idx].to(self.device)
                 actions_batch = actions[batch_idx].to(self.device)
-
-                # -- For PPO
                 target_values_batch = values[batch_idx].to(self.device)
                 returns_batch = returns[batch_idx].to(self.device)
                 old_actions_log_prob_batch = old_actions_log_prob[batch_idx].to(self.device)
@@ -281,13 +253,11 @@ class RolloutStorage:
                 old_mu_batch = old_mu[batch_idx].to(self.device)
                 old_sigma_batch = old_sigma[batch_idx].to(self.device)
 
-                # -- For RND
                 if self.rnd_state_shape is not None:
                     rnd_state_batch = rnd_state[batch_idx].to(self.device)
                 else:
                     rnd_state_batch = None
 
-                # yield the mini-batch
                 yield obs_batch, privileged_observations_batch, actions_batch, target_values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (
                     None,
                     None,
@@ -297,12 +267,12 @@ class RolloutStorage:
     def recurrent_mini_batch_generator(self, num_mini_batches, num_epochs=8):
         if self.training_type != "rl":
             raise ValueError("This function is only available for reinforcement learning training.")
-        print(self.observations.shape)
+        
+        # [FIX] Prepare ALL tensors by padding them into trajectories
         padded_obs_trajectories, trajectory_masks = split_and_pad_trajectories(self.observations, self.dones)
-        print(padded_obs_trajectories.shape)
+        
         if self.privileged_observations is not None:
             padded_privileged_obs_trajectories, _ = split_and_pad_trajectories(self.privileged_observations, self.dones)
-            print(padded_privileged_obs_trajectories.shape)
         else:
             padded_privileged_obs_trajectories = padded_obs_trajectories
 
@@ -311,17 +281,18 @@ class RolloutStorage:
         else:
             padded_rnd_state_trajectories = None
 
+        # [CRITICAL FIX] Apply padding to all PPO buffers to align with observations
+        padded_actions, _ = split_and_pad_trajectories(self.actions, self.dones)
+        padded_values, _ = split_and_pad_trajectories(self.values, self.dones)
+        padded_returns, _ = split_and_pad_trajectories(self.returns, self.dones)
+        padded_advantages, _ = split_and_pad_trajectories(self.advantages, self.dones)
+        padded_old_log_prob, _ = split_and_pad_trajectories(self.actions_log_prob, self.dones)
+        padded_old_mu, _ = split_and_pad_trajectories(self.mu, self.dones)
+        padded_old_sigma, _ = split_and_pad_trajectories(self.sigma, self.dones)
+
         mini_batch_size = self.num_envs // num_mini_batches
+        
         for ep in range(num_epochs):
-            
-            allocated = torch.cuda.memory_allocated() / 1024**3  # 转换为 GB
-            reserved = torch.cuda.memory_reserved() / 1024**3    # 转换为 GB
-            max_allocated = torch.cuda.max_memory_allocated() / 1024**3  # 转换为 GB
-            print(f"Epoch {ep}/{num_epochs}: "
-                  f"GPU Memory - Allocated: {allocated:.2f} GB, "
-                  f"Reserved: {reserved:.2f} GB, "
-                  f"Max Allocated: {max_allocated:.2f} GB")
-            
             first_traj = 0
             for i in range(num_mini_batches):
                 start = i * mini_batch_size
@@ -334,26 +305,26 @@ class RolloutStorage:
                 trajectories_batch_size = torch.sum(last_was_done[:, start:stop])
                 last_traj = first_traj + trajectories_batch_size
 
+                # [FIX] Use the padded versions for all batch elements
                 masks_batch = trajectory_masks[:, first_traj:last_traj].to(self.device)
                 obs_batch = padded_obs_trajectories[:, first_traj:last_traj].to(self.device)
                 privileged_obs_batch = padded_privileged_obs_trajectories[:, first_traj:last_traj].to(self.device)  
+
+                # Use padded actions/values/etc (slices match obs_batch dimension)
+                actions_batch = padded_actions[:, first_traj:last_traj].to(self.device)
+                values_batch = padded_values[:, first_traj:last_traj].to(self.device)
+                returns_batch = padded_returns[:, first_traj:last_traj].to(self.device)
+                advantages_batch = padded_advantages[:, first_traj:last_traj].to(self.device)
+                old_actions_log_prob_batch = padded_old_log_prob[:, first_traj:last_traj].to(self.device)
+                old_mu_batch = padded_old_mu[:, first_traj:last_traj].to(self.device)
+                old_sigma_batch = padded_old_sigma[:, first_traj:last_traj].to(self.device)
 
                 if padded_rnd_state_trajectories is not None:
                     rnd_state_batch = padded_rnd_state_trajectories[:, first_traj:last_traj].to(self.device)
                 else:
                     rnd_state_batch = None
 
-                actions_batch = self.actions[:, start:stop].to(self.device)
-                old_mu_batch = self.mu[:, start:stop].to(self.device)
-                old_sigma_batch = self.sigma[:, start:stop].to(self.device)
-                returns_batch = self.returns[:, start:stop].to(self.device)
-                advantages_batch = self.advantages[:, start:stop].to(self.device)
-                values_batch = self.values[:, start:stop].to(self.device)
-                old_actions_log_prob_batch = self.actions_log_prob[:, start:stop].to(self.device)
-
-                # reshape to [num_envs, time, num layers, hidden dim] (original shape: [time, num_layers, num_envs, hidden_dim])
-                # then take only time steps after dones (flattens num envs and time dimensions),
-                # take a batch of trajectories and finally reshape back to [num_layers, batch, hidden_dim]
+                # Hidden State logic remains same
                 last_was_done = last_was_done.permute(1, 0)
                 hid_a_batch = [
                     saved_hidden_states.permute(2, 0, 1, 3)[last_was_done][first_traj:last_traj]
@@ -369,7 +340,6 @@ class RolloutStorage:
                     .to(self.device)
                     for saved_hidden_states in self.saved_hidden_states_c
                 ]
-                # remove the tuple for GRU
                 hid_a_batch = hid_a_batch[0] if len(hid_a_batch) == 1 else hid_a_batch
                 hid_c_batch = hid_c_batch[0] if len(hid_c_batch) == 1 else hid_c_batch
 
