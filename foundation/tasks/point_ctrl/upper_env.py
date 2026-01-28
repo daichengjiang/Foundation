@@ -840,16 +840,21 @@ class QuadcopterEnv(DirectRLEnv):
         self.sim.play()
 
     def _pre_physics_step(self, actions: torch.Tensor):
-        actions = actions.clamp(-1.0, 1.0)
+
         # 1. actions 是上层 RL 输出的 6 维向量 [-1, 1]
+        actions = torch.clamp(actions, -1.0, 1.0)
         self._actions = actions.clone() # 这里的 self._actions 对应 action_space=6
         
         # 2. 解析并缩放上层指令 (纠偏量)
-        # 假设缩放范围：位置误差 +-2m，速度误差 +-2m/s (请根据你下层训练时的 range 调整)
-        upper_pos_scale = 2.0
-        upper_vel_scale = 2.0
-        delta_p_b = actions[:, :3] * upper_pos_scale
-        delta_v_b = actions[:, 3:6] * upper_vel_scale
+        # x, y 缩放到 [-0.3, 0.3]，z 缩放到 [-0.35, 0.05]
+        # vx, vy 缩放到 [-1, 1]，vz 缩放到 [-0.5, 0.5]
+        delta_p_xy = actions[:, :2] * 0.3
+        delta_p_z = -0.15 + actions[:, 2:3] * 0.2
+        delta_p_b = torch.cat([delta_p_xy, delta_p_z], dim=-1)
+
+        delta_v_xy = actions[:, 3:5] * 1.0
+        delta_v_z = actions[:, 5:6] * 0.5
+        delta_v_b = torch.cat([delta_v_xy, delta_v_z], dim=-1)
 
         # 3. 准备下层 Student 网络的输入 (22维)
         quat_w = self._robot.data.root_quat_w

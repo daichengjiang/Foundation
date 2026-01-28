@@ -224,7 +224,8 @@ class ActorCriticRNN(nn.Module):
             features = self.actor_memory(features, masks, hidden_states).squeeze(0)
 
         # Compute mean with fusion MLP
-        mean = self.actor(features)  
+        # mean = self.actor(features)  
+        mean = torch.tanh(self.actor(features))
 
         # Compute standard deviation
         if self.noise_std_type == "scalar":
@@ -267,7 +268,8 @@ class ActorCriticRNN(nn.Module):
         fused_features = self.actor_memory(fused_features).squeeze(0)
 
         # Compute mean
-        actions_mean = self.actor(fused_features)
+        # actions_mean = self.actor(fused_features)
+        actions_mean = torch.tanh(self.actor(fused_features))
         return actions_mean
 
     def evaluate(self, critic_observations, masks=None, hidden_states=None, **kwargs):
