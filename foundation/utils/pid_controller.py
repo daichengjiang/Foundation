@@ -31,22 +31,30 @@ class PaperPhysControllerTensor:
         
         # 质量 < 200g (0.2kg) -> wn = 6.0
         # 质量 >= 200g (0.2kg) -> wn = 2.0
-        threshold_mass = 0.2 # 200g
-        wn_light = 6.0
-        wn_heavy = 2.0
+        # threshold_mass = 0.2 # 200g
+        # wn_light = 6.0
+        # wn_heavy = 2.0
 
-        # --- 2. 控制器增益 (来自 positioncontroller.py / attitudecontroller.py) ---
-        self.wn = torch.where(
-                self.mass < threshold_mass,
-                torch.tensor(wn_light, device=device),
-                torch.tensor(wn_heavy, device=device)
-        )
+        # # --- 2. 控制器增益 (来自 positioncontroller.py / attitudecontroller.py) ---
+        # self.wn = torch.where(
+        #         self.mass < threshold_mass,
+        #         torch.tensor(wn_light, device=device),
+        #         torch.tensor(wn_heavy, device=device)
+        # )
         
-        self.zeta = torch.full((num_envs,), 0.7, device=device)
-        self.tc_ang_rp = torch.full((num_envs,), 0.08, device=device)
-        self.tc_ang_y = torch.full((num_envs,), 0.40, device=device)
-        self.tc_rate_rp = torch.full((num_envs,), 0.04, device=device)
-        self.tc_rate_y = torch.full((num_envs,), 0.20, device=device)
+        # self.zeta = torch.full((num_envs,), 0.7, device=device)
+        # self.tc_ang_rp = torch.full((num_envs,), 0.08, device=device)
+        # self.tc_ang_y = torch.full((num_envs,), 0.40, device=device)
+        # self.tc_rate_rp = torch.full((num_envs,), 0.04, device=device)
+        # self.tc_rate_y = torch.full((num_envs,), 0.20, device=device)
+
+        param_list = [2.9245564937591553,0.7187620401382446,0.17166225612163544,0.6650351285934448,0.031566496938467026,0.27553918957710266]  # Default gains
+        self.wn = torch.full((num_envs,), param_list[0], device=device)
+        self.zeta = torch.full((num_envs,), param_list[1], device=device)
+        self.tc_ang_rp = torch.full((num_envs,), param_list[2], device=device)
+        self.tc_ang_y = torch.full((num_envs,), param_list[3], device=device)
+        self.tc_rate_rp = torch.full((num_envs,), param_list[4], device=device)
+        self.tc_rate_y = torch.full((num_envs,), param_list[5], device=device)
 
         # --- 3. 构建混控矩阵 (源自 mixer.py) ---
         # 原 mixer.py 代码:
