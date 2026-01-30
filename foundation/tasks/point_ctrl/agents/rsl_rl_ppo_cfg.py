@@ -143,31 +143,97 @@ class QuadcopterDistillPostPolicyCfg(RslRlPpoActorCriticCfg):
     init_noise_std = 1.0
     activation = "elu"
 
+# @configclass
+# class QuadcopterDistillPostRunnerCfg(RslRlOnPolicyRunnerCfg):
+#     """
+#     对应 Distill Post Env 的 Runner 配置
+#     """
+#     num_steps_per_env = 256  # 与 env 配置保持一致
+#     max_iterations = 10000
+#     save_interval = 200
+#     experiment_name = "distill_post_train" # 实验名称
+#     empirical_normalization = True
+    
+#     # 加载上面的策略配置
+#     policy = QuadcopterDistillPostPolicyCfg()
+    
+#     algorithm = RslRlPpoAlgorithmCfg(
+#         value_loss_coef=1.0,
+#         use_clipped_value_loss=True,
+#         clip_param=0.2,
+#         entropy_coef=0.0002,
+#         num_learning_epochs=5,
+#         num_mini_batches=4, # 根据显存调整
+#         learning_rate=1.0e-4,
+#         schedule="adaptive",
+#         gamma=0.99,
+#         lam=0.95,
+#         desired_kl=0.01,
+#         max_grad_norm=1.0,
+#     )
+
+# [新增] 1. 定义一个新的算法配置类，包含论文 Algorithm 1 所需的所有参数
+@configclass
+class QuadcopterAdaptivePpoAlgorithmCfg(RslRlPpoAlgorithmCfg):
+    """
+    适配论文 Performance-Adaptive RL 的配置类
+    """
+    # 覆盖原有的 schedule
+    schedule: str = "performance_adaptive"
+    
+    # [新增] Algorithm 1 专用超参数
+    critic_learning_rate: float = 1.0e-3    # Critic 初始学习率 (LR_V)
+    critic_warmup_iterations: int = 50      # Critic 预热步数 (Freeze Actor)
+    
+    # 自适应调整系数 (对应论文中的常数 c)
+    adaptive_c_v: float = 1e-5        # c_V: 用于增加 Actor LR
+    adaptive_c_pi: float = 1e-5       # c_pi: 用于减小 Critic LR
+    adaptive_c_epsilon: float = 0.01  # c_epsilon: 用于增加 Clip Range
+    
+    # 边界限制
+    lr_max: float = 5.0e-4            # Actor LR 上限
+    lr_min: float = 1.0e-6            # Critic LR 下限
+    epsilon_max: float = 0.5          # Clip Range 上限
+
+# ... (QuadcopterTeacherRunnerCfg 保持不变，此处省略) ...
+# ... (QuadcopterUpperRunnerCfg 保持不变，此处省略) ...
+# ... (QuadcopterDistillationPolicyCfg 保持不变，此处省略) ...
+# ... (QuadcopterDistillationRunnerCfg 保持不变，此处省略) ...
+# ... (QuadcopterDistillPostPolicyCfg 保持不变，此处省略) ...
+
 @configclass
 class QuadcopterDistillPostRunnerCfg(RslRlOnPolicyRunnerCfg):
     """
-    对应 Distill Post Env 的 Runner 配置
+    对应 Distill Post Env 的 Runner 配置 (RL 微调阶段)
     """
-    num_steps_per_env = 256  # 与 env 配置保持一致
+    num_steps_per_env = 256
     max_iterations = 10000
     save_interval = 200
-    experiment_name = "distill_post_train" # 实验名称
+    experiment_name = "distill_post_train"
     empirical_normalization = True
     
-    # 加载上面的策略配置
+    # 使用自定义的 Policy 配置 (保持你之前的定义)
     policy = QuadcopterDistillPostPolicyCfg()
     
-    algorithm = RslRlPpoAlgorithmCfg(
+    # [修改] 2. 使用上面定义的新算法配置类
+    algorithm = QuadcopterAdaptivePpoAlgorithmCfg(
         value_loss_coef=1.0,
         use_clipped_value_loss=True,
-        clip_param=0.2,
+        clip_param=0.2,       # 初始 epsilon
         entropy_coef=0.0002,
         num_learning_epochs=5,
-        num_mini_batches=4, # 根据显存调整
-        learning_rate=1.0e-4,
-        schedule="adaptive",
+        num_mini_batches=4,
+        learning_rate=1.0e-4, # Actor 初始学习率 (LR_pi)
+        schedule="performance_adaptive", # 已经在类定义中默认设置了
         gamma=0.99,
         lam=0.95,
         desired_kl=0.01,
         max_grad_norm=1.0,
+        
+        # 下面这些是新类的默认值，你可以在这里覆盖它们
+        critic_learning_rate=1.0e-3,
+        critic_warmup_iterations=50,
+        adaptive_c_v=1e-5,
+        adaptive_c_pi=1e-5,
+        adaptive_c_epsilon=0.01,
     )

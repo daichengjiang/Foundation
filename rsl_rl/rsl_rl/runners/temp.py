@@ -66,8 +66,7 @@ class OnPolicyRunner:
         # [新增] 配置多 GPU
         self._configure_multi_gpu()
 
-        # [修复关键点] 只有当 num_privileged_obs > 0 时才认为有特权观测
-        # 否则回退到 num_obs (因为 critic_obs 会被赋值为 obs)
+        # [修复] 只有当 num_privileged_obs > 0 时才认为有特权观测
         if self.env.num_privileged_obs is not None and self.env.num_privileged_obs > 0:
             num_critic_obs = self.env.num_privileged_obs
         else:
@@ -149,29 +148,29 @@ class OnPolicyRunner:
             return type(data)(self._to_device(v) for v in data)
         return data
 
-    # [新增关键函数] 智能归一化处理
+    # [辅助函数] 智能归一化处理
     def _apply_norm(self, obs, normalizer):
-        """
-        智能处理 Tensor 或 Tuple/List 类型的观测归一化。
-        如果是 Tuple，假设第一个元素是本体状态（Proprioception）并对其进行归一化，
-        其余元素（如图像、Latent）保持原样。
-        """
         if isinstance(obs, torch.Tensor):
             return normalizer(obs)
         elif isinstance(obs, (tuple, list)):
-            # 假设第一个元素是 State Tensor，需要归一化
-            # 后面的元素保持原样返回
             normed_first = normalizer(obs[0])
             return (normed_first, *obs[1:])
         elif isinstance(obs, dict):
-            # 如果是字典，通常不使用 EmpiricalNormalization，或者需要指定 Key
-            # 这里简单处理：如果 'obs' 在字典里，归一化它
             if "obs" in obs:
                 obs["obs"] = normalizer(obs["obs"])
             return obs
         else:
-            # 未知类型，直接返回，避免报错
             return obs
+
+    # [新增关键函数] 将 Tuple/List 展平成单个 Tensor
+    def _flatten_obs(self, obs):
+        """
+        如果观测是 Tuple/List (例如 [proprio, latent])，将其在最后一维拼接。
+        """
+        if isinstance(obs, (tuple, list)):
+            # 假设所有元素都是 Tensor，且第一维是 Batch，在 dim=-1 拼接
+            return torch.cat(obs, dim=-1)
+        return obs
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):
         # initialize writer
@@ -189,11 +188,9 @@ class OnPolicyRunner:
         
         critic_obs = privileged_obs if privileged_obs is not None else obs
         
-        # 使用 _to_device 处理
         obs = self._to_device(obs)
         critic_obs = self._to_device(critic_obs)
         
-        # 切换到训练模式
         self.train_mode()
 
         ep_infos = []
@@ -217,11 +214,15 @@ class OnPolicyRunner:
         
         with torch.inference_mode():
             while init_steps_collected < steps_to_collect:
-                # [修复] 使用 _apply_norm 替代直接调用
+                # 1. 归一化 (可能返回 Tuple)
                 normed_obs = self._apply_norm(obs, self.obs_normalizer)
                 normed_critic_obs = self._apply_norm(critic_obs, self.critic_obs_normalizer)
                 
-                actions = self.alg.act(normed_obs, normed_critic_obs)
+                # 2. [关键修复] 拼接成 Tensor
+                flat_obs = self._flatten_obs(normed_obs)
+                flat_critic_obs = self._flatten_obs(normed_critic_obs)
+                
+                actions = self.alg.act(flat_obs, flat_critic_obs)
                 
                 obs, rewards, dones, infos = self.env.step(actions)
                 obs = self._to_device(obs)
@@ -269,11 +270,15 @@ class OnPolicyRunner:
                 start = time.time()
                 with torch.inference_mode():
                     for i in range(self.num_steps_per_env):
-                        # [修复] 使用 _apply_norm
+                        # 1. 归一化
                         normed_obs = self._apply_norm(obs, self.obs_normalizer)
                         normed_critic_obs = self._apply_norm(critic_obs, self.critic_obs_normalizer)
                         
-                        actions = self.alg.act(normed_obs, normed_critic_obs)
+                        # 2. [关键修复] 拼接
+                        flat_obs = self._flatten_obs(normed_obs)
+                        flat_critic_obs = self._flatten_obs(normed_critic_obs)
+                        
+                        actions = self.alg.act(flat_obs, flat_critic_obs)
                         
                         obs, rewards, dones, infos = self.env.step(actions)
                         obs = self._to_device(obs)
@@ -295,9 +300,10 @@ class OnPolicyRunner:
                 
                 start = stop
                 
-                # [修复] Compute returns 也需要归一化的 Critic Obs
+                # [关键修复] 计算 Returns 时也需要拼接后的 Critic Obs
                 normed_critic_obs = self._apply_norm(critic_obs, self.critic_obs_normalizer)
-                self.alg.compute_returns(normed_critic_obs)
+                flat_critic_obs = self._flatten_obs(normed_critic_obs)
+                self.alg.compute_returns(flat_critic_obs)
                 
                 loss_dict = self.alg.update(update_actor=False)
                 
@@ -322,11 +328,15 @@ class OnPolicyRunner:
             # Rollout
             with torch.inference_mode():
                 for i in range(self.num_steps_per_env):
-                    # [修复] 使用 _apply_norm
+                    # 1. 归一化
                     normed_obs = self._apply_norm(obs, self.obs_normalizer)
                     normed_critic_obs = self._apply_norm(critic_obs, self.critic_obs_normalizer)
                     
-                    actions = self.alg.act(normed_obs, normed_critic_obs)
+                    # 2. [关键修复] 拼接
+                    flat_obs = self._flatten_obs(normed_obs)
+                    flat_critic_obs = self._flatten_obs(normed_critic_obs)
+                    
+                    actions = self.alg.act(flat_obs, flat_critic_obs)
                     
                     obs, rewards, dones, infos = self.env.step(actions)
                     obs = self._to_device(obs)
@@ -355,9 +365,10 @@ class OnPolicyRunner:
             collection_time = stop - start
 
             start = stop
-            # [修复] Compute returns 也需要归一化的 Critic Obs
+            # [关键修复] Compute returns 拼接
             normed_critic_obs = self._apply_norm(critic_obs, self.critic_obs_normalizer)
-            self.alg.compute_returns(normed_critic_obs)
+            flat_critic_obs = self._flatten_obs(normed_critic_obs)
+            self.alg.compute_returns(flat_critic_obs)
 
             # [Algorithm 1] 计算 Performance Ratio (Alpha)
             if len(rewbuffer) > 0:
@@ -443,23 +454,6 @@ class OnPolicyRunner:
                 f"""{'Mean action noise std:':>{pad}} {mean_std.item() :.2f}\n"""
                 f"""{'Mean reward:':>{pad}} {statistics.mean(locs['rewbuffer']):.2f}\n"""
                 f"""{'Mean episode length:':>{pad}} {statistics.mean(locs['lenbuffer']):.2f}\n"""
-            )
-            log_string += (
-                f"""{'-' * width}\n"""
-                f"""{'Total timesteps:':>{pad}} {self.tot_timesteps}\n"""
-                f"""{'Iteration time:':>{pad}} {iteration_time:.2f}s\n"""
-                f"""{'Total time:':>{pad}} {self.tot_time:.2f}s\n"""
-                f"""{'ETA:':>{pad}} {self.tot_time / (locs['it'] + 1) * (
-                               locs['num_learning_iterations'] - locs['it']):.1f}s\n"""
-            )
-        else:
-            log_string = (
-                f"""{'#' * width}\n"""
-                f"""{str.center(width, ' ')}\n\n"""
-                f"""{'Computation:':>{pad}} {fps:.0f} steps/s (collection: {locs['collection_time']:.3f}s, learning {locs['learn_time']:.3f}s)\n"""
-                f"""{'Value function loss:':>{pad}} {locs['loss_dict']['value_function']:.4f}\n"""
-                f"""{'Surrogate loss:':>{pad}} {locs['loss_dict']['surrogate']:.4f}\n"""
-                f"""{'Mean action noise std:':>{pad}} {mean_std.item() :.2f}\n"""
             )
             log_string += (
                 f"""{'-' * width}\n"""
