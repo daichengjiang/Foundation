@@ -11,6 +11,7 @@ import csv
 import os
 import time
 import torch
+import torchvision
 import numpy as np
 import gymnasium as gym
 
@@ -258,7 +259,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             print(f"[WARNING] Could not read existing ID, starting from 0. Error: {e}")
 
     valid_group_count = 0
-    rmse_threshold = 0.2
+    rmse_threshold = 0.12
 
     # 使用计算好的 mode 打开文件
     with open(csv_filename, mode=write_mode, newline='') as csv_file:

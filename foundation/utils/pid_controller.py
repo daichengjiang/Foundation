@@ -67,6 +67,15 @@ class PaperPhysControllerTensor:
         self.mat = mat
         self.mat_inv = torch.linalg.inv(mat)
 
+    # 在 PaperPhysControllerTensor 类中添加
+    def update_gains(self, wn, zeta, tc_ang_rp, tc_ang_y, tc_rate_rp, tc_rate_y):
+        self.wn = wn.to(self.device)
+        self.zeta = zeta.to(self.device)
+        self.tc_ang_rp = tc_ang_rp.to(self.device)
+        self.tc_ang_y = tc_ang_y.to(self.device)
+        self.tc_rate_rp = tc_rate_rp.to(self.device)
+        self.tc_rate_y = tc_rate_y.to(self.device)
+
     def compute_target_speeds(self, cur_pos, cur_vel, cur_quat, cur_ang_vel, des_pos, des_vel, des_acc_ff, cur_motor_speed):
         """
         流程：PositionController -> AttitudeController -> Mixer -> Speed
