@@ -285,7 +285,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
     env_cfg.scene.num_envs = args_cli.num_envs
     env_cfg.prob_null_trajectory = 0.0
-    env_cfg.train_or_play = False
+    env_cfg.train_or_play = True
     env_cfg.debug_vis = False 
     env_cfg.seed = args_cli.seed
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device

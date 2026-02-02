@@ -48,7 +48,7 @@ class PaperPhysControllerTensor:
         # self.tc_rate_rp = torch.full((num_envs,), 0.04, device=device)
         # self.tc_rate_y = torch.full((num_envs,), 0.20, device=device)
 
-        param_list = [2.9245564937591553,0.7187620401382446,0.17166225612163544,0.6650351285934448,0.031566496938467026,0.27553918957710266]  # Default gains
+        param_list = [3.0309736728668213,0.6789804697036743,0.1660696119070053,0.3423488438129425,0.06988178938627243,0.16802886128425598]  # Default gains
         self.wn = torch.full((num_envs,), param_list[0], device=device)
         self.zeta = torch.full((num_envs,), param_list[1], device=device)
         self.tc_ang_rp = torch.full((num_envs,), param_list[2], device=device)

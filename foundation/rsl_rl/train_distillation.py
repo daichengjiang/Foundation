@@ -176,6 +176,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             "motor_tau_up": float(row['motor_tau_up']) if 'motor_tau_up' in row else 0.001,
             "motor_tau_down": float(row['motor_tau_down']) if 'motor_tau_down' in row else 0.001,
             "kappa": float(row['kappa']) if 'kappa' in row else 0.016,
+            "wn": float(row['wn']) if 'wn' in row else 2,
+            "zeta": float(row['zeta']) if 'zeta' in row else 0.7,
+            "tc_ang_rp": float(row['tc_ang_rp']) if 'tc_ang_rp' in row else 0.08,
+            "tc_ang_y": float(row['tc_ang_y']) if 'tc_ang_y' in row else 0.4,
+            "tc_rate_rp": float(row['tc_rate_rp']) if 'tc_rate_rp' in row else 0.04,
+            "tc_rate_y": float(row['tc_rate_y']) if 'tc_rate_y' in row else 0.2,
         }
         teacher_params_list.append(params)
         
@@ -257,7 +263,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # PID 模式下不需要加载 Teacher 的 Normalizer (PID 输出就是标准动作)
     teacher_norm_dicts = [None]
     
-    # [修改点 2] 动态检测 Teacher 维度，修复 38 vs 56 的冲突
+    # 动态检测 Teacher 维度，修复 38 vs 56 的冲突
     if "teacher" in extras["observations"]:
         real_teacher_obs_dim = extras["observations"]["teacher"].shape[1]
         print(f"[INFO] Auto-detected Teacher Obs Dim from env: {real_teacher_obs_dim}")

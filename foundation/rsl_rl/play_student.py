@@ -125,13 +125,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # env_cfg.dynamics.moment_scale = 0.025
 
     # # Flightmare
-    # env_cfg.dynamics.mass = 0.73
-    # env_cfg.dynamics.arm_length = 0.085
-    # env_cfg.dynamics.inertia = (7.911e-3,7.911e-3,1.231e-2)
-    # env_cfg.dynamics.thrust_to_weight = 4.5
-    # env_cfg.dynamics.motor_tau_up = 0.06
-    # env_cfg.dynamics.motor_tau_down = 0.15
-    # env_cfg.dynamics.moment_scale = 0.025
+    env_cfg.dynamics.mass = 0.73
+    env_cfg.dynamics.arm_length = 0.085
+    env_cfg.dynamics.inertia = (7.911e-3,7.911e-3,1.231e-2)
+    env_cfg.dynamics.thrust_to_weight = 4.5
+    env_cfg.dynamics.motor_tau_up = 0.06
+    env_cfg.dynamics.motor_tau_down = 0.15
+    env_cfg.dynamics.moment_scale = 0.025
 
     # env_cfg.dynamics.mass = 0.6863819667949842
     # env_cfg.dynamics.arm_length = 0.12728135908262386
@@ -153,16 +153,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # env_cfg.dynamics.arm_length = 0.1836220312867356
     # env_cfg.dynamics.inertia = (0.008119679905502329,0.008119679905502329,0.014875253586880266)
     # env_cfg.dynamics.thrust_to_weight = 3.182839781321408
-    # env_cfg.dynamics.motor_tau_up = 0.001
-    # env_cfg.dynamics.motor_tau_down = 0.001
+    # env_cfg.dynamics.motor_tau_up = 0.05
+    # env_cfg.dynamics.motor_tau_down = 0.05
     # env_cfg.dynamics.moment_scale = 0.006129949459514757
-    env_cfg.dynamics.mass = 0.8036685316459228
-    env_cfg.dynamics.arm_length = 0.14929195884518573
-    env_cfg.dynamics.inertia = (0.00792070163886903,0.00792070163886903,0.014510725402408062)
-    env_cfg.dynamics.thrust_to_weight = 4.876546642251455
-    env_cfg.dynamics.motor_tau_up = 0.001
-    env_cfg.dynamics.motor_tau_down = 0.001
-    env_cfg.dynamics.moment_scale = 0.03113516146560811
+    
 
 
     # get checkpoint path

@@ -563,10 +563,6 @@ class QuadcopterEnv(DirectRLEnv):
         self._map_generation_timer = 0
 
     # def _pre_physics_step(self, actions: torch.Tensor):
-    #     if self.cfg.trajectory_type == "figure8":
-    #         self._generate_desired_trajectory_figure8()
-    #     elif torch.any(self._is_langevin_task):
-    #         self._generate_desired_trajectory_langevin(env_ids=torch.where(self._is_langevin_task)[0])
 
     #     raw_clamped = torch.clamp(actions, -1.0, 1.0)
     #     action_norm = (raw_clamped + 1.0) * 0.5
@@ -594,10 +590,6 @@ class QuadcopterEnv(DirectRLEnv):
 
 
     def _pre_physics_step(self, actions: torch.Tensor):
-        if self.cfg.trajectory_type == "figure8":
-            self._generate_desired_trajectory_figure8()
-        elif torch.any(self._is_langevin_task):
-            self._generate_desired_trajectory_langevin(env_ids=torch.where(self._is_langevin_task)[0])
         
         # 1. 获取状态
         cur_pos = self._robot.data.root_pos_w
@@ -629,6 +621,12 @@ class QuadcopterEnv(DirectRLEnv):
         self._robot.set_external_force_and_torque(self._forces, self._torques, body_ids=self._body_id)
             
     def _get_observations(self) -> dict:
+
+        if self.cfg.trajectory_type == "figure8":
+            self._generate_desired_trajectory_figure8()
+        elif torch.any(self._is_langevin_task):
+            self._generate_desired_trajectory_langevin(env_ids=torch.where(self._is_langevin_task)[0])
+
         pos_w = self._robot.data.root_pos_w
         quat_w = self._robot.data.root_quat_w
         vel_w = self._robot.data.root_lin_vel_w
@@ -826,14 +824,14 @@ class QuadcopterEnv(DirectRLEnv):
                 return d * (r * torch.pow(u, 1.0/3.0))
 
             # 采样偏移量
-            pos_offset = sample_in_sphere(10.0 * l_arm, num_resets) # 位置偏移与轴距成正比
-            lin_vel = sample_in_sphere(1.0, num_resets)            # 1m/s 内的随机初速度
-            ang_vel = sample_in_sphere(1.0, num_resets)            # 1rad/s 内的随机角速度
+            pos_offset = sample_in_sphere(3.0 * l_arm, num_resets) # 位置偏移与轴距成正比
+            lin_vel = sample_in_sphere(0.5, num_resets)            # 1m/s 内的随机初速度
+            ang_vel = sample_in_sphere(0.5, num_resets)            # 1rad/s 内的随机角速度
             
             # 随机旋转 (Roll, Pitch, Yaw)
-            r = (torch.rand(num_resets, device=self.device)*2-1) * (math.pi / 4)
-            p = (torch.rand(num_resets, device=self.device)*2-1) * (math.pi / 4)
-            y = (torch.rand(num_resets, device=self.device)*2-1) * (math.pi / 3)
+            r = (torch.rand(num_resets, device=self.device)*2-1) * (math.pi / 8)
+            p = (torch.rand(num_resets, device=self.device)*2-1) * (math.pi / 8)
+            y = (torch.rand(num_resets, device=self.device)*2-1) * (math.pi / 6)
             quat = quat_from_euler_xyz(r, p, y)
             
             # 10% 几率完美开局，加速初期收敛
