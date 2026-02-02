@@ -386,13 +386,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         runner.alg.policy.reset(torch.ones(env.num_envs, dtype=torch.bool, device=agent_cfg.device))
     
 
-    runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)
+    # runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)
     # # 传入 baseline_reward
-    # runner.learn(
-    #     num_learning_iterations=agent_cfg.max_iterations, 
-    #     init_at_random_ep_len=True,
-    #     init_reward=baseline_reward # <--- 传入
-    # )
+    runner.learn(
+        num_learning_iterations=agent_cfg.max_iterations, 
+        init_at_random_ep_len=True,
+        init_reward=baseline_reward # <--- 传入
+    )
     # 10. 关闭
     env.close()
 

@@ -145,13 +145,51 @@ class OnPolicyRunner:
         self.tot_time = 0
         self.current_learning_iteration = 0
         self.git_status_repos = [rsl_rl.__file__]
-
-    def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):  # noqa: C901
+    
+    ##绝对式
+    def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False, init_reward: float = None):  # noqa: C901
         
+        # =================================================================================
+        # [Adaptive Loop Config] 
+        # =================================================================================
+        # 只有传入了有效的 init_reward 才开启自适应
+        use_adaptive = (init_reward is not None and init_reward > 1.0) 
+        
+        # 1. 读取基础参数 (Base Values) - 作为计算的锚点
+        # 注意：必须深拷贝或直接读取数值，防止被后续修改覆盖
+        if self.alg_cfg is not None:
+             base_lr = float(self.alg_cfg.get("learning_rate", 1e-3))
+             base_clip = float(self.alg_cfg.get("clip_param", 0.2))
+        else:
+             # Fallback
+             base_lr = 1e-3
+             base_clip = 0.2
+
+        # 2. 定义敏感度系数 (Coefficients) - 对应论文中的 c 参数
+        # 这些系数决定了"进步一点点，参数变多少"
+        c_actor = 1.0     # 策略进步越快，学习率加得越快
+        c_critic = 1.0    # 策略进步越快，Critic 越需要稳 (LR减小)
+        c_clip = 0.2      # 策略越稳，允许的 Clip 范围越大
+
+        # 3. 定义安全边界 (Safety Bounds)
+        lr_max = 0.005        # Actor LR 上限 (防止梯度爆炸)
+        lr_min_critic = 1e-6  # Critic LR 下限 (防止停止学习)
+        clip_max = 0.4        # Clip 上限
+
+        if use_adaptive:
+            print(f"\n[{'='*30}]")
+            print(f"[INFO] Adaptive Loop: ENABLED")
+            print(f"[INFO] Base Reward (r_init): {init_reward:.4f}")
+            print(f"[INFO] Base LR: {base_lr} | Base Clip: {base_clip}")
+            print(f"[{'='*30}]\n")
+        else:
+            print(f"[INFO] Adaptive Loop: DISABLED (Using fixed LR={base_lr})")
+
+        # =================================================================================
+
         # Initialize best mean reward for tracking the best model
         best_mean_reward = float('-inf')
         best_model_path = os.path.join(self.log_dir, "best_model.pt") if self.log_dir is not None else None
-
         
         # initialize writer
         if self.log_dir is not None and self.writer is None and not self.disable_logs:
@@ -210,12 +248,11 @@ class OnPolicyRunner:
         if self.is_distributed:
             print(f"Synchronizing parameters for rank {self.gpu_global_rank}...")
             self.alg.broadcast_parameters()
-            # TODO: Do we need to synchronize empirical normalizers?
-            #   Right now: No, because they all should converge to the same values "asymptotically".
 
         # Start training
         start_iter = self.current_learning_iteration
         tot_iter = start_iter + num_learning_iterations
+        
         for it in range(start_iter, tot_iter):
             start = time.time()
             # Rollout
@@ -280,8 +317,55 @@ class OnPolicyRunner:
                     self.alg.compute_returns(privileged_obs)
 
             print(f"Rollout storage size: {calculate_rollout_storage_size(self.alg.storage)} MB, {calculate_rollout_storage_size(self.alg.storage)[1]} GB")
+            
             # update policy
             loss_dict = self.alg.update()
+
+            # =================================================================================
+            # [Core Logic] Phase III: Adaptive Update (Run Every Iteration)
+            # =================================================================================
+            # 默认值 (用于 Log)
+            current_alpha = 1.0
+            current_actor_lr = base_lr
+            current_critic_lr = base_lr
+            current_clip = base_clip
+
+            if use_adaptive and len(rewbuffer) > 0:
+                # 1. 计算当前的性能 (r_rollout)
+                # 使用 rewbuffer 的均值可以有效平滑波动，比单次 iteration 的均值更稳定
+                r_rollout = statistics.mean(rewbuffer)
+                
+                # 2. 计算比率 alpha
+                current_alpha = r_rollout / init_reward
+                
+                # 3. 计算相对进步幅度 Delta (只在进步时触发)
+                # delta = max(alpha - 1, 0)
+                delta = max(current_alpha - 1.0, 0.0)
+                
+                # 4. 计算新的超参数 (Formulas)
+                
+                # Formula A: Actor LR (Linear Increase)
+                # LR_pi = Base * (1 + c * delta)
+                target_actor_lr = base_lr * (1.0 + c_actor * delta)
+                
+                # Formula B: Critic LR (Inverse Decay)
+                # LR_v = Base / (1 + c * delta)
+                target_critic_lr = base_lr / (1.0 + c_critic * delta)
+                
+                # Formula C: Clip Range (Linear Increase)
+                # Epsilon = Base * (1 + c * delta)
+                target_clip = base_clip * (1.0 + c_clip * delta)
+                
+                # 5. 安全截断 (Bounds)
+                current_actor_lr = min(target_actor_lr, lr_max)       # 上限截断
+                current_critic_lr = max(target_critic_lr, lr_min_critic) # 下限截断
+                current_clip = min(target_clip, clip_max)             # 上限截断
+                
+                # 6. 执行修改 (Call PPO Interface)
+                if hasattr(self.alg, 'update_hyperparameters'):
+                    self.alg.update_hyperparameters(current_actor_lr, current_critic_lr, current_clip)
+
+            # =================================================================================
 
             stop = time.time()
             learn_time = stop - start
@@ -290,8 +374,16 @@ class OnPolicyRunner:
             if self.log_dir is not None and not self.disable_logs:
                 # Log information
                 self.log(locals())
-                # Save model
+                
+                # [NEW] Log Adaptive Parameters to WandB/Tensorboard
+                if use_adaptive:
+                    self.writer.add_scalar("Adaptive/Alpha", current_alpha, it)
+                    self.writer.add_scalar("Adaptive/Delta", max(current_alpha - 1.0, 0.0), it)
+                    self.writer.add_scalar("Adaptive/Actor_LR", current_actor_lr, it)
+                    self.writer.add_scalar("Adaptive/Critic_LR", current_critic_lr, it)
+                    self.writer.add_scalar("Adaptive/Clip_Param", current_clip, it)
 
+                # Save model
                 if len(rewbuffer) > 0:
                     current_mean_reward = statistics.mean(rewbuffer)
                     if current_mean_reward > best_mean_reward:
@@ -317,11 +409,238 @@ class OnPolicyRunner:
         if self.log_dir is not None and not self.disable_logs:
             self.save(os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"))
 
-        # [Modified] Return average reward from the buffer (last 100 episodes)
+        # 返回最后阶段的平均奖励
         if len(rewbuffer) > 0:
             return statistics.mean(rewbuffer)
         else:
             return 0.0
+
+    ##增量式
+    # def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False, init_reward: float = None):  # noqa: C901
+        
+    #     # =================================================================================
+    #     # [Adaptive Loop Config] 
+    #     # =================================================================================
+    #     use_adaptive = (init_reward is not None and init_reward > 1.0) 
+        
+    #     # 1. 基础参数 (Base Values)
+    #     if self.alg_cfg is not None:
+    #          base_lr = float(self.alg_cfg.get("learning_rate", 1e-3))
+    #          base_clip = float(self.alg_cfg.get("clip_param", 0.2))
+    #     else:
+    #          base_lr = 1e-3
+    #          base_clip = 0.2
+
+    #     # 2. 状态变量初始化 (Stateful Initialization)
+    #     # [关键] 这里初始化为 Base，后面会在此基础上累积变化
+    #     current_actor_lr = base_lr
+    #     current_critic_lr = base_lr
+    #     current_clip = base_clip
+
+    #     # 3. 敏感度系数 (Coefficients) - 论文中的 "Step Size"
+    #     # 注意：在累积模式下，这些系数要小一点，否则几次迭代就爆炸了
+    #     c_actor = 1e-5     # 每次进步，Actor LR 增加的幅度
+    #     c_critic = 1e-5    # 每次进步，Critic LR 减少的幅度
+    #     c_clip = 1e-3      # 每次进步，Clip 增加的幅度
+
+    #     # 4. 安全边界 (Safety Bounds)
+    #     lr_max = 0.005         # Actor LR 上限
+    #     lr_min_critic = 1e-6   # Critic LR 下限
+    #     clip_max = 0.4         # Clip 上限
+
+    #     if use_adaptive:
+    #         print(f"\n[{'='*30}]")
+    #         print(f"[INFO] Adaptive Loop: ENABLED (Cumulative/Ratchet Mode)")
+    #         print(f"[INFO] Base Reward (r_init): {init_reward:.4f}")
+    #         print(f"[INFO] Initial Params: LR={base_lr} | Clip={base_clip}")
+    #         print(f"[{'='*30}]\n")
+    #     else:
+    #         print(f"[INFO] Adaptive Loop: DISABLED (Using fixed LR={base_lr})")
+
+    #     # =================================================================================
+
+    #     best_mean_reward = float('-inf')
+    #     best_model_path = os.path.join(self.log_dir, "best_model.pt") if self.log_dir is not None else None
+        
+    #     # initialize writer
+    #     if self.log_dir is not None and self.writer is None and not self.disable_logs:
+    #         self.logger_type = self.cfg.get("logger", "tensorboard")
+    #         self.logger_type = self.logger_type.lower()
+    #         if self.logger_type == "neptune":
+    #             from rsl_rl.utils.neptune_utils import NeptuneSummaryWriter
+    #             self.writer = NeptuneSummaryWriter(log_dir=self.log_dir, flush_secs=10, cfg=self.cfg)
+    #             self.writer.log_config(self.env.cfg, self.cfg, self.alg_cfg, self.policy_cfg)
+    #         elif self.logger_type == "wandb":
+    #             from rsl_rl.utils.wandb_utils import WandbSummaryWriter
+    #             self.writer = WandbSummaryWriter(log_dir=self.log_dir, flush_secs=10, cfg=self.cfg)
+    #             self.writer.log_config(self.env.cfg, self.cfg, self.alg_cfg, self.policy_cfg)
+    #         elif self.logger_type == "tensorboard":
+    #             from torch.utils.tensorboard import SummaryWriter
+    #             self.writer = SummaryWriter(log_dir=self.log_dir, flush_secs=10)
+
+    #     if self.training_type == "distillation" and not self.alg.policy.loaded_teacher:
+    #         raise ValueError("Teacher model parameters not loaded.")
+
+    #     if init_at_random_ep_len:
+    #         self.env.episode_length_buf = torch.randint_like(
+    #             self.env.episode_length_buf, high=int(self.env.max_episode_length)
+    #         )
+
+    #     obs, extras = self.env.get_observations()
+    #     privileged_obs = extras["observations"].get(self.privileged_obs_type, obs)
+    #     obs, privileged_obs = obs.to(self.device), privileged_obs.to(self.device)
+    #     self.train_mode()
+
+    #     ep_infos = []
+    #     rewbuffer = deque(maxlen=100)
+    #     lenbuffer = deque(maxlen=100)
+    #     cur_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
+    #     cur_episode_length = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
+
+    #     if self.alg.rnd:
+    #         erewbuffer = deque(maxlen=100)
+    #         irewbuffer = deque(maxlen=100)
+    #         cur_ereward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
+    #         cur_ireward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
+
+    #     if self.is_distributed:
+    #         self.alg.broadcast_parameters()
+
+    #     start_iter = self.current_learning_iteration
+    #     tot_iter = start_iter + num_learning_iterations
+        
+    #     for it in range(start_iter, tot_iter):
+    #         start = time.time()
+    #         # Rollout
+    #         with torch.inference_mode():
+    #             for _ in range(self.num_steps_per_env):
+    #                 actions = self.alg.act(obs, privileged_obs)
+    #                 obs, rewards, dones, infos = self.env.step(actions.to(self.env.device))
+    #                 obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
+    #                 obs = self.obs_normalizer(obs)
+    #                 if self.privileged_obs_type is not None:
+    #                     privileged_obs = self.privileged_obs_normalizer(
+    #                         infos["observations"][self.privileged_obs_type].to(self.device)
+    #                     )
+    #                 else:
+    #                     privileged_obs = obs
+    #                 self.alg.process_env_step(rewards, dones, infos)
+                    
+    #                 if self.alg.rnd:
+    #                     intrinsic_rewards = self.alg.intrinsic_rewards
+                    
+    #                 if self.log_dir is not None:
+    #                     if "episode" in infos: ep_infos.append(infos["episode"])
+    #                     elif "log" in infos: ep_infos.append(infos["log"])
+                        
+    #                     if self.alg.rnd:
+    #                         cur_ereward_sum += rewards
+    #                         cur_ireward_sum += intrinsic_rewards
+    #                         cur_reward_sum += rewards + intrinsic_rewards
+    #                     else:
+    #                         cur_reward_sum += rewards
+    #                     cur_episode_length += 1
+                        
+    #                     new_ids = (dones > 0).nonzero(as_tuple=False)
+    #                     rewbuffer.extend(cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
+    #                     lenbuffer.extend(cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
+    #                     cur_reward_sum[new_ids] = 0
+    #                     cur_episode_length[new_ids] = 0
+                        
+    #                     if self.alg.rnd:
+    #                         erewbuffer.extend(cur_ereward_sum[new_ids][:, 0].cpu().numpy().tolist())
+    #                         irewbuffer.extend(cur_ireward_sum[new_ids][:, 0].cpu().numpy().tolist())
+    #                         cur_ereward_sum[new_ids] = 0
+    #                         cur_ireward_sum[new_ids] = 0
+
+    #             stop = time.time()
+    #             collection_time = stop - start
+    #             start = stop
+
+    #             if self.training_type == "rl":
+    #                 self.alg.compute_returns(privileged_obs)
+
+    #         print(f"Rollout storage size: {calculate_rollout_storage_size(self.alg.storage)} MB")
+            
+    #         # update policy
+    #         loss_dict = self.alg.update()
+
+    #         # =================================================================================
+    #         # [Core Logic] Phase III: Adaptive Update (Cumulative / Ratchet)
+    #         # =================================================================================
+    #         current_alpha = 1.0
+            
+    #         # 至少积累一定数据再调整
+    #         if use_adaptive and len(rewbuffer) >= 10:
+    #             # 1. 计算性能比率
+    #             r_rollout = statistics.mean(rewbuffer)
+    #             current_alpha = r_rollout / init_reward
+                
+    #             # 2. 计算相对进步幅度
+    #             delta = max(current_alpha - 1.0, 0.0)
+                
+    #             if delta > 0:
+    #                 # 3. 累积更新 (Cumulative Update) - 这就是"记忆"
+    #                 # 只有在进步时才更新，而且是在 current 值基础上加减
+                    
+    #                 # Actor: 增加
+    #                 current_actor_lr += (delta * c_actor)
+                    
+    #                 # Critic: 减少
+    #                 current_critic_lr -= (delta * c_critic)
+                    
+    #                 # Clip: 增加
+    #                 current_clip += (delta * c_clip)
+                    
+    #                 # 4. 严格边界限制 (Hard Clamping)
+    #                 current_actor_lr = min(current_actor_lr, lr_max)
+    #                 current_critic_lr = max(current_critic_lr, lr_min_critic)
+    #                 current_clip = min(current_clip, clip_max)
+                
+    #             # 5. 执行修改
+    #             if hasattr(self.alg, 'update_hyperparameters'):
+    #                 self.alg.update_hyperparameters(current_actor_lr, current_critic_lr, current_clip)
+
+    #         # =================================================================================
+
+    #         stop = time.time()
+    #         learn_time = stop - start
+    #         self.current_learning_iteration = it
+            
+    #         if self.log_dir is not None and not self.disable_logs:
+    #             self.log(locals())
+                
+    #             if use_adaptive:
+    #                 self.writer.add_scalar("Adaptive/Alpha", current_alpha, it)
+    #                 self.writer.add_scalar("Adaptive/Delta", max(current_alpha - 1.0, 0.0), it)
+    #                 self.writer.add_scalar("Adaptive/Actor_LR", current_actor_lr, it)
+    #                 self.writer.add_scalar("Adaptive/Critic_LR", current_critic_lr, it)
+    #                 self.writer.add_scalar("Adaptive/Clip_Param", current_clip, it)
+
+    #             if len(rewbuffer) > 0:
+    #                 current_mean_reward = statistics.mean(rewbuffer)
+    #                 if current_mean_reward > best_mean_reward:
+    #                     best_mean_reward = current_mean_reward
+    #                     self.save(best_model_path)
+    #                     print(f"New best model saved with mean_reward: {best_mean_reward:.4f} at iteration {it}")
+
+    #             if it % self.save_interval == 0:
+    #                 self.save(os.path.join(self.log_dir, f"model_{it}.pt"))
+
+    #         ep_infos.clear()
+    #         if it == start_iter and not self.disable_logs:
+    #             git_file_paths = store_code_state(self.log_dir, self.git_status_repos)
+    #             if self.logger_type in ["wandb", "neptune"] and git_file_paths:
+    #                 for path in git_file_paths:
+    #                     self.writer.save_file(path)
+
+    #     if self.log_dir is not None and not self.disable_logs:
+    #         self.save(os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"))
+
+    #     if len(rewbuffer) > 0:
+    #         return statistics.mean(rewbuffer)
+    #     else:
+    #         return 0.0
 
     def log(self, locs: dict, width: int = 80, pad: int = 35):
         # Compute the collection size
