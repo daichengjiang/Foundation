@@ -317,6 +317,12 @@ class OnPolicyRunner:
         if self.log_dir is not None and not self.disable_logs:
             self.save(os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"))
 
+        # [Modified] Return average reward from the buffer (last 100 episodes)
+        if len(rewbuffer) > 0:
+            return statistics.mean(rewbuffer)
+        else:
+            return 0.0
+
     def log(self, locs: dict, width: int = 80, pad: int = 35):
         # Compute the collection size
         collection_size = self.num_steps_per_env * self.env.num_envs * self.gpu_world_size

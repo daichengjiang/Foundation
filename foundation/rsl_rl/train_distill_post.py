@@ -46,7 +46,7 @@ parser.add_argument("--teacher_dir", type=str, default=None, help="Path to the d
 parser.add_argument("--teacher_ids", type=str, default="0", help="Comma-separated list of dynamics IDs to use (e.g., '0,1,2' or '0-4').")
 
 # [新增] Critic 预热参数
-parser.add_argument("--warmup_iterations", type=int, default=500, help="Number of iterations to warm up the Critic while freezing the Student.")
+parser.add_argument("--warmup_iterations", type=int, default=200, help="Number of iterations to warm up the Critic while freezing the Student.")
 
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
@@ -324,59 +324,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     print(f"[INFO] Sanity Check finished.")
     print(f"[{'='*30}]")
 
-    # # =================================================================================
-    # # [Warm-up Phase 2] Critic Warm-up (冻结 Actor，只训练 Critic)
-    # # =================================================================================
-    
-    # if args_cli.warmup_iterations > 0:
-    #     print(f"[{'='*30}]")
-    #     print(f"[INFO] Starting CRITIC WARM-UP for {args_cli.warmup_iterations} iterations...")
-    #     print(f"[INFO] Actor (Student) gradients will be FROZEN.")
-
-    #     # 1. 切换回训练模式
-    #     runner.alg.policy.train()
-
-    #     # 2. 冻结 Actor (Student) 的所有参数
-    #     # 你的 Custom Policy 包含: pre_rnn_mlp, rnn, post_rnn_mlp, student, critic
-    #     # 我们需要冻结除了 critic 以外的所有部分
-    #     modules_to_freeze = [
-    #         runner.alg.policy.pre_rnn_mlp,
-    #         runner.alg.policy.rnn,
-    #         runner.alg.policy.post_rnn_mlp,
-    #         runner.alg.policy.student
-    #     ]
-        
-    #     for module in modules_to_freeze:
-    #         for param in module.parameters():
-    #             param.requires_grad = False
-        
-    #     print("[INFO] Student parameters frozen. Starting Critic training...")
-
-    #     # 3. 重置环境以确保干净的开始 (虽然不是绝对必须，但推荐)
-    #     with torch.inference_mode():
-    #          obs, _ = env.reset()
-    #          runner.alg.policy.reset(torch.ones(env.num_envs, dtype=torch.bool, device=agent_cfg.device))
-
-    #     # 4. 运行训练循环 (只会更新 Critic)
-    #     # 注意: init_at_random_ep_len=True 会随机初始化步长，增加数据的多样性，适合 Critic 学习
-    #     runner.learn(num_learning_iterations=args_cli.warmup_iterations, init_at_random_ep_len=True)
-
-    #     print(f"[INFO] Critic Warm-up finished.")
-        
-    #     # 5. 解冻 Actor
-    #     for module in modules_to_freeze:
-    #         for param in module.parameters():
-    #             param.requires_grad = True
-        
-    #     print("[INFO] Student parameters UN-FROZEN.")
-    #     print(f"[{'='*30}]")
-    # else:
-    #     print("[INFO] Skipping Critic Warm-up (iterations set to 0).")
 
     # =================================================================================
     # [Warm-up Phase 2] Critic Warm-up (冻结 Actor，只训练 Critic)
     # =================================================================================
-    
+    # 默认基准奖励，如果没有 Warm-up 则设为 0 (或者你需要另外处理)
+    baseline_reward = 0.0 
     if args_cli.warmup_iterations > 0:
         print(f"[{'='*30}]")
         print(f"[INFO] Starting CRITIC WARM-UP for {args_cli.warmup_iterations} iterations...")
@@ -385,17 +338,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # 1. 切换回训练模式
         runner.alg.policy.train()
 
-        # 2. [改进版] 冻结 Policy 的所有参数 (包括 std)
+        # 2. 冻结 Policy 的所有参数
         for param in runner.alg.policy.parameters():
             param.requires_grad = False
 
-        # 3. [改进版] 只解冻 Critic
-        # 遍历 critic 网络的所有参数并开启梯度
+        # 3. 只解冻 Critic
         for param in runner.alg.policy.critic.parameters():
             param.requires_grad = True
-        
-        # 打印一下确认状态 (可选)
-        # print(f"Policy Std requires_grad: {runner.alg.policy.std.requires_grad}") # 应该是 False
         
         print("[INFO] Student parameters (including noise std) frozen. Starting Critic training...")
 
@@ -404,34 +353,46 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
              obs, _ = env.reset()
              runner.alg.policy.reset(torch.ones(env.num_envs, dtype=torch.bool, device=agent_cfg.device))
 
-        # 5. 运行训练循环
-        runner.learn(num_learning_iterations=args_cli.warmup_iterations, init_at_random_ep_len=True)
-
-        print(f"[INFO] Critic Warm-up finished.")
+        # 5. 运行训练循环，并捕获返回值 [关键修改]
+        # 假设我们已经修改了 runner.learn 让它返回最后的 mean reward
+        warmup_final_reward = runner.learn(num_learning_iterations=args_cli.warmup_iterations, init_at_random_ep_len=True)
         
-        # 6. [改进版] 恢复所有参数的梯度 (解冻一切)
+        # [关键] 将 Warm-up 结束时的奖励作为基准
+        baseline_reward = warmup_final_reward
+        
+        print(f"[INFO] Critic Warm-up finished.")
+        print(f"[INFO] Baseline Reward captured from Warm-up: {baseline_reward:.4f}")
+        
+        # 6. 恢复所有参数的梯度
         for param in runner.alg.policy.parameters():
             param.requires_grad = True
         
         print("[INFO] All parameters UN-FROZEN.")
         print(f"[{'='*30}]")
     else:
-        print("[INFO] Skipping Critic Warm-up (iterations set to 0).")
+        print("[INFO] Skipping Critic Warm-up. Cannot collect baseline automatically.")
+        # 如果跳过 warmup，你可能需要一个 fallback 的 phase 0，或者报错
+        # baseline_reward = ...
 
     # =================================================================================
     # [Main Training] 正式微调
     # =================================================================================
 
     print(f"[INFO] Starting MAIN TRAINING for {agent_cfg.max_iterations} iterations...")
+    print(f"[INFO] Using Baseline Reward (r_init) = {baseline_reward:.4f} for Adaptive Update.")
     
-    # 强制重置一次环境，防止 Warm-up 阶段的残余状态影响主训练
     with torch.inference_mode():
         obs, _ = env.reset() 
         runner.alg.policy.reset(torch.ones(env.num_envs, dtype=torch.bool, device=agent_cfg.device))
     
-    # 开始联合训练 (Actor + Critic)
-    runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)
 
+    runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)
+    # # 传入 baseline_reward
+    # runner.learn(
+    #     num_learning_iterations=agent_cfg.max_iterations, 
+    #     init_at_random_ep_len=True,
+    #     init_reward=baseline_reward # <--- 传入
+    # )
     # 10. 关闭
     env.close()
 
