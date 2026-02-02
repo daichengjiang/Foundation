@@ -95,8 +95,30 @@ class PPO:
         # PPO components
         self.policy = policy
         self.policy.to(self.device)
-        # Create optimizer
-        self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
+        
+        # =================================================================================
+        # [Modified] Dual-Track Optimizer Initialization for Adaptive Loop
+        # =================================================================================
+        # Check if we can split actor and critic parameters (e.g. for StudentTeacherRecurrentCustom)
+        if hasattr(self.policy, "critic"):
+             print("[INFO] PPO detected 'critic' module. Initializing Dual-Track Optimizer (Actor/Critic split).")
+             # 1. Identify Critic Parameters (Set of IDs for fast lookup)
+             critic_param_ids = set(map(id, self.policy.critic.parameters()))
+             
+             # 2. Separate Parameters
+             # Everything NOT in critic is considered Actor (Student + RNN + Encoders + Std)
+             actor_params = [p for p in self.policy.parameters() if id(p) not in critic_param_ids]
+             critic_params = list(self.policy.critic.parameters())
+             
+             # 3. Create Optimizer with Groups
+             self.optimizer = optim.Adam([
+                 {'params': actor_params, 'lr': learning_rate, 'name': 'actor'},
+                 {'params': critic_params, 'lr': learning_rate, 'name': 'critic'}
+             ])
+        else:
+             # Standard initialization (Fallback)
+             self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
+
         # Create rollout storage
         self.storage: RolloutStorage = None  # type: ignore
         self.transition = RolloutStorage.Transition()
@@ -184,6 +206,33 @@ class PPO:
         self.storage.compute_returns(
             last_values, self.gamma, self.lam, normalize_advantage=not self.normalize_advantage_per_mini_batch
         )
+
+    # =================================================================================
+    # [NEW] Interface for Adaptive Loop (Phase III)
+    # =================================================================================
+    def update_hyperparameters(self, actor_lr, critic_lr, clip_param):
+        """
+        Dynamically update learning rates and clip range.
+        This is called by the OnPolicyRunner during the Adaptive Loop.
+        """
+        # Update Clip Range
+        self.clip_param = clip_param
+        
+        # Update Learning Rates (Dual-Track)
+        updated_groups = []
+        for param_group in self.optimizer.param_groups:
+            if "name" in param_group:
+                if param_group["name"] == "actor":
+                    param_group["lr"] = actor_lr
+                    updated_groups.append("actor")
+                elif param_group["name"] == "critic":
+                    param_group["lr"] = critic_lr
+                    updated_groups.append("critic")
+        
+        # Fallback: if no groups were named (e.g. not using StudentTeacherRecurrentCustom), update all
+        if not updated_groups:
+            for param_group in self.optimizer.param_groups:
+                param_group["lr"] = actor_lr
 
     def update(self):  # noqa: C901
         mean_value_loss = 0
