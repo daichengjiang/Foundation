@@ -45,8 +45,10 @@ parser.add_argument("--log_timestamp", type=str, default=None, help="Fixed times
 parser.add_argument("--teacher_dir", type=str, default=None, help="Path to the directory containing teacher_dynamics.csv (for heterogeneous envs).")
 parser.add_argument("--teacher_ids", type=str, default="0", help="Comma-separated list of dynamics IDs to use (e.g., '0,1,2' or '0-4').")
 
+# [新增] Critic 预热参数
+parser.add_argument("--warmup_iterations", type=int, default=500, help="Number of iterations to warm up the Critic while freezing the Student.")
+
 # append RSL-RL cli arguments
-# 这会添加 --checkpoint, --resume, --run_name 等参数
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
@@ -167,7 +169,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             print(f"  > [Variant-{t_id}] Mass={params['mass']:.4f} | Arm={params['arm_length']:.4f} | TWR={params['twr']:.2f}")
 
         # 4. 注入到 env 配置中
-        # QuadcopterEnv 会检测到这个列表并进行分配
         try:
             env_cfg.dynamics.multi_teacher_params = teacher_params_list
         except AttributeError:
@@ -237,7 +238,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # 7. 加载模型逻辑
 
     if args_cli.checkpoint:
-        # [关键部分] 完全按照你的要求实现手动加载、过滤和 Normalizer 加载
+        # [关键部分] 手动加载、过滤和 Normalizer 加载
         checkpoint_path = retrieve_file_path(args_cli.checkpoint)
         print(f"[INFO]: Loading model checkpoint from: {checkpoint_path}")
 
@@ -256,7 +257,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             student_only_state_dict[k] = v
                 
         # 3. Load weights
-        # 注意: 这里使用 strict=False 允许加载部分权重（即忽略预训练中缺失的 Critic/Teacher 部分）
         runner.alg.policy.load_state_dict(student_only_state_dict, strict=False)
         print("[INFO] Model weights loaded (Student only, Teachers ignored).")
 
@@ -268,29 +268,25 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             else:
                 print("[WARNING] Empirical normalization is enabled but no 'obs_norm_state_dict' found!")
     
-    # 如果需要调整初始噪声 (Distill Post 建议调小噪声)
+    # 如果需要调整初始噪声
     if args_cli.init_noise_std:
         runner.load_std(args_cli.init_noise_std)
         print(f"[INFO]: Overwriting init noise std to: {args_cli.init_noise_std}")
 
     # =================================================================================
-    # [CRITICAL FIX] 手动初始化 Hidden States 为正确的维度 [Layers, Num_Envs, Dim]
-    # 这防止了 RolloutStorage 因为第一次收到 dummy state [Layers, 1, Dim] 而错误地初始化缓冲区
+    # [CRITICAL FIX] 手动初始化 Hidden States 为正确的维度
     # =================================================================================
     policy = runner.alg.policy
-    # 检查 policy 是否有 hidden_state 属性 (即是否是我们的自定义 RNN)
     if hasattr(policy, "hidden_state"):
         print(f"[{'='*20}]")
         print(f"[INFO] Manually initializing policy hidden state for {env.num_envs} environments.")
         device = agent_cfg.device
         
-        # 根据 RNN 类型构造全0张量
         if hasattr(policy, "rnn_type") and policy.rnn_type == "lstm":
              h = torch.zeros(policy.rnn_num_layers, env.num_envs, policy.rnn_hidden_dim, device=device)
              c = torch.zeros(policy.rnn_num_layers, env.num_envs, policy.rnn_hidden_dim, device=device)
              policy.hidden_state = (h, c)
         else:
-             # GRU
              policy.hidden_state = torch.zeros(policy.rnn_num_layers, env.num_envs, policy.rnn_hidden_dim, device=device)
         print(f"[INFO] Hidden state initialized with shape: {policy.hidden_state.shape if hasattr(policy.hidden_state, 'shape') else 'Tuple'}")
         print(f"[{'='*20}]")
@@ -303,70 +299,137 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     dump_pickle(os.path.join(log_dir, "params", "agent.pkl"), agent_cfg)
 
     # =================================================================================
-    # [新增功能] 训练前热身/评估 (Pre-training Evaluation / Play Mode)
-    # 目的：使用加载的预训练模型，以 Eval 模式（无噪声、确定性）运行 10 个 Episode
+    # [Warm-up Phase 1] 评估 / 健全性检查 (Sanity Check)
     # =================================================================================
     
-    # 配置热身长度
     NUM_EVAL_EPISODES = 10
-    # 获取每个 Episode 的步数 (从 cfg 中读取，通常是 256)
     steps_per_episode = env_cfg.num_steps_per_env 
     total_eval_steps = NUM_EVAL_EPISODES * steps_per_episode
     
     print(f"[{'='*30}]")
-    print(f"[INFO] Starting Warm-up / Sanity Check (Eval Mode) for {NUM_EVAL_EPISODES} episodes...")
-    print(f"[INFO] Total steps: {total_eval_steps}. Watch the viewer to verify behavior.")
+    print(f"[INFO] Starting Sanity Check (Eval Mode) for {NUM_EVAL_EPISODES} episodes...")
     
-    # 1. 切换到 Eval 模式
-    # 这会通知 PyTorch 层（如 Dropout/BatchNorm）进入推理模式
     runner.alg.policy.eval()
-    
-    # 2. 获取推理策略
-    # RSL-RL 的 get_inference_policy 返回的是确定性的 act_inference 函数
-    # 对于你的 RNN 网络，这意味着它会使用内部维护的 hidden_state 进行推理
     inference_policy = runner.get_inference_policy(device=agent_cfg.device)
-    
-    # 3. 确保环境已重置
     obs, _ = env.get_observations()
     
-    # 4. 执行仿真循环
-    with torch.inference_mode(): # 关闭梯度计算，节省显存并加速
+    with torch.inference_mode(): 
         for i in range(total_eval_steps):
-            # A. 策略推理 (Deterministic)
-            # 这里的 actions 是不带噪声的，纯粹由预训练权重决定
             actions = inference_policy(obs)
-            
-            # B. 环境步进
             obs, rewards, dones, extras = env.step(actions)
-            
-            # C. [关键] 手动处理 RNN 状态重置
-            # 在 runner.learn() 中这是自动的，但在手动循环中，我们需要
-            # 告诉策略网络哪些环境已经重置了，以便它清空对应的 hidden_state
             runner.alg.policy.reset(dones)
-            
-            # 打印进度
             if (i + 1) % steps_per_episode == 0:
                 print(f"[Eval] Completed approximately {(i + 1) // steps_per_episode} / {NUM_EVAL_EPISODES} episodes.")
 
-    print(f"[INFO] Warm-up finished. The model seems runnable.")
-    print(f"[INFO] Switching back to TRAINING mode (adding noise, enabling grad)...")
-    
-    # 5. 恢复训练状态
-    runner.alg.policy.train() 
-    
-    # 6. [重要] 彻底重置环境和 RNN 状态
-    # 为了防止热身阶段的残留状态（如飞到一半的位置、残留的 hidden_state）污染 PPO 的第一个 Batch
-    # 我们强制对所有环境进行一次 Reset
-    with torch.inference_mode():
-        all_env_ids = torch.arange(env.num_envs, device=agent_cfg.device)
-        obs, _ = env.reset() 
-        # RNN reset 通常也建议在无梯度模式下做
-        runner.alg.policy.reset(torch.ones(env.num_envs, dtype=torch.bool, device=agent_cfg.device))
-        print(f"[{'='*30}]")
-        # =================================================================================
+    print(f"[INFO] Sanity Check finished.")
+    print(f"[{'='*30}]")
 
-    # 9. 开始训练
-    print(f"[INFO] Starting training for {agent_cfg.max_iterations} iterations...")
+    # # =================================================================================
+    # # [Warm-up Phase 2] Critic Warm-up (冻结 Actor，只训练 Critic)
+    # # =================================================================================
+    
+    # if args_cli.warmup_iterations > 0:
+    #     print(f"[{'='*30}]")
+    #     print(f"[INFO] Starting CRITIC WARM-UP for {args_cli.warmup_iterations} iterations...")
+    #     print(f"[INFO] Actor (Student) gradients will be FROZEN.")
+
+    #     # 1. 切换回训练模式
+    #     runner.alg.policy.train()
+
+    #     # 2. 冻结 Actor (Student) 的所有参数
+    #     # 你的 Custom Policy 包含: pre_rnn_mlp, rnn, post_rnn_mlp, student, critic
+    #     # 我们需要冻结除了 critic 以外的所有部分
+    #     modules_to_freeze = [
+    #         runner.alg.policy.pre_rnn_mlp,
+    #         runner.alg.policy.rnn,
+    #         runner.alg.policy.post_rnn_mlp,
+    #         runner.alg.policy.student
+    #     ]
+        
+    #     for module in modules_to_freeze:
+    #         for param in module.parameters():
+    #             param.requires_grad = False
+        
+    #     print("[INFO] Student parameters frozen. Starting Critic training...")
+
+    #     # 3. 重置环境以确保干净的开始 (虽然不是绝对必须，但推荐)
+    #     with torch.inference_mode():
+    #          obs, _ = env.reset()
+    #          runner.alg.policy.reset(torch.ones(env.num_envs, dtype=torch.bool, device=agent_cfg.device))
+
+    #     # 4. 运行训练循环 (只会更新 Critic)
+    #     # 注意: init_at_random_ep_len=True 会随机初始化步长，增加数据的多样性，适合 Critic 学习
+    #     runner.learn(num_learning_iterations=args_cli.warmup_iterations, init_at_random_ep_len=True)
+
+    #     print(f"[INFO] Critic Warm-up finished.")
+        
+    #     # 5. 解冻 Actor
+    #     for module in modules_to_freeze:
+    #         for param in module.parameters():
+    #             param.requires_grad = True
+        
+    #     print("[INFO] Student parameters UN-FROZEN.")
+    #     print(f"[{'='*30}]")
+    # else:
+    #     print("[INFO] Skipping Critic Warm-up (iterations set to 0).")
+
+    # =================================================================================
+    # [Warm-up Phase 2] Critic Warm-up (冻结 Actor，只训练 Critic)
+    # =================================================================================
+    
+    if args_cli.warmup_iterations > 0:
+        print(f"[{'='*30}]")
+        print(f"[INFO] Starting CRITIC WARM-UP for {args_cli.warmup_iterations} iterations...")
+        print(f"[INFO] Actor (Student) gradients will be FROZEN.")
+
+        # 1. 切换回训练模式
+        runner.alg.policy.train()
+
+        # 2. [改进版] 冻结 Policy 的所有参数 (包括 std)
+        for param in runner.alg.policy.parameters():
+            param.requires_grad = False
+
+        # 3. [改进版] 只解冻 Critic
+        # 遍历 critic 网络的所有参数并开启梯度
+        for param in runner.alg.policy.critic.parameters():
+            param.requires_grad = True
+        
+        # 打印一下确认状态 (可选)
+        # print(f"Policy Std requires_grad: {runner.alg.policy.std.requires_grad}") # 应该是 False
+        
+        print("[INFO] Student parameters (including noise std) frozen. Starting Critic training...")
+
+        # 4. 重置环境
+        with torch.inference_mode():
+             obs, _ = env.reset()
+             runner.alg.policy.reset(torch.ones(env.num_envs, dtype=torch.bool, device=agent_cfg.device))
+
+        # 5. 运行训练循环
+        runner.learn(num_learning_iterations=args_cli.warmup_iterations, init_at_random_ep_len=True)
+
+        print(f"[INFO] Critic Warm-up finished.")
+        
+        # 6. [改进版] 恢复所有参数的梯度 (解冻一切)
+        for param in runner.alg.policy.parameters():
+            param.requires_grad = True
+        
+        print("[INFO] All parameters UN-FROZEN.")
+        print(f"[{'='*30}]")
+    else:
+        print("[INFO] Skipping Critic Warm-up (iterations set to 0).")
+
+    # =================================================================================
+    # [Main Training] 正式微调
+    # =================================================================================
+
+    print(f"[INFO] Starting MAIN TRAINING for {agent_cfg.max_iterations} iterations...")
+    
+    # 强制重置一次环境，防止 Warm-up 阶段的残余状态影响主训练
+    with torch.inference_mode():
+        obs, _ = env.reset() 
+        runner.alg.policy.reset(torch.ones(env.num_envs, dtype=torch.bool, device=agent_cfg.device))
+    
+    # 开始联合训练 (Actor + Critic)
     runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)
 
     # 10. 关闭
