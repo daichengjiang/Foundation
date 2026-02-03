@@ -39,11 +39,19 @@ def main() -> None:
             self._policy = policy
             self._device = self._unwrapped.device
             
-            # 统计变量
             self.max_episodes = max_episodes
             self.total_episodes = 0
             self.total_successes = 0
-            # 使用环境内部定义的 Enum 方便对比
+            
+            # 统计各项原因
+            self.death_counts = {
+                "COLLISION": 0,
+                "TOO_LOW": 0,
+                "TOO_HIGH": 0,
+                "UNSTABLE": 0,
+                "TIMEOUT": 0,
+                "OTHER": 0
+            }
             self.Outcome = self._unwrapped.EpisodeOutcome
 
         def run(self):
@@ -55,9 +63,6 @@ def main() -> None:
                     actions = self._policy(obs)
                     obs, rewards, dones, infos = self._env.step(actions)
                 
-                # --- 修改后的统计逻辑 ---
-                # 直接从环境的 extras 中读取本步完成的所有 episode 结果
-                # upper_env.py 在 _get_dones 中存入了这些数据
                 log_data = self._unwrapped.extras.get("log", {})
                 outcomes = log_data.get("Metrics/outcome_episodes_per_step", [])
 
@@ -66,19 +71,45 @@ def main() -> None:
                         self.total_episodes += 1
                         if outcome == self.Outcome.SUCCESS:
                             self.total_successes += 1
+                        elif outcome == self.Outcome.COLLISION:
+                            self.death_counts["COLLISION"] += 1
+                        elif outcome == self.Outcome.TOO_LOW:
+                            self.death_counts["TOO_LOW"] += 1
+                        elif outcome == self.Outcome.TOO_HIGH:
+                            self.death_counts["TOO_HIGH"] += 1
+                        elif outcome == self.Outcome.UNSTABLE:
+                            self.death_counts["UNSTABLE"] += 1
+                        elif outcome == self.Outcome.TIMEOUT:
+                            self.death_counts["TIMEOUT"] += 1
+                        else:
+                            self.death_counts["OTHER"] += 1
                     
-                    # 实时打印进度
+                    # 计算比例
                     success_rate = (self.total_successes / self.total_episodes) * 100
-                    print(f">>> [进度] Ep: {self.total_episodes}/{self.max_episodes} | "
-                          f"成功率: {success_rate:.2f}%", end='\r')
+                    
+                    # 构造死亡原因显示的字符串
+                    deaths = self.total_episodes - self.total_successes
+                    death_info = ""
+                    if deaths > 0:
+                        parts = []
+                        mapping = {"碰": "COLLISION", "低": "TOO_LOW", "高": "TOO_HIGH", "晕": "UNSTABLE", "时": "TIMEOUT"}
+                        for label, key in mapping.items():
+                            if self.death_counts[key] > 0:
+                                parts.append(f"{label}:{self.death_counts[key]/deaths*100:.0f}%")
+                        death_info = " | " + " ".join(parts)
 
-                # 达到目标数量停止
+                    print(f">>> [进度] Ep: {self.total_episodes}/{self.max_episodes} | "
+                          f"成功率: {success_rate:.2f}%{death_info}          ", end='\r')
+
                 if self.total_episodes >= self.max_episodes:
                     print(f"\n\n{'='*50}")
-                    print(f"评估完成！")
-                    print(f"总 Episodes: {self.total_episodes}")
-                    print(f"总成功数: {self.total_successes}")
-                    print(f"最终成功率: {(self.total_successes / self.total_episodes) * 100:.2f}%")
+                    print(f"评估完成！最终成功率: {(self.total_successes / self.total_episodes) * 100:.2f}%")
+                    print("失败原因细分 (占总失败次数):")
+                    deaths = self.total_episodes - self.total_successes
+                    if deaths > 0:
+                        for k, v in self.death_counts.items():
+                            if v > 0:
+                                print(f"  - {k:10}: {v} ({v/deaths*100:.1f}%)")
                     print(f"{'='*50}")
                     break
 

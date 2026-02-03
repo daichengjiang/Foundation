@@ -1187,11 +1187,13 @@ class QuadcopterEnv(DirectRLEnv):
         return total_reward
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
-
+        # 1. 计算超时
         time_out = self.episode_length_buf >= self.max_episode_length - 1
 
+        # 2. 检查数值稳定性
         self.CHECK_state()
 
+        # 3. 检查碰撞
         net_contact_forces = self._contact_sensor.data.net_forces_w_history
         selected_forces = torch.index_select(
             net_contact_forces,
@@ -1200,56 +1202,72 @@ class QuadcopterEnv(DirectRLEnv):
         )
         max_contact = torch.max(torch.norm(selected_forces, dim=-1), dim=1)[0]
         physical_contact = torch.sum(max_contact > 0.0, dim=1) > 0
-        is_contact = physical_contact
-        self._is_contact = torch.logical_or(self._is_contact, is_contact.bool())
+        self._is_contact = torch.logical_or(self._is_contact, physical_contact.bool())
 
+        # 4. 检查地图占据（如果启用）
         if self.cfg.enable_dijkstra:
             for i in range(self.cfg.grid_rows):
                 for j in range(self.cfg.grid_cols):
                     idx = i * self.cfg.grid_cols + j
                     env_ids = self.grid_idx[idx]
-                    is_free, _ = self._maps[idx].check_positions_occupancy(self._robot.data.root_state_w[env_ids, :3].cpu().numpy())
-                    is_free = torch.tensor(is_free, dtype=torch.bool, device=self.device)
-                    self._is_contact[env_ids] = torch.logical_or(self._is_contact[env_ids], ~is_free)
+                    if len(env_ids) > 0:
+                        is_free, _ = self._maps[idx].check_positions_occupancy(self._robot.data.root_state_w[env_ids, :3].cpu().numpy())
+                        is_free = torch.tensor(is_free, dtype=torch.bool, device=self.device)
+                        self._is_contact[env_ids] = torch.logical_or(self._is_contact[env_ids], ~is_free)
 
+        # 5. 检查成功条件
         succeed_mask = self._robot.data.root_state_w[:, :3][:, 0] > self.env_origins[:, 0] + self.cfg.success_threshold
-
         self._is_success = torch.logical_or(self._is_success, succeed_mask.bool())
-        conditions = [
-            self._numerical_is_unstable,
-            self._is_contact,
-            self._robot.data.root_pos_w[:, 2] < self.cfg.too_low,
-            self._robot.data.root_pos_w[:, 2] > self.cfg.too_high,
-            self._is_success,
-        ]
 
-        died = conditions[0]
-        for condition in conditions[1:]:
-            died = torch.logical_or(died, condition)
+        # 6. 综合所有死亡/结束条件
+        too_low = self._robot.data.root_pos_w[:, 2] < self.cfg.too_low
+        too_high = self._robot.data.root_pos_w[:, 2] > self.cfg.too_high
+        
+        # 只要满足其中之一即为 died (这里包含成功，因为成功后也需要重置)
+        died = self._numerical_is_unstable | self._is_contact | too_low | too_high | self._is_success
 
+        # 7. 统计逻辑：初始化变量，防止 NameError
         if "log" not in self.extras:
             self.extras["log"] = dict()
+
         completed_mask = torch.logical_or(died, time_out)
         completed_episodes = torch.sum(completed_mask == True).item()
+        
+        success_episodes = 0
+        timeout_episodes = 0
+        outcome_list = []
+
         if completed_episodes > 0:
-            success_episodes = torch.sum(self._is_success == True).item()
-            timeout_episodes = torch.sum(time_out == True).item()
-            outcomes = self._is_success[completed_mask]
-            outcomes = (outcomes.cpu() == True).tolist()
-            outcome =  [self.EpisodeOutcome.SUCCESS if success else self.EpisodeOutcome.FAILURE for success in outcomes]
-            self.extras["log"].update({
-                    "Metrics/success_episodes_per_step": success_episodes,
-                    "Metrics/completed_episodes_per_step": completed_episodes,
-                    "Metrics/timeout_episodes_per_step": timeout_episodes,
-                    "Metrics/outcome_episodes_per_step": outcome,
-            })
-        else:
-            self.extras["log"].update({
-                "Metrics/success_episodes_per_step": 0,
-                "Metrics/completed_episodes_per_step": 0,
-                "Metrics/timeout_episodes_per_step": 0,
-                "Metrics/outcome_episodes_per_step": [],
-            })
+            success_episodes = torch.sum(self._is_success[completed_mask] == True).item()
+            timeout_episodes = torch.sum(time_out[completed_mask] == True).item()
+            
+            # 找到所有本步结束的环境 ID
+            completed_env_indices = torch.where(completed_mask)[0]
+            
+            for idx in completed_env_indices:
+                # 按照优先级判断具体原因
+                if self._is_success[idx]:
+                    outcome_list.append(self.EpisodeOutcome.SUCCESS)
+                elif time_out[idx]:
+                    outcome_list.append(self.EpisodeOutcome.TIMEOUT)
+                elif self._numerical_is_unstable[idx]:
+                    outcome_list.append(self.EpisodeOutcome.UNSTABLE)
+                elif self._is_contact[idx]:
+                    outcome_list.append(self.EpisodeOutcome.COLLISION)
+                elif self._robot.data.root_pos_w[idx, 2] < self.cfg.too_low:
+                    outcome_list.append(self.EpisodeOutcome.TOO_LOW)
+                elif self._robot.data.root_pos_w[idx, 2] > self.cfg.too_high:
+                    outcome_list.append(self.EpisodeOutcome.TOO_HIGH)
+                else:
+                    outcome_list.append(self.EpisodeOutcome.FAILURE)
+
+        # 8. 更新 extras 字典
+        self.extras["log"].update({
+            "Metrics/success_episodes_per_step": success_episodes,
+            "Metrics/completed_episodes_per_step": completed_episodes,
+            "Metrics/timeout_episodes_per_step": timeout_episodes,
+            "Metrics/outcome_episodes_per_step": outcome_list,
+        })
 
         return died, time_out
 
@@ -1528,114 +1546,146 @@ class QuadcopterEnv(DirectRLEnv):
     class EpisodeOutcome(IntEnum):
         ONGOING = 0
         SUCCESS = 1
-        FAILURE = 2
+        FAILURE = 2        # 通用失败
+        COLLISION = 3      # 碰撞
+        TOO_LOW = 4        # 高度过低
+        TOO_HIGH = 5       # 高度过高
+        UNSTABLE = 6       # 数值不稳定
+        TIMEOUT = 7        # 超时
 
     def _update_episode_outcomes_and_metrics(self, env_ids, success_mask, died_mask, timed_out_mask):
+        # ----------------------------------------------------------------------
+        # 1. 细化 Outcome 判定逻辑
+        # ----------------------------------------------------------------------
+        # 只有当环境结束(done)时，我们才更新 outcome，否则保持 ONGOING
+        
+        # 为了并行效率，我们先给所有结束的环境一个默认值
+        # 优先级：Success > Timeout > Specific Failure > Generic Failure
+        
+        # 临时存储本轮结束环境的 outcome，默认为 ONGOING
+        current_outcomes = torch.full((len(env_ids),), self.EpisodeOutcome.ONGOING, device=self.device)
+        
+        # 1.1 标记 Success
+        current_outcomes[success_mask] = self.EpisodeOutcome.SUCCESS
+        
+        # 1.2 标记 Timeout (注意：如果既 Success 又 Timeout，上面 Success 会被覆盖吗？
+        # 通常我们希望 Success 优先，所以下面用 mask 排除掉已经是 Success 的)
+        # 仅在 (TimedOut AND NOT Success) 的情况下标记为 TIMEOUT
+        pure_timeout_mask = timed_out_mask & (~success_mask)
+        current_outcomes[pure_timeout_mask] = self.EpisodeOutcome.TIMEOUT
+        
+        # 1.3 标记各种死亡原因 (Died AND NOT Success)
+        # died_mask 通常包含了 success (在 get_dones 里)，所以这里要小心
+        # 我们只处理那些 died 但没有 success 的
+        actual_died_mask = died_mask & (~success_mask)
+        
+        if torch.any(actual_died_mask):
+            died_indices = torch.where(actual_died_mask)[0]
+            # 获取这些环境的物理状态进行判定
+            # 注意：这里的 indexing 需要对应到全局的 env_ids
+            global_died_ids = env_ids[died_indices]
+            
+            # 获取状态
+            is_unstable = self._numerical_is_unstable[global_died_ids]
+            is_collision = self._is_contact[global_died_ids]
+            pos_z = self._robot.data.root_pos_w[global_died_ids, 2]
+            too_low = pos_z < self.cfg.too_low
+            too_high = pos_z > self.cfg.too_high
+            
+            # 逐个判定优先级 (数值不稳定 > 碰撞 > 高度异常 > 普通失败)
+            # 这里的逻辑稍微繁琐一点，但为了准确性是必须的
+            # 我们直接操作 current_outcomes 对应的位置
+            
+            # 默认给 FAILURE
+            current_outcomes[died_indices] = self.EpisodeOutcome.FAILURE
+            
+            # 覆盖具体的
+            current_outcomes[died_indices[too_high]] = self.EpisodeOutcome.TOO_HIGH
+            current_outcomes[died_indices[too_low]] = self.EpisodeOutcome.TOO_LOW
+            current_outcomes[died_indices[is_collision]] = self.EpisodeOutcome.COLLISION
+            current_outcomes[died_indices[is_unstable]] = self.EpisodeOutcome.UNSTABLE
 
-        self._episode_outcomes[env_ids] = torch.where(
-            success_mask,
-            torch.tensor(self.EpisodeOutcome.SUCCESS, device=self.device),
-            torch.where(
-                died_mask,
-                torch.tensor(self.EpisodeOutcome.FAILURE, device=self.device),
-                self._episode_outcomes[env_ids]
-            )
-        )
+        # 更新历史记录 Buffer
+        self._episode_outcomes[env_ids] = current_outcomes
 
+        # ----------------------------------------------------------------------
+        # 2. 统计 Metrics (用于 WandB)
+        # ----------------------------------------------------------------------
         completed_mask = torch.logical_or(torch.logical_or(success_mask, died_mask), timed_out_mask)
         if not torch.any(completed_mask):
             return 0, 0
 
         completed_env_ids = env_ids[completed_mask]
-        success_env_ids = env_ids[success_mask]
-        died_env_ids = env_ids[died_mask]
+        
+        # 提取本步完成的所有 outcomes (转为 Python list)
+        outcomes_tensor = current_outcomes[completed_mask]
+        outcomes_list = outcomes_tensor.cpu().tolist()
+        
+        # 将最新的 outcome 加入历史队列
+        self._episode_outcome_history.extend(outcomes_list)
 
-        completed_success = success_mask[completed_mask]
-
-        outcomes = (completed_success.cpu() == True).tolist()
-        outcomes = [self.EpisodeOutcome.SUCCESS if success else self.EpisodeOutcome.FAILURE for success in outcomes]
-
-        if len(died_env_ids) > 0:
-
-            is_unstable = self._numerical_is_unstable[died_env_ids].cpu().numpy()
-            is_collision = self._is_contact[died_env_ids].cpu().numpy()
-            pos_z = self._robot.data.root_pos_w[died_env_ids, 2].cpu().numpy()
-            too_low = (pos_z < self.cfg.too_low)
-            too_high = (pos_z > self.cfg.too_high)
-
-            for i in range(len(died_env_ids)):
-                self._termination_reason_history.append({
-                    "numerical_is_unstable": bool(is_unstable[i]),
-                    "collision": bool(is_collision[i]),
-                    "too_low": bool(too_low[i]),
-                    "too_high": bool(too_high[i])
-                })
-
-        self._termination_reason_history.extend([{}] * (len(success_env_ids) + len(env_ids[timed_out_mask])))
-
-        if len(completed_env_ids) > 0:
-            distances = torch.linalg.norm(
-                self._desired_pos_w[completed_env_ids] - self._robot.data.root_pos_w[completed_env_ids],
-                dim=1
-            ).cpu().tolist()
-
-            self._final_distances.extend(distances)
-
-        if len(completed_env_ids) > 0:
-            vel_abs = torch.linalg.norm(
-                self._robot.data.root_lin_vel_w[completed_env_ids],
-                dim=1
-            ).cpu().tolist()
-
-            self._vel_abs.extend(vel_abs)
-
-        self._episode_outcome_history.extend(outcomes)
-
+        # ----------------------------------------------------------------------
+        # 3. 计算 WandB 曲线
+        # ----------------------------------------------------------------------
         num_outcomes = len(self._episode_outcome_history)
         if num_outcomes > 0:
-
             outcome_array = np.array(list(self._episode_outcome_history))
+            
+            # A. 统计基础三大类
             success_count = np.sum(outcome_array == self.EpisodeOutcome.SUCCESS)
-            died_count = np.sum(outcome_array == self.EpisodeOutcome.FAILURE)
-            timeout_count = num_outcomes - success_count - died_count
+            timeout_count = np.sum(outcome_array == self.EpisodeOutcome.TIMEOUT)
+            # 所有不等于 Success 且 不等于 Timeout 且 不等于 Ongoing 的都是 Died
+            # 或者更简单：Total - Success - Timeout
+            died_count = num_outcomes - success_count - timeout_count
 
             self._success_rate = success_count / num_outcomes
 
-            reason_keys = ["numerical_is_unstable", "collision", "too_low", "too_high"]
-            reason_counts = {key: 0 for key in reason_keys}
+            # B. 统计具体死亡原因 (用于 Metrics/Died/...)
+            # 直接从 outcome_array 统计，准确无误
+            count_collision = np.sum(outcome_array == self.EpisodeOutcome.COLLISION)
+            count_unstable = np.sum(outcome_array == self.EpisodeOutcome.UNSTABLE)
+            count_too_low = np.sum(outcome_array == self.EpisodeOutcome.TOO_LOW)
+            count_too_high = np.sum(outcome_array == self.EpisodeOutcome.TOO_HIGH)
 
-            if len(self._termination_reason_history) > 0:
-
-                batch_size = 2000
-                for i in range(0, len(self._termination_reason_history), batch_size):
-                    batch = list(itertools.islice(self._termination_reason_history, i, i + batch_size))
-                    for key in reason_keys:
-                        reason_counts[key] += sum(1 for reason in batch if key in reason and reason[key])
-
-            completed_count = len(outcomes)
-            succeeded_count = sum(1 for o in outcomes if o == self.EpisodeOutcome.SUCCESS)
-            self._episodes_completed += completed_count
-            self._episodes_succeeded += succeeded_count
-            cumulative_success_rate = self._episodes_succeeded / self._episodes_completed if self._episodes_completed > 0 else 0.0
+            # C. 其他统计 (距离、速度等保持原样)
+            if len(completed_env_ids) > 0:
+                distances = torch.linalg.norm(
+                    self._desired_pos_w[completed_env_ids] - self._robot.data.root_pos_w[completed_env_ids],
+                    dim=1
+                ).cpu().tolist()
+                self._final_distances.extend(distances)
+                
+                vel_abs = torch.linalg.norm(
+                    self._robot.data.root_lin_vel_w[completed_env_ids],
+                    dim=1
+                ).cpu().tolist()
+                self._vel_abs.extend(vel_abs)
 
             avg_final_distance = np.mean(list(self._final_distances)) if self._final_distances else 0.0
-
             avg_velocity = np.mean(list(self._vel_abs)) if self._vel_abs else 0.0
+            
+            # 计算累积成功率
+            self._episodes_completed += len(outcomes_list)
+            self._episodes_succeeded += outcomes_list.count(self.EpisodeOutcome.SUCCESS)
+            cumulative_success_rate = self._episodes_succeeded / self._episodes_completed if self._episodes_completed > 0 else 0.0
 
             if "log" not in self.extras:
                 self.extras["log"] = {}
 
+            # D. 更新 Logs
             self.extras["log"].update({
-
+                # 核心三大类 (和为 100%)
                 "Episode_Termination/died": died_count / num_outcomes * 100.0,
                 "Episode_Termination/time_out": timeout_count / num_outcomes * 100.0,
                 "Episode_Termination/success": success_count / num_outcomes * 100.0,
 
-                "Metrics/Died/numerical_is_unstable": reason_counts["numerical_is_unstable"] / num_outcomes * 100.0,
-                "Metrics/Died/collision": reason_counts["collision"] / num_outcomes * 100.0,
-                "Metrics/Died/too_low": reason_counts["too_low"] / num_outcomes * 100.0,
-                "Metrics/Died/too_high": reason_counts["too_high"] / num_outcomes * 100.0,
+                # 死亡原因细分 (分母为总 episodes，所以这些加起来等于 died_rate)
+                "Metrics/Died/numerical_is_unstable": count_unstable / num_outcomes * 100.0,
+                "Metrics/Died/collision": count_collision / num_outcomes * 100.0,
+                "Metrics/Died/too_low": count_too_low / num_outcomes * 100.0,
+                "Metrics/Died/too_high": count_too_high / num_outcomes * 100.0,
 
+                # 其他指标
                 "Metrics/final_distance_to_goal": avg_final_distance,
                 "Metrics/average_velocity": avg_velocity,
                 "Metrics/Success/goal_reached": success_count,
@@ -1643,9 +1693,14 @@ class QuadcopterEnv(DirectRLEnv):
                 "Metrics/cumulative_success_rate": cumulative_success_rate * 100.0,
                 "Metrics/episodes_completed": self._episodes_completed,
                 "Metrics/episodes_succeeded": self._episodes_succeeded,
+                
+                # 这一行是为了兼容 Play 脚本的实时显示
+                "Metrics/outcome_episodes_per_step": outcomes_list 
             })
 
-            return completed_count, succeeded_count
+            return len(outcomes_list), outcomes_list.count(self.EpisodeOutcome.SUCCESS)
+            
+        return 0, 0
 
     def close(self):
 
