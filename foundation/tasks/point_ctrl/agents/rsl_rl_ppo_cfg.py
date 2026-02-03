@@ -48,7 +48,7 @@ class QuadcopterUpperRunnerCfg(RslRlOnPolicyRunnerCfg):
     experiment_name = "upper"
     empirical_normalization = True
     policy = RslRlPpoActorCriticCfg(
-        init_noise_std=0.3,
+        init_noise_std=1.0,
         actor_hidden_dims=[256, 256, 128],
         critic_hidden_dims=[256, 256, 128],
         activation="elu",
