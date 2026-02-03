@@ -385,7 +385,7 @@ class QuadcopterEnv(DirectRLEnv):
         
         # Figure-8 trajectory parameters
         self._figure8_time = torch.zeros(self.num_envs, device=self.device)
-        self._figure8_frequency = 0.2
+        self._figure8_frequency = 0.1
         self._figure8_scale_x = 1.0
         self._figure8_scale_y = 0.5
         self._figure8_height = 3.0
