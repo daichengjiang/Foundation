@@ -265,7 +265,8 @@ class QuadcopterEnv(DirectRLEnv):
         self._current_motor_speeds = torch.zeros(self.num_envs, 4, device=self.device)
 
         # 初始化控制器 (传入异构张量)
-        self._controller = PaperPhysControllerTensor(
+        
+        self._controller = SimpleQuadrotorController(
             num_envs=self.num_envs,
             device=self.device,
             mass=self.mass_tensor,
@@ -273,9 +274,19 @@ class QuadcopterEnv(DirectRLEnv):
             inertia=self.inertia_tensor,
             thrust_to_weight=self.twr_tensor,
             kappa=self.kappa_tensor,
-            motor_alpha_up=self.motor_alpha_up,
-            motor_alpha_down=self.motor_alpha_down,
         )
+
+        # self._controller = PaperPhysControllerTensor(
+        #     num_envs=self.num_envs,
+        #     device=self.device,
+        #     mass=self.mass_tensor,
+        #     arm_length=self.arm_l_tensor,
+        #     inertia=self.inertia_tensor,
+        #     thrust_to_weight=self.twr_tensor,
+        #     kappa=self.kappa_tensor,
+        #     motor_alpha_up=self.motor_alpha_up,
+        #     motor_alpha_down=self.motor_alpha_down,
+        # )
 
         # 状态标志位
         self._is_langevin_task = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
@@ -545,7 +556,7 @@ class QuadcopterEnv(DirectRLEnv):
             
             # --- 4. [新增] 正弦 Yaw 角 ---
             # 设定 Yaw 的摆动幅度，例如 90 度 (PI/2)
-            yaw_amplitude = math.pi / 3   
+            yaw_amplitude = math.pi / 4   
             
             # 计算 Yaw (跟随主频率 omega 变化)
             # yaw = A * sin(omega * t)
@@ -935,8 +946,6 @@ class QuadcopterEnv(DirectRLEnv):
         self.acc_des[env_ids] = 0.0
         self._spawn_pos_w[env_ids] = spawn_center
 
-        self.yaw_des[env_ids] = (torch.rand(len(env_ids), device=self.device) * 2 - 1) * self.yaw_limit / 2.0
-        self.yaw_rate_des[env_ids] = 0.0 # 初始角速度为 0
 
         # 4. --- 随机初始状态采样 (RAPTOR style) ---
         num_resets = len(env_ids)
@@ -968,6 +977,8 @@ class QuadcopterEnv(DirectRLEnv):
             lin_vel[perfect_mask] = 0.0
             ang_vel[perfect_mask] = 0.0
             quat[perfect_mask] = torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device)
+            self.yaw_des[env_ids] = (torch.rand(len(env_ids), device=self.device) * 2 - 1) * self.yaw_limit / 2.0
+            self.yaw_rate_des[env_ids] = 0.0 # 初始角速度为 0
         else:
             # Play 模式固定开局
             pos_offset = torch.zeros(num_resets, 3, device=self.device)
@@ -975,6 +986,8 @@ class QuadcopterEnv(DirectRLEnv):
             ang_vel = torch.zeros(num_resets, 3, device=self.device)
             quat = torch.zeros(num_resets, 4, device=self.device)
             quat[:, 0] = 1.0
+            self.yaw_des[env_ids] = 0.0
+            self.yaw_rate_des[env_ids] = 0.0 # 初始角速度为 0
 
         # 5. --- [核心优化] 初始化历史 Buffer (同步随机状态) ---
         # 计算重置时刻的 Body-frame 旋转矩阵

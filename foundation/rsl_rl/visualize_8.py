@@ -14,35 +14,6 @@ from matplotlib.collections import LineCollection
 from mpl_toolkits.mplot3d.art3d import Line3DCollection
 import os
 
-def plot_yaw_tracking(timestamps, desired_yaw, actual_yaw, save_path=None):
-    """Plot Yaw tracking over time."""
-    if len(desired_yaw) == 0:
-        return
-
-    # 转换为角度 (Degrees)
-    des_deg = np.degrees(desired_yaw)
-    act_deg = np.degrees(actual_yaw)
-    
-    # 简单的角度 Wrap 处理 (为了绘图好看，如果数据跳变，图上会有竖线)
-    # 如果希望图更好看，可以对 act_deg 做 unwrap，或者仅绘制 raw data
-    
-    plt.figure(figsize=(10, 5))
-    plt.plot(timestamps, des_deg, label='Desired Yaw', color='red', linestyle='--', linewidth=1.5)
-    plt.plot(timestamps, act_deg, label='Actual Yaw', color='blue', alpha=0.8, linewidth=1.5)
-    
-    plt.title('Yaw Angle Tracking', fontsize=14)
-    plt.xlabel('Time [s]', fontsize=12)
-    plt.ylabel('Yaw Angle [deg]', fontsize=12)
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    
-    # 限制 Y 轴范围 (根据你的限制 ±90度，稍微多给点空间)
-    plt.ylim(-110, 110) 
-    
-    if save_path:
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        print(f"Saved yaw plot to: {save_path}")
-    plt.close()
 
 def get_colored_segments(x, y, z, color_vals, cmap_name='plasma'):
     """Prepare segments and colors for plotting."""
@@ -175,6 +146,36 @@ def plot_paper_style_3d(desired_pos, actual_pos, actual_vel, save_path=None):
         print(f"3D paper-style plot saved to: {save_path}")
     plt.show()
 
+def plot_yaw_tracking(timestamps, desired_yaw, actual_yaw, save_path=None):
+    """Plot Yaw tracking over time."""
+    if len(desired_yaw) == 0:
+        return
+
+    # 转换为角度 (Degrees)
+    des_deg = np.degrees(desired_yaw)
+    act_deg = np.degrees(actual_yaw)
+    
+    # 简单的角度 Wrap 处理 (为了绘图好看，如果数据跳变，图上会有竖线)
+    # 如果希望图更好看，可以对 act_deg 做 unwrap，或者仅绘制 raw data
+    
+    plt.figure(figsize=(10, 5))
+    plt.plot(timestamps, des_deg, label='Desired Yaw', color='red', linestyle='--', linewidth=1.5)
+    plt.plot(timestamps, act_deg, label='Actual Yaw', color='blue', alpha=0.8, linewidth=1.5)
+    
+    plt.title('Yaw Angle Tracking', fontsize=14)
+    plt.xlabel('Time [s]', fontsize=12)
+    plt.ylabel('Yaw Angle [deg]', fontsize=12)
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    # 限制 Y 轴范围 (根据你的限制 ±90度，稍微多给点空间)
+    plt.ylim(-110, 110) 
+    
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"Saved yaw plot to: {save_path}")
+    plt.show()
+
 def main():
     parser = argparse.ArgumentParser(description='Visualize trajectory tracking results (Paper Style)')
     parser.add_argument('--data_dir', type=str, required=True, 
@@ -200,6 +201,15 @@ def main():
     desired_yaw = data['desired_yaw']
     actual_yaw = data['actual_yaw']
     
+    # ================= [修复 1: 提取 timestamps] =================
+    if 'timestamps' in data:
+        timestamps = data['timestamps']
+    else:
+        # 如果旧数据没有时间戳，生成一个模拟的 dt=0.01
+        print("[WARNING] Timestamps not found, generating sequential time.")
+        timestamps = np.arange(len(desired_pos)) * 0.01 
+    # ===========================================================
+
     # Determine start step for stats and plotting
     stats_start = 3000 # Default fallback
     
@@ -258,12 +268,12 @@ def main():
     save_path_3d = os.path.join(plots_dir, '3d_velocity_trajectory.png') if args.save_plots else None
     plot_paper_style_3d(plot_desired, plot_actual, plot_vel, save_path_3d)
 
-    plot_yaw_tracking(
-        timestamps, 
-        desired_yaw, 
-        actual_yaw, 
-        save_path=os.path.join(plots_dir, 'yaw_tracking.png') if args.save_plots else None
-    )
+    # ================= [修复 2: 使用切片后的数据绘图] =================
+    # 确保时间戳和Yaw数据也从 stats_start 开始，与上面两张图保持一致
+    save_path_yaw = os.path.join(plots_dir, 'yaw_tracking.png') if args.save_plots else None
+    plot_yaw_tracking(timestamps[stats_start:],desired_yaw[stats_start:],actual_yaw[stats_start:],save_path_yaw)
+
+    # =================================================================
     
     print("\nVisualization complete!")
 

@@ -107,14 +107,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env_cfg.sim.use_fabric = not args_cli.disable_fabric if args_cli.disable_fabric is not None else env_cfg.sim.use_fabric
 
     # Example dynamics (Teacher usually works on specific dynamics)
-    env_cfg.dynamics.mass = 2.6212713726296095
-    env_cfg.dynamics.arm_length = 0.22783240710897568
-    env_cfg.dynamics.inertia = (0.017986559143800703,0.017986559143800703,0.032951376351442886)
-    env_cfg.dynamics.thrust_to_weight = 1.8968700962085583
-    env_cfg.dynamics.motor_tau_up = 0.04631196130033888
-    env_cfg.dynamics.motor_tau_down = 0.16175337519859598
-    env_cfg.dynamics.moment_scale = 0.03225607735778938
-
+    env_cfg.dynamics.mass = 2.3225681331110195
+    env_cfg.dynamics.arm_length = 0.16618615639723053
+    env_cfg.dynamics.inertia = (0.01772012181684822,0.01772012181684822,0.03246326316846594)
+    env_cfg.dynamics.thrust_to_weight = 3.817971224232067
+    env_cfg.dynamics.motor_tau_up = 0.033747857021372236
+    env_cfg.dynamics.motor_tau_down = 0.050106098836605065
+    env_cfg.dynamics.moment_scale = 0.016033988659398073
 
     # get checkpoint path
     checkpoint_path = retrieve_file_path(args_cli.checkpoint)
@@ -245,11 +244,23 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             timestep += 1
             
             if timestep % 200 == 0:
+                # 1. 计算位置 RMSE
                 cur_rmse = np.sqrt(torch.mean(squared_error).item())
                 cur_rmse_xy = np.sqrt(torch.mean(squared_error_xy).item())
-                status = " (Collecting Stats)" if timestep >= STATS_START_STEP else " (Warmup)"
-                print(f"Step {timestep:5d}{status} | RMSE: {cur_rmse:.4f}m | RMSE w/o z: {cur_rmse_xy:.4f}m")
                 
+                # 2. [新增] 计算实时 Yaw RMSE
+                # 使用已经获取的 full-batch 数据: env.unwrapped.yaw_des 和 yaw_curr
+                batch_yaw_err = env.unwrapped.yaw_des - yaw_curr
+                # 角度归一化 (Wrap to -pi ~ pi)
+                batch_yaw_err = torch.remainder(batch_yaw_err + torch.pi, 2 * torch.pi) - torch.pi
+                # 计算 RMSE 并转为角度
+                cur_yaw_rmse = np.degrees(torch.sqrt(torch.mean(batch_yaw_err**2)).item())
+
+                status = " (Collecting Stats)" if timestep >= STATS_START_STEP else " (Warmup)"
+                
+                # 3. [新增] 打印包含 Yaw RMSE 的信息
+                print(f"Step {timestep:5d}{status} | RMSE: {cur_rmse:.4f}m | RMSE w/o z: {cur_rmse_xy:.4f}m | Yaw RMSE: {cur_yaw_rmse:.4f} deg")
+        
         if args_cli.realtime:
             sleep_time = dt - (time.time() - step_start_time)
             if sleep_time > 0:
