@@ -510,6 +510,9 @@ class QuadcopterEnv(DirectRLEnv):
             self._spawn_pos_w[recenter_idx] = curr_pos
             self.pos_des[recenter_idx] = curr_pos
             self._traj_origin_adjusted[recenter_idx] = True
+            # [新增] 重置时也将 Yaw 设为 0，防止突变
+            self.yaw_des[recenter_idx] = 0.0
+            self.yaw_rate_des[recenter_idx] = 0.0
 
         in_warmup = t < self._figure8_warmup_duration
         active_mask = ~in_warmup
@@ -517,31 +520,47 @@ class QuadcopterEnv(DirectRLEnv):
         
         if len(active_env_ids) > 0:
             omega = 2 * math.pi * self._figure8_frequency
-            spawn = self._spawn_pos_w[active_env_ids] # 只取活跃环境的出生点
-            t_adj = t[active_mask] - self._figure8_warmup_duration # 只取活跃环境的时间
+            spawn = self._spawn_pos_w[active_env_ids]
+            t_adj = t[active_mask] - self._figure8_warmup_duration
             
-            # --- 修正：补全 pos_des_new ---
+            # --- 1. 位置 Position ---
             x_rel = self._figure8_scale_x * torch.sin(omega * t_adj)
             y_rel = self._figure8_scale_y * torch.sin(2 * omega * t_adj)
             z_target = spawn[:, 2] 
             pos_des_new = torch.stack([spawn[:, 0] + x_rel, spawn[:, 1] + y_rel, z_target], dim=1)
             
-            # 速度
+            # --- 2. 速度 Velocity ---
             vx = self._figure8_scale_x * omega * torch.cos(omega * t_adj)
             vy = self._figure8_scale_y * 2 * omega * torch.cos(2 * omega * t_adj)
             vz = torch.zeros_like(vx)
             vel_des_new = torch.stack([vx, vy, vz], dim=1)
 
-            # 加速度
+            # --- 3. 加速度 Acceleration ---
             ax = -self._figure8_scale_x * (omega**2) * torch.sin(omega * t_adj)
             ay = -self._figure8_scale_y * (4 * omega**2) * torch.sin(2 * omega * t_adj)
             az = torch.zeros_like(ax)
             acc_des_new = torch.stack([ax, ay, az], dim=1)
             
-            # 赋值
+            # --- 4. [新增] 正弦 Yaw 角 ---
+            # 设定 Yaw 的摆动幅度，例如 90 度 (PI/2)
+            yaw_amplitude = math.pi / 3   
+            
+            # 计算 Yaw (跟随主频率 omega 变化)
+            # yaw = A * sin(omega * t)
+            yaw_new = yaw_amplitude * torch.sin(omega * t_adj)
+            
+            # 计算 Yaw Rate (对时间求导)
+            # d(yaw)/dt = A * omega * cos(omega * t)
+            yaw_rate_new = yaw_amplitude * omega * torch.cos(omega * t_adj)
+
+            # --- 赋值 ---
             self.pos_des[active_env_ids] = pos_des_new
             self.vel_des[active_env_ids] = vel_des_new
             self.acc_des[active_env_ids] = acc_des_new
+            
+            # [新增] 赋值 Yaw
+            self.yaw_des[active_env_ids] = yaw_new
+            self.yaw_rate_des[active_env_ids] = yaw_rate_new
 
     def _calc_env_origins(self):
         robots_per_env = self.cfg.robots_per_env
@@ -739,9 +758,15 @@ class QuadcopterEnv(DirectRLEnv):
         # 这一步是为了解决“350度”和“10度”相差只有20度，而不是340度的问题
         # 使用 torch.remainder 确保结果在 [0, 2pi] 之间，然后减去 pi 移到 [-pi, pi]
         yaw_error = torch.remainder(yaw_error + torch.pi, 2 * torch.pi) - torch.pi
-        # Cost 就是误差的绝对值
-        orientation_cost = torch.abs(yaw_error)
+        # B. 【关键修改】将角度误差映射回“四元数 Z 分量”空间
+        # 原版惩罚的是 q_z，物理上 q_z = sin(yaw/2)。
+        # 为了复刻原版手感，我们计算“误差角的 sin(x/2)”
+        yaw_error_mapped = torch.sin(yaw_error / 2.0)
         
+        # C. 套用原版非线性公式
+        # 公式：arccos( clamp( 1.0 - abs(x) ) )
+        # 这一步保留了“接近目标时梯度无穷大”的特性，会促使 Agent 极其精确地对齐
+        orientation_cost = torch.arccos(torch.clamp(1.0 - torch.abs(yaw_error_mapped), -1.0, 1.0))
         # 3. 动作平滑 Cost (保持不变)
         d_action_cost = torch.norm(self._actions - self._last_actions, dim=1)
         
