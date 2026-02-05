@@ -16,7 +16,7 @@ while true; do
     echo "[$(date '+%H:%M:%S')] Starting new iteration with SEED: $SEED"
     
     # 核心修改：在这里动态拼接 --seed 参数
-    python generate_pid_dataset.py --task teacher --headless --seed $SEED
+    python generate_pid_dataset.py --task teacher --headless --use_pid --seed $SEED
     
     if [ $? -eq 0 ]; then
         echo "✅ Iteration finished successfully."

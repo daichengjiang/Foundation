@@ -263,28 +263,17 @@ class QuadcopterEnv(DirectRLEnv):
 
         self._current_motor_speeds = torch.zeros(self.num_envs, 4, device=self.device)
 
-        if self.cfg.use_pid:
-            self._controller = PaperPhysControllerTensor(
-                num_envs=self.num_envs,
-                device=self.device,
-                mass=self.mass_tensor,
-                arm_length=self.arm_l_tensor,
-                inertia=self.inertia_tensor,
-                thrust_to_weight=self.twr_tensor,
-                kappa=self.kappa_tensor,
-                motor_alpha_up=self.motor_alpha_up,
-                motor_alpha_down=self.motor_alpha_down,
-            )
-        else:
-            self._controller = SimpleQuadrotorController(
-                num_envs=self.num_envs,
-                device=self.device,
-                mass=self.mass_tensor,
-                arm_length=self.arm_l_tensor,
-                inertia=self.inertia_tensor,
-                thrust_to_weight=self.twr_tensor,
-                kappa=self.kappa_tensor,
-            )
+        self._controller = PaperPhysControllerTensor(
+            num_envs=self.num_envs,
+            device=self.device,
+            mass=self.mass_tensor,
+            arm_length=self.arm_l_tensor,
+            inertia=self.inertia_tensor,
+            thrust_to_weight=self.twr_tensor,
+            kappa=self.kappa_tensor,
+            motor_alpha_up=self.motor_alpha_up,
+            motor_alpha_down=self.motor_alpha_down,
+        )
 
         # 状态标志位
         self._is_langevin_task = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
@@ -304,7 +293,6 @@ class QuadcopterEnv(DirectRLEnv):
         self.pos_des = torch.zeros(self.num_envs, 3, device=self.device)
         self.vel_des = torch.zeros(self.num_envs, 3, device=self.device)
         self.acc_des = torch.zeros(self.num_envs, 3, device=self.device)
-        # [新增] 独立 Yaw 轨迹状态
         self.yaw_des = torch.zeros(self.num_envs, device=self.device)      # 期望偏航角
         self.yaw_rate_des = torch.zeros(self.num_envs, device=self.device) # 期望偏航角速度
 

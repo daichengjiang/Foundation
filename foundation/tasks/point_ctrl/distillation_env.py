@@ -124,9 +124,9 @@ class QuadcopterSceneCfg(InteractiveSceneCfg):
 @configclass
 class QuadcopterEnvCfg(DirectRLEnvCfg):
 
-    teacher_observation_space = 56
+    teacher_observation_space = 58
 
-    student_observation_space = 22
+    student_observation_space = 24
     # 设置 IsaacLab 默认观测空间（通常对应学生策略维度）
     observation_space = student_observation_space 
 
@@ -332,19 +332,19 @@ class QuadcopterEnv(DirectRLEnv):
 
         self._current_motor_speeds = torch.zeros(self.num_envs, 4, device=self.device)
 
+        
+        self._controller = PaperPhysControllerTensor(
+            num_envs=self.num_envs,
+            device=self.device,
+            mass=self.mass_tensor,
+            arm_length=self.arm_l_tensor,
+            inertia=self.inertia_tensor,
+            thrust_to_weight=self.twr_tensor,
+            kappa=self.kappa_tensor,
+            motor_alpha_up=self.motor_alpha_up,
+            motor_alpha_down=self.motor_alpha_down,
+        )
         if self.cfg.use_pid:
-            self._controller = PaperPhysControllerTensor(
-                num_envs=self.num_envs,
-                device=self.device,
-                mass=self.mass_tensor,
-                arm_length=self.arm_l_tensor,
-                inertia=self.inertia_tensor,
-                thrust_to_weight=self.twr_tensor,
-                kappa=self.kappa_tensor,
-                motor_alpha_up=self.motor_alpha_up,
-                motor_alpha_down=self.motor_alpha_down,
-            )
-
             self._controller.update_gains(
                 wn=self.wn_tensor,
                 zeta=self.zeta_tensor,
@@ -352,17 +352,6 @@ class QuadcopterEnv(DirectRLEnv):
                 tc_ang_y=self.tc_ang_y_tensor,
                 tc_rate_rp=self.tc_rate_rp_tensor,
                 tc_rate_y=self.tc_rate_y_tensor
-            )
-
-        else:
-            self._controller = SimpleQuadrotorController(
-                num_envs=self.num_envs,
-                device=self.device,
-                mass=self.mass_tensor,
-                arm_length=self.arm_l_tensor,
-                inertia=self.inertia_tensor,
-                thrust_to_weight=self.twr_tensor,
-                kappa=self.kappa_tensor,
             )
 
         self._is_langevin_task = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
@@ -384,6 +373,10 @@ class QuadcopterEnv(DirectRLEnv):
         self.pos_des = torch.zeros(self.num_envs, 3, device=self.device)
         self.vel_des = torch.zeros(self.num_envs, 3, device=self.device)
         self.acc_des = torch.zeros(self.num_envs, 3, device=self.device) # 新增加速度项
+        self.yaw_des = torch.zeros(self.num_envs, device=self.device)      # 期望偏航角
+        self.yaw_rate_des = torch.zeros(self.num_envs, device=self.device) # 期望偏航角速度
+
+        self.yaw_limit = math.pi / 2
 
         # Langevin parameters
         self._langevin_dt = 0.01
@@ -489,6 +482,57 @@ class QuadcopterEnv(DirectRLEnv):
         
         self._numerical_is_unstable = torch.logical_or(self._numerical_is_unstable, state_is_unstable)
 
+    def _update_yaw_langevin(self, env_ids: torch.Tensor, dt: float):
+        """
+        受限的 Yaw 角 Langevin 动力学生成。
+        范围被限制在 [-90, 90] 度之间，且带有回中趋势。
+        """
+        # --- 参数设置 ---
+        yaw_limit = self.yaw_limit # 限制在 +/- 90 度 (1.57 rad)
+        yaw_k_pos = 0.2        # 弹簧刚度 (回复力)
+        yaw_k_vel = 0.5        # 阻尼
+        yaw_noise_scale = 2.0  # 噪声强度
+        max_yaw_rate = 2.5     # 最大角速度
+            
+        # 1. 获取当前状态
+        current_yaw = self.yaw_des[env_ids]
+        current_yaw_rate = self.yaw_rate_des[env_ids]
+        
+        # 2. 生成随机扰动
+        noise = torch.randn(len(env_ids), device=self.device) * yaw_noise_scale
+        
+        # 3. 核心动力学更新 (Ornstein-Uhlenbeck Process)
+        # 加速度 = 随机力 - 阻尼力 - 弹簧回复力(当前角度偏离0的程度)
+        # 这里的 - yaw_k_pos * current_yaw 就是把头拉回正前方的力
+        yaw_acc = noise - yaw_k_vel * current_yaw_rate - yaw_k_pos * current_yaw
+        
+        # 4. 积分更新角速度
+        next_yaw_rate = current_yaw_rate + yaw_acc * dt
+        
+        # 限制角速度 (物理能力限制)
+        next_yaw_rate = torch.clamp(next_yaw_rate, -max_yaw_rate, max_yaw_rate)
+        
+        # 5. 积分更新角度
+        next_yaw = current_yaw + next_yaw_rate * dt
+        
+        # 6. 硬截断与边界处理 (Hard Constraints)
+        # 如果超出 +/- 90 度，强制拉回，并将撞墙的速度清零
+        over_max = next_yaw > yaw_limit
+        under_min = next_yaw < -yaw_limit
+        
+        if over_max.any() or under_min.any():
+            # 截断角度
+            next_yaw = torch.clamp(next_yaw, -yaw_limit, yaw_limit)
+            
+            # 撞墙处理：如果试图冲出边界，把速度抹平（非弹性碰撞），防止粘在墙上抖动
+            # 逻辑：如果超限了，把对应的 rate 设为 0 (或者反弹 -0.5 * rate)
+            hit_limit_mask = over_max | under_min
+            next_yaw_rate[hit_limit_mask] = 0.0
+            
+        # 7. 保存状态
+        self.yaw_des[env_ids] = next_yaw
+        self.yaw_rate_des[env_ids] = next_yaw_rate
+
     def _generate_desired_trajectory_langevin(self, env_ids: torch.Tensor = None):
         if env_ids is None: env_ids = torch.arange(self.num_envs, device=self.device)
         n_envs = len(env_ids)
@@ -547,6 +591,8 @@ class QuadcopterEnv(DirectRLEnv):
         self.vel_des[env_ids] = vel_next
         self.pos_des[env_ids] = pos_next
 
+        self._update_yaw_langevin(env_ids, dt)
+
     def _generate_desired_trajectory_figure8(self, env_ids: torch.Tensor = None):
         if env_ids is None: env_ids = torch.arange(self.num_envs, device=self.device)
         n_envs = len(env_ids)
@@ -562,6 +608,9 @@ class QuadcopterEnv(DirectRLEnv):
             self._spawn_pos_w[recenter_idx] = curr_pos
             self.pos_des[recenter_idx] = curr_pos
             self._traj_origin_adjusted[recenter_idx] = True
+            # [新增] 重置时也将 Yaw 设为 0，防止突变
+            self.yaw_des[recenter_idx] = 0.0
+            self.yaw_rate_des[recenter_idx] = 0.0
 
         in_warmup = t < self._figure8_warmup_duration
         active_mask = ~in_warmup
@@ -569,31 +618,48 @@ class QuadcopterEnv(DirectRLEnv):
         
         if len(active_env_ids) > 0:
             omega = 2 * math.pi * self._figure8_frequency
-            spawn = self._spawn_pos_w[active_env_ids] # 只取活跃环境的出生点
-            t_adj = t[active_mask] - self._figure8_warmup_duration # 只取活跃环境的时间
+            spawn = self._spawn_pos_w[active_env_ids]
+            t_adj = t[active_mask] - self._figure8_warmup_duration
             
-            # --- 修正：补全 pos_des_new ---
+            # --- 1. 位置 Position ---
             x_rel = self._figure8_scale_x * torch.sin(omega * t_adj)
             y_rel = self._figure8_scale_y * torch.sin(2 * omega * t_adj)
             z_target = spawn[:, 2] 
             pos_des_new = torch.stack([spawn[:, 0] + x_rel, spawn[:, 1] + y_rel, z_target], dim=1)
             
-            # 速度
+            # --- 2. 速度 Velocity ---
             vx = self._figure8_scale_x * omega * torch.cos(omega * t_adj)
             vy = self._figure8_scale_y * 2 * omega * torch.cos(2 * omega * t_adj)
             vz = torch.zeros_like(vx)
             vel_des_new = torch.stack([vx, vy, vz], dim=1)
 
-            # 加速度
+            # --- 3. 加速度 Acceleration ---
             ax = -self._figure8_scale_x * (omega**2) * torch.sin(omega * t_adj)
             ay = -self._figure8_scale_y * (4 * omega**2) * torch.sin(2 * omega * t_adj)
             az = torch.zeros_like(ax)
             acc_des_new = torch.stack([ax, ay, az], dim=1)
             
-            # 赋值
+            # --- 4. [新增] 正弦 Yaw 角 ---
+            # 设定 Yaw 的摆动幅度，例如 90 度 (PI/2)
+            yaw_amplitude = math.pi / 4   
+            
+            # 计算 Yaw (跟随主频率 omega 变化)
+            # yaw = A * sin(omega * t)
+            yaw_new = yaw_amplitude * torch.sin(omega * t_adj)
+            
+            # 计算 Yaw Rate (对时间求导)
+            # d(yaw)/dt = A * omega * cos(omega * t)
+            yaw_rate_new = yaw_amplitude * omega * torch.cos(omega * t_adj)
+
+            # --- 赋值 ---
             self.pos_des[active_env_ids] = pos_des_new
             self.vel_des[active_env_ids] = vel_des_new
             self.acc_des[active_env_ids] = acc_des_new
+            
+            # [新增] 赋值 Yaw
+            self.yaw_des[active_env_ids] = yaw_new
+            self.yaw_rate_des[active_env_ids] = yaw_rate_new
+
     def _calc_env_origins(self):
         robots_per_env = self.cfg.robots_per_env
         num_groups = self.num_envs // robots_per_env + 1
@@ -752,6 +818,13 @@ class QuadcopterEnv(DirectRLEnv):
         rot_matrix_b2w = matrix_from_quat(quat_w)
         rot_matrix_w2b = rot_matrix_b2w.transpose(1, 2) 
 
+        # yaw角观测
+        _, _, y = euler_xyz_from_quat(quat_w)
+        yaw_error = self.yaw_des - y
+        yaw_error = torch.remainder(yaw_error + math.pi, 2 * math.pi) - math.pi
+        yaw_error_sin = torch.sin(yaw_error).unsqueeze(1) # (N, 1)
+        yaw_error_cos = torch.cos(yaw_error).unsqueeze(1) # (N, 1)
+
         # 2. 计算当前帧在机体系下的误差
         curr_pos_error_b = torch.bmm(rot_matrix_w2b, (pos_w - self.pos_des).unsqueeze(-1)).squeeze(-1)
         curr_vel_error_b = torch.bmm(rot_matrix_w2b, (vel_w - self.vel_des).unsqueeze(-1)).squeeze(-1)
@@ -779,6 +852,8 @@ class QuadcopterEnv(DirectRLEnv):
             curr_vel_error_b,             # 3
             ang_vel_b,                  # 3
             self._last_actions,         # 4
+            yaw_error_sin,              # 1
+            yaw_error_cos,              # 1 
         ], dim=-1)
 
         # 7. 教师
@@ -790,6 +865,8 @@ class QuadcopterEnv(DirectRLEnv):
             self._last_actions,         # 4
             acc_des_b,                  # 3 
             vel_des_b,                  # 3 
+            yaw_error_sin,              # 1
+            yaw_error_cos,              # 1 
             self._current_motor_speeds, # 4
         ], dim=-1)
 
@@ -798,61 +875,42 @@ class QuadcopterEnv(DirectRLEnv):
         
         return {"policy": obs_student, "teacher": obs_teacher, "rnd_state": obs_student}
     def _get_rewards(self) -> torch.Tensor:
-        # --- 1. 获取状态 ---
-        pos_w = self._robot.data.root_pos_w
-        quat_w = self._robot.data.root_quat_w
-        
-        # --- 2. 计算各项原始 Cost ---
-        # Position
-        pos_error = pos_w - self.pos_des
-        pos_error_norm = torch.norm(pos_error, dim=1)
-        
-        # Orientation (q_z based)
-        q_z = quat_w[:, 3]
-        arccos_arg = torch.clamp(1.0 - torch.abs(q_z), -1.0, 1.0)
-        orientation_cost = torch.arccos(arccos_arg)
-        
-        # Action Smoothness
-        action_diff = self._actions - self._last_actions
-        d_action_cost = torch.norm(action_diff, dim=1)
-        
-        # Base Reward
-        constant = torch.ones(self.num_envs, device=self.device)
-        
-        # Terminal Penalty
-        terminal = (
-            self._numerical_is_unstable 
-        )
-        termination_penalty = terminal.float()
-        
-        # --- 3. 应用权重 (计算实际 Reward) ---
-        r_pos = -pos_error_norm * self.cfg.reward_coef_position_cost
-        r_ori = -orientation_cost * self.cfg.reward_coef_orientation_cost
-        r_act = -d_action_cost * self.cfg.reward_coef_d_action_cost
-        r_base = constant * self.cfg.reward_constant
-        r_term = -termination_penalty * self.cfg.reward_coef_termination_penalty
 
-        # 总 Reward
-        total_reward = r_pos + r_ori + r_act + r_base + r_term
+        pos_error_norm = torch.norm(self._robot.data.root_pos_w - self.pos_des, dim=1)
+
+        # yaw角姿态cost
+        quat_w = self._robot.data.root_quat_w
+        _, _, yaw_curr = euler_xyz_from_quat(quat_w)
+        yaw_error = self.yaw_des - yaw_curr
+        yaw_error = torch.remainder(yaw_error + torch.pi, 2 * torch.pi) - torch.pi
+        yaw_error_mapped = torch.sin(yaw_error / 2.0)
+        orientation_cost = torch.arccos(torch.clamp(1.0 - torch.abs(yaw_error_mapped), -1.0, 1.0))
+
+        # 3. 动作平滑 Cost (保持不变)
+        d_action_cost = torch.norm(self._actions - self._last_actions, dim=1)
         
-        # --- 4. 累加 Episode Sums ---
-        reward_items = {
-            "position": r_pos,
-            "orientation": r_ori,
-            "action_smooth": r_act,
-            "base": r_base,
+        # 4. 计算各项 Reward
+        r_pos = -pos_error_norm * self.cfg.reward_coef_position_cost
+        r_ori = -orientation_cost * self.cfg.reward_coef_orientation_cost # 这里只包含 Yaw 误差
+        r_act = -d_action_cost * self.cfg.reward_coef_d_action_cost
+        r_base = self.cfg.reward_constant
+        r_term = -self._numerical_is_unstable.float() * self.cfg.reward_coef_termination_penalty
+
+        # 5. 记录日志 (Accumulate sums)
+        sums = {
+            "position": r_pos, 
+            "orientation": r_ori, 
+            "action_smooth": r_act, 
+            "base": torch.full_like(r_pos, self.cfg.reward_constant), 
             "terminal": r_term
         }
+        for k, v in sums.items():
+            if k not in self._episode_sums: self._episode_sums[k] = torch.zeros_like(v)
+            self._episode_sums[k] += v
 
-        for key, value in reward_items.items():
-            if key not in self._episode_sums:
-                self._episode_sums[key] = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
-            self._episode_sums[key] += value
-        
-        # 更新历史动作
         self._last_actions = self._actions.clone()
-        
-        return total_reward
+        return r_pos + r_ori + r_act + r_base + r_term
+
 
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -955,13 +1013,13 @@ class QuadcopterEnv(DirectRLEnv):
                 r = radius * torch.pow(torch.rand(n_samples, 1, device=self.device), 1.0 / 3.0)
                 return direction * r
 
-            pos_offset = sample_in_sphere(10.0 * l_arm, num_resets)
-            lin_vel = sample_in_sphere(1.0, num_resets)
-            ang_vel = sample_in_sphere(1.0, num_resets)
+            pos_offset = sample_in_sphere(3.0 * l_arm, num_resets)
+            lin_vel = sample_in_sphere(0.5, num_resets)
+            ang_vel = sample_in_sphere(0.5, num_resets)
             
-            roll = (torch.rand(num_resets, device=self.device) * 2 - 1) * (math.pi / 2.0)
-            pitch = (torch.rand(num_resets, device=self.device) * 2 - 1) * (math.pi / 2.0)
-            yaw = (torch.rand(num_resets, device=self.device) * 2 - 1) * math.pi
+            roll = (torch.rand(num_resets, device=self.device) * 2 - 1) * (math.pi / 8)
+            pitch = (torch.rand(num_resets, device=self.device) * 2 - 1) * (math.pi / 8)
+            yaw = (torch.rand(num_resets, device=self.device) * 2 - 1) * (math.pi / 6)
             quat = quat_from_euler_xyz(roll, pitch, yaw)
 
             # 10% 完美开局
@@ -970,11 +1028,16 @@ class QuadcopterEnv(DirectRLEnv):
             lin_vel[is_perfect] = 0.0
             ang_vel[is_perfect] = 0.0
             quat[is_perfect] = torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device)
+
+            self.yaw_des[env_ids] = (torch.rand(len(env_ids), device=self.device) * 2 - 1) * self.yaw_limit / 2.0
+            self.yaw_rate_des[env_ids] = 0.0
         else:
             pos_offset = torch.zeros(num_resets, 3, device=self.device)
             lin_vel = torch.zeros(num_resets, 3, device=self.device)
             ang_vel = torch.zeros(num_resets, 3, device=self.device)
             quat = torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device).repeat(num_resets, 1)
+            self.yaw_des[env_ids] = 0.0
+            self.yaw_rate_des[env_ids] = 0.0
 
         # --- 3. 根据采样结果同步初始化 Buffer 和期望值 ---
         self.pos_des[env_ids] = spawn_center

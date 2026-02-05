@@ -329,7 +329,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # ================= [关键修改] 筛选与 ID 生成逻辑 =================
     
     # [修改 2] 筛选逻辑：如果 RMSE 太大，直接舍弃
-    threshold_rmse = 0.4
+    threshold_rmse = 0.6
     if best_rmse > threshold_rmse:
         print(f"❌ Result Rejected: RMSE {best_rmse:.4f} > {threshold_rmse}. Not saving.")
         return # 直接退出，不保存
