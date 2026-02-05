@@ -30,6 +30,7 @@ parser.add_argument(
     "--disable_fabric", action="store_true", default=False, help="Disable fabric and use USD I/O operations."
 )
 parser.add_argument("--realtime", action="store_true", default=False, help="Run in real-time, if possible.")
+parser.add_argument("--use_pid", action="store_true", default=False, help="the flag to indicate use pid controller or not")
 # append RSL-RL cli arguments (this includes --checkpoint)
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -104,6 +105,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env_cfg.seed = args_cli.seed
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
     env_cfg.sim.use_fabric = not args_cli.disable_fabric if args_cli.disable_fabric is not None else env_cfg.sim.use_fabric
+    env_cfg.use_pid = args_cli.use_pid
 
     # Example dynamics (Teacher usually works on specific dynamics)
     # env_cfg.dynamics.mass = 4.748783341993348
@@ -147,10 +149,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env_cfg.dynamics.motor_tau_down = dynamics_dict[7]
     env_cfg.dynamics.moment_scale = dynamics_dict[8]
 
-    # get checkpoint path
-    checkpoint_path = retrieve_file_path(args_cli.checkpoint)
-    print(f"[INFO]: Loading best model checkpoint from: {checkpoint_path}")
-    
     # specify directory for logging this play session
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
     log_root_path = os.path.abspath(log_root_path)
@@ -179,12 +177,22 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env = RslRlVecEnvWrapper(env)
     runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
     
-    print(f"[INFO]: Loading model checkpoint from: {checkpoint_path}")
-    runner.load(checkpoint_path, load_optimizer=False)
-    
-    runner.eval_mode()
-    policy = runner.get_inference_policy(device=agent_cfg.device)
-    policy_model = runner.alg.policy
+    if not args_cli.use_pid:
+        if not args_cli.checkpoint:
+            raise ValueError("Argument '--checkpoint' is required when NOT using PID controller.")
+            
+        checkpoint_path = retrieve_file_path(args_cli.checkpoint)
+        print(f"[INFO]: Loading model checkpoint from: {checkpoint_path}")
+        runner.load(checkpoint_path, load_optimizer=False)
+        
+        runner.eval_mode()
+        policy = runner.get_inference_policy(device=agent_cfg.device)
+        policy_model = runner.alg.policy
+    else:
+        print(f"[INFO]: Using PID Controller. SKIPPING model loading.")
+        # 创建一个“哑巴”策略，输入 obs，输出全 0 动作
+        policy = lambda obs: torch.zeros(env.num_envs, 4, device=env.device)
+        policy_model = None
     dt = env.unwrapped.step_dt
     obs, _ = env.get_observations()
     

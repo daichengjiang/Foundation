@@ -20,6 +20,7 @@ parser.add_argument(
     "--disable_fabric", action="store_true", default=False, help="Disable fabric and use USD I/O operations."
 )
 parser.add_argument("--output_csv", type=str, default="teacher_dynamics.csv", help="Output CSV filename.")
+parser.add_argument("--use_pid", action="store_true", default=False, help="the flag to indicate use pid controller or not")
 
 # append RSL-RL cli arguments (this includes --checkpoint)
 cli_args.add_rsl_rl_args(parser)
@@ -266,7 +267,7 @@ def sample_raptor_dynamics():
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg):
     
-    output_file = "hypernetwork_training_data.csv"
+    output_file = args_cli.output_csv
     # [修改 1] 在最前面添加 id 列
     headers = ["id", "mass", "arm_length", "Ixx", "Iyy", "Izz", "thrust_to_weight", "motor_tau_up", "motor_tau_down", "kappa", 
                "wn", "zeta", "tc_ang_rp", "tc_ang_y", "tc_rate_rp", "tc_rate_y", "best_rmse"]
