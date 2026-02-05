@@ -86,8 +86,8 @@ def run_parallel_optimization(env, num_generations=10, n_repeats=3):
     # ================= 1. 定义参数范围 (Min, Max) =================
     # 格式: [wn, zeta, tc_ang_rp, tc_ang_y, tc_rate_rp, tc_rate_y]
     # 针对大质量无人机的宽松范围
-    bounds_min = torch.tensor([1.0, 0.6, 0.05, 0.20, 0.03, 0.10], device=device)
-    bounds_max = torch.tensor([4.5, 0.95, 0.40, 1.00, 0.20, 0.50], device=device)
+    bounds_min = torch.tensor([1.0, 0.65, 0.01, 0.05, 0.01, 0.02], device=device)
+    bounds_max = torch.tensor([10.0, 0.95, 0.20, 0.50, 0.1, 0.25], device=device)
     
     # 参数容器 (Population, 6)
     current_params = torch.rand(population_size, 6, device=device)
@@ -128,9 +128,9 @@ def run_parallel_optimization(env, num_generations=10, n_repeats=3):
         # 注意：在 Population 维度计算即可，不需要广播，这样计算量小
         
         # 约束 1: 1/wn < 2 * tc_ang_rp
-        violation1 = torch.relu((1.0 / wn) - (tc_ang_rp * 2.0))
+        violation1 = torch.relu((tc_ang_rp * 3.0) - (1.0 / wn))
         # 约束 2: tc_ang_rp < 2 * tc_rate_rp
-        violation2 = torch.relu((tc_rate_rp * 2.0) - tc_ang_rp)
+        violation2 = torch.relu((tc_rate_rp * 3.0) - tc_ang_rp)
         # 约束 3: tc_ang_y >= tc_ang_rp
         violation3 = torch.relu(tc_ang_rp - tc_ang_y)
 
@@ -327,7 +327,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # ================= [关键修改] 筛选与 ID 生成逻辑 =================
     
     # [修改 2] 筛选逻辑：如果 RMSE 太大，直接舍弃
-    threshold_rmse = 1
+    threshold_rmse = 0.4
     if best_rmse > threshold_rmse:
         print(f"❌ Result Rejected: RMSE {best_rmse:.4f} > {threshold_rmse}. Not saving.")
         return # 直接退出，不保存

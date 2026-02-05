@@ -266,17 +266,7 @@ class QuadcopterEnv(DirectRLEnv):
 
         # 初始化控制器 (传入异构张量)
         
-        self._controller = SimpleQuadrotorController(
-            num_envs=self.num_envs,
-            device=self.device,
-            mass=self.mass_tensor,
-            arm_length=self.arm_l_tensor,
-            inertia=self.inertia_tensor,
-            thrust_to_weight=self.twr_tensor,
-            kappa=self.kappa_tensor,
-        )
-
-        # self._controller = PaperPhysControllerTensor(
+        # self._controller = SimpleQuadrotorController(
         #     num_envs=self.num_envs,
         #     device=self.device,
         #     mass=self.mass_tensor,
@@ -284,9 +274,19 @@ class QuadcopterEnv(DirectRLEnv):
         #     inertia=self.inertia_tensor,
         #     thrust_to_weight=self.twr_tensor,
         #     kappa=self.kappa_tensor,
-        #     motor_alpha_up=self.motor_alpha_up,
-        #     motor_alpha_down=self.motor_alpha_down,
         # )
+
+        self._controller = PaperPhysControllerTensor(
+            num_envs=self.num_envs,
+            device=self.device,
+            mass=self.mass_tensor,
+            arm_length=self.arm_l_tensor,
+            inertia=self.inertia_tensor,
+            thrust_to_weight=self.twr_tensor,
+            kappa=self.kappa_tensor,
+            motor_alpha_up=self.motor_alpha_up,
+            motor_alpha_down=self.motor_alpha_down,
+        )
 
         # 状态标志位
         self._is_langevin_task = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)

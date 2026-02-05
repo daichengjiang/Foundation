@@ -107,13 +107,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env_cfg.sim.use_fabric = not args_cli.disable_fabric if args_cli.disable_fabric is not None else env_cfg.sim.use_fabric
 
     # Example dynamics (Teacher usually works on specific dynamics)
-    env_cfg.dynamics.mass = 2.3225681331110195
-    env_cfg.dynamics.arm_length = 0.16618615639723053
-    env_cfg.dynamics.inertia = (0.01772012181684822,0.01772012181684822,0.03246326316846594)
-    env_cfg.dynamics.thrust_to_weight = 3.817971224232067
-    env_cfg.dynamics.motor_tau_up = 0.033747857021372236
-    env_cfg.dynamics.motor_tau_down = 0.050106098836605065
-    env_cfg.dynamics.moment_scale = 0.016033988659398073
+    dynamics_dict = [0.09777998465800675,0.07081547934541962,0.00037916553112477935,0.00037916553112477935,0.0006946312530205958,2.91200001513932,0.04353632598181455,0.20681289322588903,0.006225218573472514]
+    env_cfg.dynamics.mass = dynamics_dict[0]
+    env_cfg.dynamics.arm_length = dynamics_dict[1]
+    env_cfg.dynamics.inertia = (dynamics_dict[2], dynamics_dict[3], dynamics_dict[4])
+    env_cfg.dynamics.thrust_to_weight = dynamics_dict[5]
+    env_cfg.dynamics.motor_tau_up = dynamics_dict[6]
+    env_cfg.dynamics.motor_tau_down = dynamics_dict[7]
+    env_cfg.dynamics.moment_scale = dynamics_dict[8]
 
     # get checkpoint path
     checkpoint_path = retrieve_file_path(args_cli.checkpoint)
