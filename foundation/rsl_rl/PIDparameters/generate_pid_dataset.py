@@ -20,6 +20,7 @@ parser.add_argument(
     "--disable_fabric", action="store_true", default=False, help="Disable fabric and use USD I/O operations."
 )
 parser.add_argument("--output_csv", type=str, default="teacher_dynamics.csv", help="Output CSV filename.")
+parser.add_argument("--use_pid", action="store_true", default=False, help="the flag to indicate use pid controller or not")
 
 # append RSL-RL cli arguments (this includes --checkpoint)
 cli_args.add_rsl_rl_args(parser)
@@ -298,6 +299,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env_cfg.scene.num_envs = args_cli.num_envs
     env_cfg.prob_null_trajectory = 0.0
     env_cfg.train_or_play = True
+    env_cfg.use_pid = args_cli.use_pid
     env_cfg.debug_vis = False 
     env_cfg.seed = args_cli.seed
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
