@@ -20,8 +20,8 @@ class QuadcopterTeacherRunnerCfg(RslRlOnPolicyRunnerCfg):
     empirical_normalization = True
     policy = RslRlPpoActorCriticCfg(
         init_noise_std=1.0,
-        actor_hidden_dims=[64, 64, 64],
-        critic_hidden_dims=[64, 64, 64],
+        actor_hidden_dims=[128, 128, 128],
+        critic_hidden_dims=[128, 128, 128],
         activation="elu",
         class_name="ActorCritic",  # "ActorCriticRNN" or "ActorCriticAtten" or "ActorCriticMLP"
     )
@@ -29,11 +29,11 @@ class QuadcopterTeacherRunnerCfg(RslRlOnPolicyRunnerCfg):
         value_loss_coef=1.0,
         use_clipped_value_loss=True,
         clip_param=0.2,
-        entropy_coef=0.0002, #0.0002
-        num_learning_epochs=1,  #4
+        entropy_coef=0.01, #0.0002
+        num_learning_epochs=4,  #4
         num_mini_batches=64,   #4
         learning_rate=1.0e-4,
-        schedule="fixed",  #"adaptive"
+        schedule="adaptive",  #"adaptive" “fixed”
         gamma=0.99,
         lam=0.95,
         desired_kl=0.01,

@@ -106,14 +106,68 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
     env_cfg.sim.use_fabric = not args_cli.disable_fabric if args_cli.disable_fabric is not None else env_cfg.sim.use_fabric
 
-    # Example dynamics (Teacher usually works on specific dynamics)
-    env_cfg.dynamics.mass = 2.3225681331110195
-    env_cfg.dynamics.arm_length = 0.16618615639723053
-    env_cfg.dynamics.inertia = (0.01772012181684822,0.01772012181684822,0.03246326316846594)
-    env_cfg.dynamics.thrust_to_weight = 3.817971224232067
-    env_cfg.dynamics.motor_tau_up = 0.033747857021372236
-    env_cfg.dynamics.motor_tau_down = 0.050106098836605065
-    env_cfg.dynamics.moment_scale = 0.016033988659398073
+    # #38
+    # env_cfg.dynamics.mass = 0.10481928562837814
+    # env_cfg.dynamics.arm_length = 0.06638733128139446
+    # env_cfg.dynamics.inertia = (0.0003116944234071324,0.0003116944234071324,0.0005710241836818665)
+    # env_cfg.dynamics.thrust_to_weight = 3.3747481735510236
+    # env_cfg.dynamics.motor_tau_up = 0.07580553016348295
+    # env_cfg.dynamics.motor_tau_down = 0.06260816371910138
+    # env_cfg.dynamics.moment_scale = 0.029114762254111186
+
+    # #45
+    # env_cfg.dynamics.mass = 0.10667879070394651
+    # env_cfg.dynamics.arm_length = 0.06275213191421349
+    # env_cfg.dynamics.inertia = (0.0005043252020762681,0.0005043252020762681,0.0009239237702037232)
+    # env_cfg.dynamics.thrust_to_weight = 3.663525773296906
+    # env_cfg.dynamics.motor_tau_up = 0.04962523021404839
+    # env_cfg.dynamics.motor_tau_down = 0.05780714703383573
+    # env_cfg.dynamics.moment_scale = 0.03801975614353795
+
+    # #48
+    # env_cfg.dynamics.mass = 0.19379698404409604
+    # env_cfg.dynamics.arm_length = 0.08600256197519564
+    # env_cfg.dynamics.inertia = (0.0009557337894321202,0.0009557337894321202,0.0017509043022396443)
+    # env_cfg.dynamics.thrust_to_weight = 2.2940332948761846
+    # env_cfg.dynamics.motor_tau_up = 0.08731096402801336
+    # env_cfg.dynamics.motor_tau_down = 0.17994658484697898
+    # env_cfg.dynamics.moment_scale = 0.018203602917120764
+
+    # #51
+    # env_cfg.dynamics.mass = 1.609227138424464
+    # env_cfg.dynamics.arm_length = 0.1993012121308172
+    # env_cfg.dynamics.inertia = (0.00954720225941577,0.00954720225941577,0.01749047453924969)
+    # env_cfg.dynamics.thrust_to_weight = 1.8324065494629935
+    # env_cfg.dynamics.motor_tau_up = 0.0650783063743488
+    # env_cfg.dynamics.motor_tau_down = 0.1764833852951275
+    # env_cfg.dynamics.moment_scale = 0.027613859343962963
+
+    # #52
+    # env_cfg.dynamics.mass = 0.3256278994379038
+    # env_cfg.dynamics.arm_length = 0.09936175479103562
+    # env_cfg.dynamics.inertia = (0.013973807523222226,0.013973807523222226,0.02560001538254312)
+    # env_cfg.dynamics.thrust_to_weight = 4.856311162052575
+    # env_cfg.dynamics.motor_tau_up = 0.06466019905714934
+    # env_cfg.dynamics.motor_tau_down = 0.1991020307540624
+    # env_cfg.dynamics.moment_scale = 0.0481624606230106
+
+    # #22
+    # env_cfg.dynamics.mass = 1.5417999156542592
+    # env_cfg.dynamics.arm_length = 0.15739782775950703
+    # env_cfg.dynamics.inertia = (0.02801919067000304,0.02801919067000304,0.05133115730744557)
+    # env_cfg.dynamics.thrust_to_weight = 2.50691164920116
+    # env_cfg.dynamics.motor_tau_up = 0.08924475074182275
+    # env_cfg.dynamics.motor_tau_down = 0.0986217760865855
+    # env_cfg.dynamics.moment_scale = 0.04602730277040338
+
+    #26
+    env_cfg.dynamics.mass = 1.3301380725412735
+    env_cfg.dynamics.arm_length = 0.1554153949322734
+    env_cfg.dynamics.inertia = (0.02051945563367653,0.02051945563367653,0.03759164272089541)
+    env_cfg.dynamics.thrust_to_weight = 3.435745781660817
+    env_cfg.dynamics.motor_tau_up = 0.08556498615430419
+    env_cfg.dynamics.motor_tau_down = 0.09978410686486691
+    env_cfg.dynamics.moment_scale = 0.04724647584323626
 
     # get checkpoint path
     checkpoint_path = retrieve_file_path(args_cli.checkpoint)

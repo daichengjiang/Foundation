@@ -4,7 +4,8 @@ import os
 import time
 import argparse
 import sys
-import shutil # [新增] 用于删除文件夹
+import shutil 
+import json  # [新增] 引入 json 库
 from datetime import datetime
 
 def sample_raptor_dynamics():
@@ -30,7 +31,6 @@ def sample_raptor_dynamics():
     Iyy = Ixx 
     Izz = Ixx * 1.832 
     
-    # motor_tau = np.random.uniform(0.02, 0.12) <-- 删除这行
     motor_tau_up = np.random.uniform(0.03, 0.1)
     motor_tau_down = np.random.uniform(0.03, 0.3)
 
@@ -41,31 +41,31 @@ def sample_raptor_dynamics():
         "arm_length": arm_length, 
         "inertia": (Ixx, Iyy, Izz),
         "thrust_to_weight": twr, 
-        # 修改返回字典
         "motor_tau_up": motor_tau_up,
         "motor_tau_down": motor_tau_down,
         "kappa": kappa
     }
 
-def run_training(teacher_id, dynamics, timestamp, gpu_id=0, csv_path="teacher_dynamics.csv", headless=False, reward_threshold=10000.0):
+def run_training(teacher_id, dynamics, timestamp, gpu_id=0, csv_path="teacher_dynamics.csv", headless=False):
     """
-    调用 train_teacher_single.py 并传入参数，返回是否训练成功
+    调用 train_teacher_single.py 并传入参数，读取JSON文件判断是否成功
     """
     inertia_str = f"[{dynamics['inertia'][0]:.10f},{dynamics['inertia'][1]:.10f},{dynamics['inertia'][2]:.10f}]"
+
+    # 确定实验名称，确保与下方路径构建一致
+    experiment_name = "multi_teachers"
 
     overrides = [
         f"env.dynamics.mass={dynamics['mass']:.8f}",
         f"env.dynamics.arm_length={dynamics['arm_length']:.8f}",
         f"env.dynamics.inertia={inertia_str}",
         f"env.dynamics.thrust_to_weight={dynamics['thrust_to_weight']:.5f}",
-        # f"env.dynamics.motor_tau={dynamics['motor_tau']:.5f}",
         f"env.dynamics.motor_tau_up={dynamics['motor_tau_up']:.5f}",
         f"env.dynamics.motor_tau_down={dynamics['motor_tau_down']:.5f}",
         f"env.dynamics.moment_scale={dynamics['kappa']:.5f}",
         
-        f"agent.experiment_name=multi_teachers",
+        f"agent.experiment_name={experiment_name}",
         f"agent.run_name=teacher_{teacher_id:04d}",
-        # 注意：请根据你的实际路径确认 USD 路径
         'env.robot.spawn.usd_path="./USD/cf2x.usd"',
         "env.debug_vis=False"
     ]
@@ -84,7 +84,7 @@ def run_training(teacher_id, dynamics, timestamp, gpu_id=0, csv_path="teacher_dy
         sys.executable, train_script,
         "--task", "teacher",
         "--num_envs", "4000",
-        "--max_iterations", "700",
+        "--max_iterations", "800",
         "--device", target_device,
         "--logger", "wandb",
         "--log_project_name", "Foundation",
@@ -94,23 +94,32 @@ def run_training(teacher_id, dynamics, timestamp, gpu_id=0, csv_path="teacher_dy
     if headless:
         cmd.append("--headless")
 
-    # [新增] 构造临时文件路径，用于接收子进程的最大奖励
-    result_file = os.path.abspath(f"temp_reward_{timestamp}_{teacher_id}.txt")
-    if os.path.exists(result_file):
-        os.remove(result_file)
+    # [修改] 预先构建该 Teacher 的日志目录和 Metrics 文件路径
+    # 路径结构: logs/rsl_rl/{experiment_name}/{timestamp}/teacher_{id}
+    # 注意：这个目录由 RSL-RL 在训练开始时自动创建，但我们可以预知其位置
+    teacher_log_dir = os.path.join("logs", "rsl_rl", experiment_name, timestamp, f"teacher_{teacher_id:04d}")
+    metrics_file = os.path.join(teacher_log_dir, "eval_metrics.json")
+    
+    # 确保 metrics_file 是绝对路径，防止子进程工作目录不同导致找不到
+    metrics_file_abs = os.path.abspath(metrics_file)
 
-    # [新增] 设置环境变量传给子进程
+    # [修改] 设置环境变量
     env_vars = os.environ.copy()
     env_vars["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-    env_vars["TEACHER_MAX_REWARD_PATH"] = result_file
+    # 告诉 teacher_env.py 直接把 JSON 写到这里，永久保存
+    env_vars["TEACHER_REWARD_PATH"] = metrics_file_abs
+
+    Pos_threshold = -2000
+    Ori_threshold = -700
+    Smooth_threshold = -600
 
     print(f"==================================================")
     print(f"Starting Teacher {teacher_id} | GPU {gpu_id} | Headless: {headless}")
-    print(f"Dir: .../{timestamp}/teacher_{teacher_id:04d}")
+    print(f"Log Dir: {teacher_log_dir}")
     print(f"Mass: {dynamics['mass']:.4f} kg | Arm: {dynamics['arm_length']:.4f} m") 
     print(f"TWR : {dynamics['thrust_to_weight']:.2f}    | Kappa: {dynamics['kappa']:.4f}")
     print(f"Tau Up: {dynamics['motor_tau_up']:.3f} s | Tau Down: {dynamics['motor_tau_down']:.3f} s")
-    print(f"Target: Avg Mean Reward (Iter 400-700) > {reward_threshold}")
+    print(f"Conditions: Pos > {Pos_threshold}, Ori > {Ori_threshold}, Smooth > {Smooth_threshold}")
     print(f"==================================================")
     
     success = False
@@ -119,27 +128,34 @@ def run_training(teacher_id, dynamics, timestamp, gpu_id=0, csv_path="teacher_dy
         # 执行训练
         subprocess.run(cmd, check=True, env=env_vars)
         
-        # 读取临时文件中的值 (此时文件里存的是 400-700 轮的平均奖励)
-        final_eval_reward = -float('inf')
-        if os.path.exists(result_file):
-            with open(result_file, 'r') as f:
+        # [修改] 读取 JSON 文件并进行多条件判断
+        if os.path.exists(metrics_file_abs):
+            with open(metrics_file_abs, 'r') as f:
                 try:
-                    content = f.read().strip()
-                    if content:
-                        final_eval_reward = float(content)
-                except ValueError:
-                    pass
-            os.remove(result_file)
-        
-        print(f"Teacher {teacher_id} Finished. Window Avg Reward: {final_eval_reward:.2f}")
+                    stats = json.load(f)
+                    pos_reward = stats.get("position", -float('inf'))
+                    ori_reward = stats.get("orientation", -float('inf'))
+                    smooth_reward = stats.get("action_smooth", -float('inf'))
+                    
+                    print(f"Teacher {teacher_id} Metrics: Pos={pos_reward:.2f}, Ori={ori_reward:.2f}, Smooth={smooth_reward:.2f}")
 
-        # [修改判定条件]
-        if final_eval_reward > reward_threshold:
-            print(f"SUCCESS: Avg Reward {final_eval_reward:.2f} > {reward_threshold}. Saving...")
-            save_params_to_csv(csv_path, teacher_id, dynamics)
-            success = True
+                    # [关键修改] 三个条件同时满足
+                    if (pos_reward > Pos_threshold and 
+                        ori_reward > Ori_threshold and 
+                        smooth_reward > Smooth_threshold):
+                        
+                        print(f"SUCCESS: All conditions met. Saving...")
+                        save_params_to_csv(csv_path, teacher_id, dynamics)
+                        success = True
+                    else:
+                        print(f"FAILURE: Conditions not met.")
+                        success = False
+                        
+                except json.JSONDecodeError:
+                    print(f"Error: Could not decode JSON from {metrics_file_abs}")
+                    success = False
         else:
-            print(f"FAILURE: Avg Reward {final_eval_reward:.2f} < {reward_threshold}. Retrying...")
+            print(f"FAILURE: Metrics file not found at {metrics_file_abs}")
             success = False
 
     except subprocess.CalledProcessError as e:
@@ -147,14 +163,12 @@ def run_training(teacher_id, dynamics, timestamp, gpu_id=0, csv_path="teacher_dy
         print(e)
         success = False
     
-    # [新增] 如果失败，清理日志目录
+    # [修改] 如果失败，清理日志目录
     if not success:
-        # 重构日志路径: logs/rsl_rl/raptor_teachers/{timestamp}/teacher_{id}
-        log_dir = os.path.join("logs", "rsl_rl", "raptor_teachers", timestamp, f"teacher_{teacher_id:04d}")
-        if os.path.exists(log_dir):
+        if os.path.exists(teacher_log_dir):
             try:
-                print(f"[Auto-Clean] Removing failed log dir: {log_dir}")
-                shutil.rmtree(log_dir)
+                print(f"[Auto-Clean] Removing failed log dir: {teacher_log_dir}")
+                shutil.rmtree(teacher_log_dir)
             except OSError as e:
                 print(f"Warning: Could not remove failed dir: {e}")
                 
@@ -193,6 +207,7 @@ if __name__ == "__main__":
     else:
         batch_timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
+    # 这里的 multi_teachers 对应 run_training 里的 experiment_name
     log_root_dir = os.path.join("logs", "rsl_rl", "multi_teachers", batch_timestamp)
     os.makedirs(log_root_dir, exist_ok=True)
     csv_path = os.path.join(log_root_dir, "teacher_dynamics.csv")
@@ -221,8 +236,7 @@ if __name__ == "__main__":
             timestamp=batch_timestamp, 
             gpu_id=args.gpu_id,
             csv_path=csv_path,
-            headless=args.headless,
-            reward_threshold=7000.0 # 设置阈值
+            headless=args.headless
         )
         
         if is_success:

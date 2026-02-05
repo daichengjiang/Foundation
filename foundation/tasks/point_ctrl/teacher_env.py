@@ -41,6 +41,7 @@ import os
 import csv
 import collections
 import itertools
+import json
 from dataclasses import dataclass
 
 from foundation.utils.simple_controller import SimpleQuadrotorController
@@ -344,8 +345,17 @@ class QuadcopterEnv(DirectRLEnv):
         
         # 为了计算 Reward Mean，模拟 RSL-RL buffer
         self.reward_rolling_buffer = deque(maxlen=100)
+        # [新增] 分项奖励的 Rolling Buffer (用于平滑最近100个episode的表现)
+        self.pos_reward_buffer = deque(maxlen=100)
+        self.ori_reward_buffer = deque(maxlen=100)
+        self.smooth_reward_buffer = deque(maxlen=100)
+
+        # [新增] 用于存储 400-700 轮期间每一轮(iteration)的平均值
+        self.iter_mean_pos_history = []
+        self.iter_mean_ori_history = []
+        self.iter_mean_smooth_history = []
         self.global_max_reward = -float('inf')
-        self.reward_report_path = os.environ.get("TEACHER_MAX_REWARD_PATH", None)
+        self.reward_report_path = os.environ.get("TEACHER_REWARD_PATH", None)
 
         self.set_debug_vis(self.cfg.debug_vis)
         self._traj_origin_adjusted = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
@@ -870,6 +880,17 @@ class QuadcopterEnv(DirectRLEnv):
                 batch_rewards += self._episode_sums[k][env_ids]
             self.reward_rolling_buffer.extend(batch_rewards.cpu().tolist())
             
+            # --- [新增] 提取分项奖励并存入对应的 Buffer ---
+            # 从 _episode_sums 中提取当前 reset 环境的奖励均值
+            # 注意：这里我们提取的是本批次(batch)的均值，放入buffer中进一步做平滑
+            avg_pos = torch.mean(self._episode_sums["position"][env_ids]).item()
+            avg_ori = torch.mean(self._episode_sums["orientation"][env_ids]).item()
+            avg_smooth = torch.mean(self._episode_sums["action_smooth"][env_ids]).item()
+
+            self.pos_reward_buffer.append(avg_pos)
+            self.ori_reward_buffer.append(avg_ori)
+            self.smooth_reward_buffer.append(avg_smooth)
+
             # # 记录最大奖励均值
             # if len(self.reward_rolling_buffer) > 0:
             #     cur_mean = np.mean(self.reward_rolling_buffer)
@@ -888,22 +909,36 @@ class QuadcopterEnv(DirectRLEnv):
                 current_iter = self.common_step_counter // self.steps_per_iteration
 
                 # 检查是否进入 400 - 700 轮区间
-                if 400 <= current_iter <= 700:
+                if 700 <= current_iter <= 800:
                     # 每一轮只记录一次当前 Mean (在这一轮的第一次 reset 时触发记录)
                     if current_iter > self.last_recorded_iteration:
+                        curr_pos_mean = np.mean(self.pos_reward_buffer)
+                        curr_ori_mean = np.mean(self.ori_reward_buffer)
+                        curr_smooth_mean = np.mean(self.smooth_reward_buffer)
+                        # 存入历史记录表
+                        self.iter_mean_pos_history.append(curr_pos_mean)
+                        self.iter_mean_ori_history.append(curr_ori_mean)
+                        self.iter_mean_smooth_history.append(curr_smooth_mean)
+
                         self.iteration_mean_rewards.append(cur_mean)
                         self.last_recorded_iteration = current_iter
 
                         # 计算从第 400 轮到当前的平均值
                         window_avg_reward = np.mean(self.iteration_mean_rewards)
-                        
+                        # 计算从第 400 轮到当前的 总平均值
+                        stats = {
+                            "position": np.mean(self.iter_mean_pos_history),
+                            "orientation": np.mean(self.iter_mean_ori_history),
+                            "action_smooth": np.mean(self.iter_mean_smooth_history)
+                        }
+
                         # 写入临时文件
                         if self.reward_report_path:
                             try:
                                 with open(self.reward_report_path, "w") as f:
-                                    f.write(str(window_avg_reward))
-                            except:
-                                pass
+                                    json.dump(stats, f)
+                            except Exception as e:
+                                print(f"[TeacherEnv] Error writing reward report: {e}")
             
             # 清理本轮奖励累计
             if "log" not in self.extras: self.extras["log"] = dict()
