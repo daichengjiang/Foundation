@@ -30,25 +30,28 @@ def main():
     # 2. 循环执行训练
     for idx, (dims, ent, sched, epochs) in enumerate(combinations):
         
-        # 构造易读的 Run ID
+        # 构造 Run ID (无空格，便于文件名处理)
         run_id = f"Dims{dims[0]}_Ent{ent}_Sch{sched}_Ep{epochs}"
         dims_arg = list(map(str, dims))
         
         print(f"\n[{idx+1}/{len(combinations)}] Starting Run: {run_id}")
         
+        # 定义临时报告文件路径
         report_file = os.path.join(current_dir, f"temp_report_{run_id}.json")
         
         # 构造 subprocess 命令
         cmd = [
             sys.executable, train_script_path,
-            "--task", "teacher",
+            "--task", "teacher", # 确保这是正确的 task name (对应 teacher_env.py)
             "--num_envs", "4000",        
             "--headless",                
-            "--max_iterations", "800",
-            # [新增] 激活 WandB 的关键参数
+            "--max_iterations", "800",   # 跑 850 轮，覆盖 700-800 的统计区间
+            
+            # WandB 参数
             "--logger", "wandb",
-            "--wandb_project", "Quadcopter_Teacher_Search", # 确保都在同一个项目下
-            # 参数覆盖
+            "--wandb_project", "Quadcopter_Teacher_Search",
+            
+            # 搜索参数
             "--override_hidden_dims", *dims_arg,
             "--override_entropy", str(ent),
             "--override_schedule", sched,
@@ -56,6 +59,7 @@ def main():
             "--run_name_suffix", run_id
         ]
         
+        # 设置环境变量，告诉 teacher_env.py 把结果写到哪里
         env_vars = os.environ.copy()
         env_vars["TEACHER_REWARD_PATH"] = report_file
         
@@ -63,35 +67,28 @@ def main():
             # 阻塞执行
             subprocess.run(cmd, env=env_vars, check=True)
             
-            # 3. 读取结果 (这部分保持不变)
+            # 3. 读取结果
             if os.path.exists(report_file):
                 with open(report_file, "r") as f:
                     data = json.load(f)
                 
-                target_keys = ["rew_action_smooth", "rew_orientation", "rew_position"] 
-                
+                # [修改点] 对应 teacher_env.py 实际写入的 Key
+                # teacher_env.py 已经计算好了 700-800 轮的均值，直接读取即可，不需要再切片
                 record = {
                     "Hidden Dims": str(dims),
                     "Entropy": ent,
                     "Schedule": sched,
                     "Num Epochs": epochs,
-                    "Run Name": run_id
+                    "Run Name": run_id,
+                    
+                    # 直接读取 Float 值，如果 Key 不存在则填 NaN
+                    "rew_position": data.get("position", np.nan),
+                    "rew_orientation": data.get("orientation", np.nan),
+                    "rew_action_smooth": data.get("action_smooth", np.nan)
                 }
                 
-                start_idx = 700
-                end_idx = 800
-                
-                for key in target_keys:
-                    if key in data and isinstance(data[key], list):
-                        valid_end = min(len(data[key]), end_idx)
-                        if valid_end > start_idx:
-                            segment = data[key][start_idx:valid_end]
-                            record[key] = np.mean(segment)
-                        else:
-                            record[key] = np.nan
-                    else:
-                        print(f"Warning: Key '{key}' not found.")
-                        record[key] = np.nan
+                # 简单的打印检查
+                print(f"   -> Result: Pos={record['rew_position']:.4f}, Ori={record['rew_orientation']:.4f}")
 
                 results.append(record)
                 os.remove(report_file)
@@ -111,9 +108,18 @@ def main():
     
     if results:
         df = pd.DataFrame(results)
+        
+        # 调整列顺序，好看一点
+        cols = ["Hidden Dims", "Entropy", "Schedule", "Num Epochs", 
+                "rew_position", "rew_orientation", "rew_action_smooth", "Run Name"]
+        # 确保列存在
+        cols = [c for c in cols if c in df.columns]
+        df = df[cols]
+
         pd.set_option('display.max_columns', None)
         pd.set_option('display.width', 1000)
         print(df)
+        
         csv_name = os.path.join(current_dir, f"param_selection_results_{int(time.time())}.csv")
         df.to_csv(csv_name, index=False)
         print(f"\nResults saved to {csv_name}")
