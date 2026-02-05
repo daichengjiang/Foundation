@@ -61,17 +61,17 @@ SPHERE_MARKER_CFG = VisualizationMarkersCfg(
 
 @configclass
 class QuadcopterDynamicsCfg:
-    mass: float = 0.0282
-    arm_length: float = 0.04384
-    inertia: tuple[float, float, float] = (2.44864e-5, 2.44864e-5, 3.61504e-5)
-    thrust_to_weight: float = 2.25 
+    mass: float = 0.10667879070394651
+    arm_length: float = 0.06275213191421349
+    inertia: tuple[float, float, float] = (0.0005043252020762681,0.0005043252020762681,0.0009239237702037232)
+    thrust_to_weight: float = 3.663525773296906
     
     # [修改] 替换单一的 motor_tau
-    motor_tau_up: float = 0.05
-    motor_tau_down: float = 0.10 # 默认值设大一点体现差异
+    motor_tau_up: float = 0.04962523021404839
+    motor_tau_down: float = 0.05780714703383573 # 默认值设大一点体现差异
     
     # [新增] 力矩系数
-    moment_scale: float = 0.016 
+    moment_scale: float = 0.03801975614353795
 
     multi_teacher_params: list[dict] | None = None
 

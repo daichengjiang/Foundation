@@ -26,6 +26,14 @@ parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
 parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
 parser.add_argument("--log_timestamp", type=str, default=None, help="Fixed timestamp folder name.")
+
+# [NEW] 参数筛选所需的命令行参数
+parser.add_argument("--override_hidden_dims", type=int, nargs="+", default=None, help="Override actor and critic hidden dims (e.g. 128 128 128)")
+parser.add_argument("--override_entropy", type=float, default=None, help="Override entropy coefficient")
+parser.add_argument("--override_schedule", type=str, default=None, help="Override learning rate schedule")
+parser.add_argument("--override_num_learning_epochs", type=int, default=None, help="Override num learning epochs per iteration")
+parser.add_argument("--run_name_suffix", type=str, default=None, help="Suffix for wandb run name")
+parser.add_argument("--wandb_project", type=str, default=None, help="WandB project name")
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -87,6 +95,32 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         args_cli.max_iterations if args_cli.max_iterations is not None else agent_cfg.max_iterations
     )
 
+    # [NEW] 使用命令行参数覆盖默认配置 (参数搜索核心逻辑)
+    if args_cli.override_hidden_dims:
+        print(f"[INFO] Overriding Hidden Dims to: {args_cli.override_hidden_dims}")
+        agent_cfg.policy.actor_hidden_dims = args_cli.override_hidden_dims
+        agent_cfg.policy.critic_hidden_dims = args_cli.override_hidden_dims
+        
+    if args_cli.override_entropy is not None:
+        print(f"[INFO] Overriding Entropy Coef to: {args_cli.override_entropy}")
+        agent_cfg.algorithm.entropy_coef = args_cli.override_entropy
+        
+    if args_cli.override_schedule:
+        print(f"[INFO] Overriding Schedule to: {args_cli.override_schedule}")
+        agent_cfg.algorithm.schedule = args_cli.override_schedule
+
+    if args_cli.override_num_learning_epochs is not None:
+        print(f"[INFO] Overriding Num Learning Epochs to: {args_cli.override_num_learning_epochs}")
+        agent_cfg.algorithm.num_learning_epochs = args_cli.override_num_learning_epochs
+
+    # [NEW] 修改 WandB 的 Run Name 和 Experiment Name
+    if args_cli.run_name_suffix:
+        # 修改 experiment_name，防止污染正常的 single_teacher 文件夹
+        agent_cfg.experiment_name = "param_search"
+        # 修改 run_name，这样 WandB 上能直接看出参数组合
+        agent_cfg.run_name = f"Search_{args_cli.run_name_suffix}"
+        
+
     # set the environment seed
     # note: certain randomizations occur in the environment initialization so we set the seed here
     env_cfg.seed = agent_cfg.seed
@@ -99,39 +133,32 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     agent_cfg_dict = agent_cfg.to_dict()
 
-    # [修改开始] 修正且健壮的 WandB 命名逻辑
+    # [修改] WandB 命名逻辑
     if args_cli.log_timestamp:
         # 1. 构造新的运行名称 (长名字，用于 WandB)
-        # 例如: 2025-12-03_20-39-44_teacher_0000
         new_run_name = f"{args_cli.log_timestamp}_{agent_cfg.run_name}"
         
         # 2. 更新配置字典中的 run_name
         agent_cfg_dict["run_name"] = new_run_name
         agent_cfg.run_name = new_run_name
         
-        # 3. 确保 logger 依然是字符串 (修复 AttributeError 的关键)
-        # 不要在这里把它改成字典！
+        # 3. 确保 logger 依然是字符串
         if agent_cfg_dict.get("logger") == "wandb":
-            # 尝试添加 RSL-RL 可能读取的扁平化参数 (作为额外保险)
             agent_cfg_dict["wandb_name"] = new_run_name
             agent_cfg_dict["wandb_id"] = new_run_name
             agent_cfg_dict["wandb_group"] = agent_cfg_dict.get("experiment_name")
         
-        # 4. 计算本地日志路径 (保持短名字，用于文件存储)
-        # 获取 teacher_xxxx 的后缀，例如 0000
-        # 假设原始 run_name 是 teacher_0000，或者在上面已经被改成了长名字，我们需要小心处理
-        # 这里最安全的做法是用 new_run_name (它是 ..._teacher_0000) 取最后一部分
-        teacher_suffix = new_run_name.split('_')[-1] # 得到 "0000"
-        local_run_folder = f"teacher_{teacher_suffix}" # 得到 "teacher_0000"
+        # 4. 计算本地日志路径
+        teacher_suffix = new_run_name.split('_')[-1] 
+        local_run_folder = f"teacher_{teacher_suffix}" 
         
         log_dir = os.path.join(log_root_path, args_cli.log_timestamp, local_run_folder)
         
         print(f"[INFO] Using fixed timestamp: {args_cli.log_timestamp}")
         print(f"[INFO] Local Log Dir: {log_dir}")
-        print(f"[INFO] WandB Run Name (Target): {new_run_name}")
         
     else:
-        # 默认逻辑
+        # 默认逻辑 (参数搜索通常走这里，或者你可以根据喜好在 select_params.py 里也不传 timestamp)
         log_dir = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         if agent_cfg.run_name:
             log_dir += f"_{agent_cfg.run_name}"
@@ -169,11 +196,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # create runner from rsl-rl
     runner = OnPolicyRunner(env, agent_cfg_dict, log_dir=log_dir, device=agent_cfg.device)
     
-    # [新增关键代码] 强制覆盖 Runner 内部的 run_name
-    # RSL-RL 在初始化时会根据 log_dir 把 run_name 设为 teacher_0000
-    # 我们在这里将其改回带时间戳的长名字，这样 learn() 里的 wandb.init 就会用这个名字
+    # [NEW] 强制覆盖 Runner 内部的 run_name，确保 WandB 记录正确
     if args_cli.log_timestamp:
-        runner.run_name = new_run_name
+        runner.run_name = agent_cfg.run_name
+    elif args_cli.run_name_suffix:
+         # 如果是参数搜索模式，也确保 Runner 使用带有 Search_ 前缀的名字
+        runner.run_name = agent_cfg.run_name
+
     # write git state to logs
     runner.add_git_repo_to_log(__file__)
     # load the checkpoint
@@ -200,8 +229,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
 
 if __name__ == "__main__":
-    # run the main functionl_rl.runners import OnPolicyRunner
-# fro
+    # run the main function
     main()
     # close sim app
     simulation_app.close()

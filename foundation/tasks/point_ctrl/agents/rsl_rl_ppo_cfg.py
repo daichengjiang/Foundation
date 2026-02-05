@@ -14,7 +14,7 @@ from isaaclab.utils import configclass
 @configclass
 class QuadcopterTeacherRunnerCfg(RslRlOnPolicyRunnerCfg):
     num_steps_per_env = 256
-    max_iterations = 5000
+    max_iterations = 800
     save_interval = 200
     experiment_name = "single_teacher"
     empirical_normalization = True
