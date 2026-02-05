@@ -63,6 +63,7 @@ torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.benchmark = False
 
 import optuna
+from isaaclab.utils.math import euler_xyz_from_quat
 from foundation.utils.pid_controller import PaperPhysControllerTensor
 
 def run_parallel_optimization(env, num_generations=10, n_repeats=3):
@@ -159,6 +160,17 @@ def run_parallel_optimization(env, num_generations=10, n_repeats=3):
             if t >= warmup:
                 pos_error = torch.norm(env.unwrapped.pos_des - env.unwrapped._robot.data.root_pos_w, dim=1)
                 total_sq_error += pos_error ** 2
+
+                quat_w = env.unwrapped._robot.data.root_quat_w
+                _, _, yaw_curr = euler_xyz_from_quat(quat_w)
+                
+                # 计算误差并归一化到 [-pi, pi]
+                yaw_error = env.unwrapped.yaw_des - yaw_curr
+                yaw_error = torch.remainder(yaw_error + torch.pi, 2 * torch.pi) - torch.pi
+                
+                # 累计 Yaw 的平方误差
+                # 注意：通常需要给 Yaw 误差一个权重（例如 0.5），因为它的量级和位置(米)不同
+                total_sq_error += (yaw_error ** 2) * 0.5
 
         # --- E. 计算最终得分 (Cost Aggregation) ---
         
@@ -315,7 +327,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # ================= [关键修改] 筛选与 ID 生成逻辑 =================
     
     # [修改 2] 筛选逻辑：如果 RMSE 太大，直接舍弃
-    threshold_rmse = 0.4
+    threshold_rmse = 1
     if best_rmse > threshold_rmse:
         print(f"❌ Result Rejected: RMSE {best_rmse:.4f} > {threshold_rmse}. Not saving.")
         return # 直接退出，不保存
