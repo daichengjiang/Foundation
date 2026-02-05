@@ -41,6 +41,7 @@ import os
 import csv
 
 from foundation.utils.simple_controller import SimpleQuadrotorController
+from foundation.utils.pid_controller import PaperPhysControllerTensor
 
 from enum import IntEnum
 import collections
@@ -66,20 +67,16 @@ def normallize_angle(angle: torch.Tensor):
 
 @configclass
 class QuadcopterDynamicsCfg:
-    # 默认值 (Crazyflie 2.1 参数作为默认，用于单机或默认情况)
+
     mass: float = 0.0282
     arm_length: float = 0.04384
     # Inertia: Ixx, Iyy, Izz
     inertia: tuple[float, float, float] = (2.44864e-5, 2.44864e-5, 3.61504e-5)
     thrust_to_weight: float = 2.25 
     motor_tau_up: float = 0.05
-    motor_tau_down: float = 0.10 # 默认值设大一点体现差异
-    # [新增] 力矩系数
+    motor_tau_down: float = 0.10 
     moment_scale: float = 0.016  
 
-    # [新增] 用于多教师蒸馏的参数列表 (List of dicts)
-    # 格式: [{'mass': 0.03, 'arm_length': 0.04, 'inertia': (x,y,z), 'twr': 2.0, 'motor_tau': 0.05}, {...}]
-    # 如果此列表不为空，将覆盖上面的单值设置，并按环境索引分段分配
     multi_teacher_params: list[dict] | None = None 
 
 
@@ -127,7 +124,7 @@ class QuadcopterSceneCfg(InteractiveSceneCfg):
 @configclass
 class QuadcopterEnvCfg(DirectRLEnvCfg):
 
-    teacher_observation_space = 38
+    teacher_observation_space = 56
 
     student_observation_space = 22
     # 设置 IsaacLab 默认观测空间（通常对应学生策略维度）
@@ -138,10 +135,10 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     prob_null_trajectory = 0.0  # 50% 概率做定点控制
 
     # 轨迹类型选择: "langevin" 或 "figure8"
-    trajectory_type = "langevin"  # Default to Langevin during training
+    trajectory_type = "langevin"
 
-    train_or_play: bool = True  # 默认为 True (训练模式)，命令行可通过 --train_or_play=False 修改
-
+    train_or_play: bool = True 
+    use_pid = False
     # gamma in ppo, only for logging
     gamma = 0.99
 
@@ -219,18 +216,24 @@ class QuadcopterEnv(DirectRLEnv):
         self.start_time = time.time()
         self.render_mode = "human"
         
-        # ================= [新增] 多教师动力学参数分配逻辑 =================
         # 初始化张量
         self.mass_tensor = torch.zeros(self.num_envs, device=self.device)
         self.arm_l_tensor = torch.zeros(self.num_envs, device=self.device)
         self.twr_tensor = torch.zeros(self.num_envs, device=self.device)
         self.inertia_tensor = torch.zeros(self.num_envs, 3, device=self.device)
-        # self.motor_tau = torch.zeros(self.num_envs, 1, device=self.device)
         self.motor_tau_up_tensor = torch.zeros(self.num_envs, 1, device=self.device)
         self.motor_tau_down_tensor = torch.zeros(self.num_envs, 1, device=self.device)
         self.kappa_tensor = torch.zeros(self.num_envs, device=self.device)
 
-        # --- 新增：历史 Buffer ---
+        if self.cfg.use_pid:
+            self.wn_tensor = torch.zeros(self.num_envs, device=self.device)
+            self.zeta_tensor = torch.zeros(self.num_envs, device=self.device)
+            self.tc_ang_rp_tensor = torch.zeros(self.num_envs, device=self.device)
+            self.tc_ang_y_tensor = torch.zeros(self.num_envs, device=self.device)
+            self.tc_rate_rp_tensor = torch.zeros(self.num_envs, device=self.device)
+            self.tc_rate_y_tensor = torch.zeros(self.num_envs, device=self.device)
+            default_pid_params = [2, 0.7, 0.08, 0.4, 0.04, 0.2]
+
         self.history_len = self.cfg.history_len
         self.pos_error_b_history = torch.zeros(self.num_envs, self.history_len, 3, device=self.device)
         self.vel_error_b_history = torch.zeros(self.num_envs, self.history_len, 3, device=self.device)
@@ -267,10 +270,17 @@ class QuadcopterEnv(DirectRLEnv):
                 self.inertia_tensor[indices, 1] = iyy
                 self.inertia_tensor[indices, 2] = izz
                 
-                # self.motor_tau[indices] = params['motor_tau']
                 self.motor_tau_up_tensor[indices] = params['motor_tau_up']
                 self.motor_tau_down_tensor[indices] = params['motor_tau_down']
                 self.kappa_tensor[indices] = params['kappa']
+
+                if self.cfg.use_pid:
+                    self.wn_tensor[indices] = params.get('wn', default_pid_params[0])
+                    self.zeta_tensor[indices] = params.get('zeta', default_pid_params[1])
+                    self.tc_ang_rp_tensor[indices] = params.get('tc_ang_rp', default_pid_params[2])
+                    self.tc_ang_y_tensor[indices] = params.get('tc_ang_y', default_pid_params[3])
+                    self.tc_rate_rp_tensor[indices] = params.get('tc_rate_rp', default_pid_params[4])
+                    self.tc_rate_y_tensor[indices] = params.get('tc_rate_y', default_pid_params[5])
 
                 count = end_idx - start_idx
                 print(f"  > Teacher {t_id} (ID: {params.get('id', 'N/A')}): Envs {start_idx}-{end_idx-1} (Count: {count})")
@@ -291,28 +301,21 @@ class QuadcopterEnv(DirectRLEnv):
             self.arm_l_tensor.fill_(self.cfg.dynamics.arm_length)
             self.inertia_tensor[:] = torch.tensor(self.cfg.dynamics.inertia, device=self.device)
             self.twr_tensor.fill_(self.cfg.dynamics.thrust_to_weight)
-            # self.motor_tau.fill_(self.cfg.dynamics.motor_tau)
-            # [修改] 填充新参数
             self.motor_tau_up_tensor.fill_(self.cfg.dynamics.motor_tau_up)
             self.motor_tau_down_tensor.fill_(self.cfg.dynamics.motor_tau_down)
             self.kappa_tensor.fill_(self.cfg.dynamics.moment_scale)
 
-        # =================================================================
+            if self.cfg.use_pid:
+                self.wn_tensor.fill_(default_pid_params[0])
+                self.zeta_tensor.fill_(default_pid_params[1])
+                self.tc_ang_rp_tensor.fill_(default_pid_params[2])
+                self.tc_ang_y_tensor.fill_(default_pid_params[3])
+                self.tc_rate_rp_tensor.fill_(default_pid_params[4])
+                self.tc_rate_y_tensor.fill_(default_pid_params[5])
+
 
         # Store the robot mass for reference (e.g. wind force calculation if added later)
         self._robot_mass = self.mass_tensor 
-
-        # Controller initialization with tensors
-        self._controller = SimpleQuadrotorController(
-            num_envs=self.num_envs,
-            device=self.device,
-            mass=self.mass_tensor,        # Pass self.var
-            arm_length=self.arm_l_tensor, # Pass self.var
-            inertia=self.inertia_tensor,  # Pass self.var
-            thrust_to_weight=self.twr_tensor,  # Pass self.var
-            moment_scale=self.kappa_tensor
-        )
-
         self.dt = self.cfg.sim.dt
 
         # if self.motor_tau.shape != (self.num_envs, 1):
@@ -327,9 +330,41 @@ class QuadcopterEnv(DirectRLEnv):
         self.motor_alpha_up = self.dt / (self.dt + self.motor_tau_up_tensor)
         self.motor_alpha_down = self.dt / (self.dt + self.motor_tau_down_tensor)
 
-
         self._current_motor_speeds = torch.zeros(self.num_envs, 4, device=self.device)
-        
+
+        if self.cfg.use_pid:
+            self._controller = PaperPhysControllerTensor(
+                num_envs=self.num_envs,
+                device=self.device,
+                mass=self.mass_tensor,
+                arm_length=self.arm_l_tensor,
+                inertia=self.inertia_tensor,
+                thrust_to_weight=self.twr_tensor,
+                kappa=self.kappa_tensor,
+                motor_alpha_up=self.motor_alpha_up,
+                motor_alpha_down=self.motor_alpha_down,
+            )
+
+            self._controller.update_gains(
+                wn=self.wn_tensor,
+                zeta=self.zeta_tensor,
+                tc_ang_rp=self.tc_ang_rp_tensor,
+                tc_ang_y=self.tc_ang_y_tensor,
+                tc_rate_rp=self.tc_rate_rp_tensor,
+                tc_rate_y=self.tc_rate_y_tensor
+            )
+
+        else:
+            self._controller = SimpleQuadrotorController(
+                num_envs=self.num_envs,
+                device=self.device,
+                mass=self.mass_tensor,
+                arm_length=self.arm_l_tensor,
+                inertia=self.inertia_tensor,
+                thrust_to_weight=self.twr_tensor,
+                kappa=self.kappa_tensor,
+            )
+
         self._is_langevin_task = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
         # === 死亡原因标志位 ===
@@ -668,12 +703,6 @@ class QuadcopterEnv(DirectRLEnv):
 
     def _pre_physics_step(self, actions: torch.Tensor):
 
-        # 1. 更新轨迹
-        if self.cfg.trajectory_type == "figure8":
-            self._generate_desired_trajectory_figure8()
-        elif torch.any(self._is_langevin_task):
-            self._generate_desired_trajectory_langevin(env_ids=torch.where(self._is_langevin_task)[0])
-
         # 2. Action Clamp
         raw_actions_clamped = torch.clamp(actions, -1.0, 1.0)
         action_setpoint_normalized = (raw_actions_clamped + 1.0) * 0.5
@@ -707,6 +736,13 @@ class QuadcopterEnv(DirectRLEnv):
         self._robot.set_external_force_and_torque(self._forces, self._torques, body_ids=self._body_id)
 
     def _get_observations(self) -> dict:
+
+        # 更新轨迹
+        if self.cfg.trajectory_type == "figure8":
+            self._generate_desired_trajectory_figure8()
+        elif torch.any(self._is_langevin_task):
+            self._generate_desired_trajectory_langevin(env_ids=torch.where(self._is_langevin_task)[0])
+
         pos_w = self._robot.data.root_pos_w
         quat_w = self._robot.data.root_quat_w
         vel_w = self._robot.data.root_lin_vel_w
@@ -1151,3 +1187,31 @@ class QuadcopterEnv(DirectRLEnv):
     def close(self):
         """Clean up resources when environment is closed."""
         super().close()
+
+    def get_pid_actions(self) -> torch.Tensor:
+        """
+        利用内置的 PID 控制器计算当前状态下的理想动作 (Motor Speeds [0,1])。
+        用于 PID 蒸馏教学。
+        """
+        # 1. 获取状态
+        cur_pos = self._robot.data.root_pos_w
+        cur_vel = self._robot.data.root_lin_vel_w
+        cur_quat = self._robot.data.root_quat_w
+        cur_ang_vel = self._robot.data.root_ang_vel_b
+        
+        # 2. 计算期望转速 (Controller)
+        target_motor_speeds = self._controller.compute_target_speeds(
+            cur_pos, cur_vel, cur_quat, cur_ang_vel,
+            self.pos_des, self.vel_des, self.acc_des, self.yaw_des,
+            self._current_motor_speeds
+        )
+        
+        # 映射到动作空间 [-1, 1]
+        # 环境动作通常是归一化的 [-1, 1]，而 PID 输出是 [0, 1] (Motor Speeds)
+        # 根据 env._pre_physics_step: 
+        # action_setpoint_normalized = (raw_actions_clamped + 1.0) * 0.5
+        # 所以: raw_action = setpoint * 2.0 - 1.0
+        
+        pid_actions = target_motor_speeds * 2.0 - 1.0
+        
+        return torch.clamp(pid_actions, -1.0, 1.0)
