@@ -20,6 +20,7 @@ parser.add_argument(
     "--disable_fabric", action="store_true", default=False, help="Disable fabric and use USD I/O operations."
 )
 parser.add_argument("--output_csv", type=str, default="teacher_dynamics.csv", help="Output CSV filename.")
+parser.add_argument("--use_pid", action="store_true", default=False, help="the flag to indicate use pid controller or not")
 
 # append RSL-RL cli arguments (this includes --checkpoint)
 cli_args.add_rsl_rl_args(parser)
@@ -63,6 +64,7 @@ torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.benchmark = False
 
 import optuna
+from isaaclab.utils.math import euler_xyz_from_quat
 from foundation.utils.pid_controller import PaperPhysControllerTensor
 
 def run_parallel_optimization(env, num_generations=10, n_repeats=3):
@@ -85,8 +87,8 @@ def run_parallel_optimization(env, num_generations=10, n_repeats=3):
     # ================= 1. 定义参数范围 (Min, Max) =================
     # 格式: [wn, zeta, tc_ang_rp, tc_ang_y, tc_rate_rp, tc_rate_y]
     # 针对大质量无人机的宽松范围
-    bounds_min = torch.tensor([1.0, 0.6, 0.05, 0.20, 0.03, 0.10], device=device)
-    bounds_max = torch.tensor([4.5, 0.95, 0.40, 1.00, 0.20, 0.50], device=device)
+    bounds_min = torch.tensor([1.0, 0.65, 0.01, 0.05, 0.01, 0.02], device=device)
+    bounds_max = torch.tensor([10.0, 0.95, 0.20, 0.50, 0.1, 0.25], device=device)
     
     # 参数容器 (Population, 6)
     current_params = torch.rand(population_size, 6, device=device)
@@ -127,9 +129,9 @@ def run_parallel_optimization(env, num_generations=10, n_repeats=3):
         # 注意：在 Population 维度计算即可，不需要广播，这样计算量小
         
         # 约束 1: 1/wn < 2 * tc_ang_rp
-        violation1 = torch.relu((1.0 / wn) - (tc_ang_rp * 2.0))
+        violation1 = torch.relu((tc_ang_rp * 3.0) - (1.0 / wn))
         # 约束 2: tc_ang_rp < 2 * tc_rate_rp
-        violation2 = torch.relu((tc_rate_rp * 2.0) - tc_ang_rp)
+        violation2 = torch.relu((tc_rate_rp * 3.0) - tc_ang_rp)
         # 约束 3: tc_ang_y >= tc_ang_rp
         violation3 = torch.relu(tc_ang_rp - tc_ang_y)
 
@@ -159,6 +161,17 @@ def run_parallel_optimization(env, num_generations=10, n_repeats=3):
             if t >= warmup:
                 pos_error = torch.norm(env.unwrapped.pos_des - env.unwrapped._robot.data.root_pos_w, dim=1)
                 total_sq_error += pos_error ** 2
+
+                quat_w = env.unwrapped._robot.data.root_quat_w
+                _, _, yaw_curr = euler_xyz_from_quat(quat_w)
+                
+                # 计算误差并归一化到 [-pi, pi]
+                yaw_error = env.unwrapped.yaw_des - yaw_curr
+                yaw_error = torch.remainder(yaw_error + torch.pi, 2 * torch.pi) - torch.pi
+                
+                # 累计 Yaw 的平方误差
+                # 注意：通常需要给 Yaw 误差一个权重（例如 0.5），因为它的量级和位置(米)不同
+                total_sq_error += (yaw_error ** 2) * 0.5
 
         # --- E. 计算最终得分 (Cost Aggregation) ---
         
@@ -286,6 +299,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env_cfg.scene.num_envs = args_cli.num_envs
     env_cfg.prob_null_trajectory = 0.0
     env_cfg.train_or_play = True
+    env_cfg.use_pid = args_cli.use_pid
     env_cfg.debug_vis = False 
     env_cfg.seed = args_cli.seed
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device

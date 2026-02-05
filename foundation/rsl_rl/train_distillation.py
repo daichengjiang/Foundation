@@ -29,6 +29,7 @@ parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy 
 
 parser.add_argument("--teacher_dir", type=str, default=None, required=True, help="Path to the teacher experiment directory.")
 parser.add_argument("--teacher_ids", type=str, default="0", help="Comma-separated list of teacher IDs.")
+parser.add_argument("--use_pid", action="store_true", default=False, help="the flag to indicate use pid controller or not")
 
 cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
@@ -75,6 +76,38 @@ torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.benchmark = False
 
+class PIDTeacherWrapper(nn.Module):
+    """
+    将环境内置的 PID 控制器包装成 Policy 的形式。
+    忽略输入的 obs，直接从 env 获取 Ground Truth 计算动作。
+    """
+    def __init__(self, env):
+        super().__init__()
+        self.env = env
+        # 这是一个伪参数，用于通过 PyTorch 的 optimizer 检查（虽然我们不会更新它）
+        self.dummy_param = nn.Parameter(torch.zeros(1))
+
+    def act_inference(self, obs):
+        """
+        模仿 ActorCritic.act_inference 接口
+        """
+        # 这里的 obs 是经过归一化的 teacher_obs，PID 不需要它
+        # PID 需要的是 env 内部的真实状态
+        
+        # 如果 env 被 wrap 过了 (例如 RslRlVecEnvWrapper), 需要解包找到原本的 QuadcopterEnv
+        if hasattr(self.env, "unwrapped"):
+            base_env = self.env.unwrapped
+        else:
+            base_env = self.env
+            
+        # 再次检查，防止多层 wrap
+        while hasattr(base_env, "env"):
+            base_env = base_env.env
+            
+        return base_env.get_pid_actions()
+    
+    def forward(self, obs):
+        return self.act_inference(obs)
 
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg):
@@ -87,12 +120,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     env_cfg.seed = agent_cfg.seed
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
+    env_cfg.use_pid = args_cli.use_pid
 
-    # ==================================================================================
-    # [新增] 多教师配置解析与加载
-    # ==================================================================================
-    print(f"\n{'='*20} [Multi-Teacher Distillation Setup] {'='*20}")
-    
     teacher_ids = []
     if '-' in args_cli.teacher_ids:
         start, end = map(int, args_cli.teacher_ids.split('-'))
@@ -129,33 +158,52 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             raise ValueError(f"Teacher ID {t_id} not found in CSV.")
         row = row.iloc[0]
 
-        params = {
-            "id": int(t_id),
-            "mass": float(row['mass']),
-            "arm_length": float(row['arm_length']),
-            "inertia": (float(row['Ixx']), float(row['Iyy']), float(row['Izz'])),
-            "twr": float(row['twr']) if 'twr' in row else float(row['thrust_to_weight']),
-            "motor_tau_up": float(row['motor_tau_up']) if 'motor_tau_up' in row else 0.05,
-            "motor_tau_down": float(row['motor_tau_down']) if 'motor_tau_down' in row else 0.07,
-            "kappa": float(row['kappa']) if 'kappa' in row else 0.016,
-        }
-        teacher_params_list.append(params)
-        
-        teacher_run_name = f"teacher_{t_id:04d}"
-        folder_path = os.path.join(args_cli.teacher_dir, teacher_run_name)
-        
-        model_path = os.path.join(folder_path, "best_model.pt")
-        if not os.path.exists(model_path):
-            search_pattern = os.path.join(folder_path, "model_*.pt")
-            models = glob.glob(search_pattern)
-            if not models:
-                raise FileNotFoundError(f"No model found for teacher {t_id} in {folder_path}")
-            model_path = max(models, key=os.path.getctime)
+        if args_cli.use_pid:
+            params = {
+                "id": int(t_id),
+                "mass": float(row['mass']),
+                "arm_length": float(row['arm_length']),
+                "inertia": (float(row['Ixx']), float(row['Iyy']), float(row['Izz'])),
+                "twr": float(row['twr']) if 'twr' in row else float(row['thrust_to_weight']),
+                "motor_tau_up": float(row['motor_tau_up']) if 'motor_tau_up' in row else 0.001,
+                "motor_tau_down": float(row['motor_tau_down']) if 'motor_tau_down' in row else 0.001,
+                "kappa": float(row['kappa']) if 'kappa' in row else 0.016,
+                "wn": float(row['wn']) if 'wn' in row else 2,
+                "zeta": float(row['zeta']) if 'zeta' in row else 0.7,
+                "tc_ang_rp": float(row['tc_ang_rp']) if 'tc_ang_rp' in row else 0.08,
+                "tc_ang_y": float(row['tc_ang_y']) if 'tc_ang_y' in row else 0.4,
+                "tc_rate_rp": float(row['tc_rate_rp']) if 'tc_rate_rp' in row else 0.04,
+                "tc_rate_y": float(row['tc_rate_y']) if 'tc_rate_y' in row else 0.2,
+            }
+            teacher_params_list.append(params)
+        else:
+            params = {
+                "id": int(t_id),
+                "mass": float(row['mass']),
+                "arm_length": float(row['arm_length']),
+                "inertia": (float(row['Ixx']), float(row['Iyy']), float(row['Izz'])),
+                "twr": float(row['twr']) if 'twr' in row else float(row['thrust_to_weight']),
+                "motor_tau_up": float(row['motor_tau_up']) if 'motor_tau_up' in row else 0.05,
+                "motor_tau_down": float(row['motor_tau_down']) if 'motor_tau_down' in row else 0.07,
+                "kappa": float(row['kappa']) if 'kappa' in row else 0.016,
+            }
+            teacher_params_list.append(params)
             
-        print(f"  > [T-{t_id}] Dynamics: Mass={params['mass']:.3f} | Model: {os.path.basename(model_path)}")
-        
-        ckpt = torch.load(model_path, map_location='cpu', weights_only=False)
-        loaded_teachers_state_dicts.append(ckpt)
+            teacher_run_name = f"teacher_{t_id:04d}"
+            folder_path = os.path.join(args_cli.teacher_dir, teacher_run_name)
+            
+            model_path = os.path.join(folder_path, "best_model.pt")
+            if not os.path.exists(model_path):
+                search_pattern = os.path.join(folder_path, "model_*.pt")
+                models = glob.glob(search_pattern)
+                if not models:
+                    raise FileNotFoundError(f"No model found for teacher {t_id} in {folder_path}")
+                model_path = max(models, key=os.path.getctime)
+                
+            print(f"  > [T-{t_id}] Dynamics: Mass={params['mass']:.3f} | Model: {os.path.basename(model_path)}")
+            
+            ckpt = torch.load(model_path, map_location='cpu', weights_only=False)
+            loaded_teachers_state_dicts.append(ckpt)
 
     try:
         env_cfg.dynamics.multi_teacher_params = teacher_params_list
@@ -164,7 +212,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         raise
 
     print(f"{'='*60}\n")
-    # ==================================================================================
 
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
     log_root_path = os.path.abspath(log_root_path)
@@ -201,48 +248,64 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
     runner.add_git_repo_to_log(__file__)
-    
-    # ==================================================================================
-    # [核心] 构建 MultiTeacherPolicy 并替换 Runner 中的策略
-    # ==================================================================================
+
     print("\n[Distillation] Constructing Multi-Teacher Policy...")
     
-    obs, _ = env.get_observations() 
+    obs, extras = env.get_observations() 
     real_student_obs_dim = obs.shape[1] 
     
-    first_ckpt = loaded_teachers_state_dicts[0]
-    teacher_input_weight = None
-    for key in ['actor.0.weight', 'actor.layers.0.weight', 'actor.actor_mlp.0.weight']:
-        if key in first_ckpt['model_state_dict']:
-            teacher_input_weight = first_ckpt['model_state_dict'][key]
-            break
-            
-    if teacher_input_weight is None:
-        raise ValueError("Could not infer Teacher input dimension from checkpoint.")
-    
-    real_teacher_obs_dim = teacher_input_weight.shape[1]
-    
-    teacher_modules = []
-    teacher_norm_dicts = []
-    for i, ckpt in enumerate(loaded_teachers_state_dicts):
-        teacher_p = ActorCritic(
-            num_actor_obs=real_teacher_obs_dim,
-            num_critic_obs=real_teacher_obs_dim,
-            num_actions=env.num_actions,
-            actor_hidden_dims=agent_cfg.policy.teacher_hidden_dims,
-            critic_hidden_dims=agent_cfg.policy.teacher_hidden_dims, 
-            activation="elu", 
-            init_noise_std=1.0,  # Note: 推理时使用 act_inference()，不使用此参数；将被 checkpoint 覆盖
-        ).to(agent_cfg.device)
-        
-        teacher_p.load_state_dict(ckpt['model_state_dict'])
-        teacher_p.eval() 
-        teacher_modules.append(teacher_p)
+    if args_cli.use_pid:
 
-        if 'obs_norm_state_dict' in ckpt:
-            teacher_norm_dicts.append(ckpt['obs_norm_state_dict'])
+        pid_wrapper = PIDTeacherWrapper(env).to(agent_cfg.device)
+        teacher_modules = [pid_wrapper]
+        teacher_norm_dicts = [None]
+        
+        # 动态检测 Teacher 维度
+        if "teacher" in extras["observations"]:
+            real_teacher_obs_dim = extras["observations"]["teacher"].shape[1]
+            print(f"[INFO] Auto-detected Teacher Obs Dim from env: {real_teacher_obs_dim}")
+        elif hasattr(env.unwrapped, "cfg") and hasattr(env.unwrapped.cfg, "teacher_observation_space"):
+            real_teacher_obs_dim = env.unwrapped.cfg.teacher_observation_space
+            print(f"[WARNING] 'teacher' obs not found in extras. Using config value: {real_teacher_obs_dim}")
         else:
-            teacher_norm_dicts.append(None) 
+            # Fallback
+            print("[WARNING] Could not find teacher dim. Using default 38 (May crash!).")
+            real_teacher_obs_dim = 38
+    else:
+
+        first_ckpt = loaded_teachers_state_dicts[0]
+        teacher_input_weight = None
+        for key in ['actor.0.weight', 'actor.layers.0.weight', 'actor.actor_mlp.0.weight']:
+            if key in first_ckpt['model_state_dict']:
+                teacher_input_weight = first_ckpt['model_state_dict'][key]
+                break
+                
+        if teacher_input_weight is None:
+            raise ValueError("Could not infer Teacher input dimension from checkpoint.")
+        
+        real_teacher_obs_dim = teacher_input_weight.shape[1]
+        
+        teacher_modules = []
+        teacher_norm_dicts = []
+        for i, ckpt in enumerate(loaded_teachers_state_dicts):
+            teacher_p = ActorCritic(
+                num_actor_obs=real_teacher_obs_dim,
+                num_critic_obs=real_teacher_obs_dim,
+                num_actions=env.num_actions,
+                actor_hidden_dims=agent_cfg.policy.teacher_hidden_dims,
+                critic_hidden_dims=agent_cfg.policy.teacher_hidden_dims, 
+                activation="elu", 
+                init_noise_std=1.0,  # Note: 推理时使用 act_inference()，不使用此参数；将被 checkpoint 覆盖
+            ).to(agent_cfg.device)
+            
+            teacher_p.load_state_dict(ckpt['model_state_dict'])
+            teacher_p.eval() 
+            teacher_modules.append(teacher_p)
+
+            if 'obs_norm_state_dict' in ckpt:
+                teacher_norm_dicts.append(ckpt['obs_norm_state_dict'])
+            else:
+                teacher_norm_dicts.append(None) 
 
     multi_policy = MultiTeacherPolicy(
         num_student_obs=real_student_obs_dim,
@@ -280,7 +343,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         print("[INFO] Disabling global privileged_obs_normalizer in Runner.")
         print("       (Normalization is now handled internally by MultiTeacherPolicy per teacher)")
         runner.privileged_obs_normalizer = torch.nn.Identity().to(agent_cfg.device)
-    # ==================================================================================
 
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
     dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)

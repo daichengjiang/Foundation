@@ -120,6 +120,7 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     prob_null_trajectory = 0.0
     trajectory_type = "langevin"
     train_or_play: bool = True
+    use_pid = False
     gamma = 0.99
     episode_length_s = 96
     decimation = 1
@@ -250,11 +251,8 @@ class QuadcopterEnv(DirectRLEnv):
         
         # Store for reference
         self._robot_mass = self.mass_tensor 
-
         self.dt = self.cfg.sim.dt
-        # if self.motor_tau.shape != (self.num_envs, 1):
-        #      self.motor_tau = self.motor_tau.view(self.num_envs, 1)
-        # self.motor_alpha = self.dt / (self.dt + self.motor_tau)
+        
         if self.motor_tau_up_tensor.shape != (self.num_envs, 1):
              self.motor_tau_up_tensor = self.motor_tau_up_tensor.view(self.num_envs, 1)
         if self.motor_tau_down_tensor.shape != (self.num_envs, 1):
@@ -265,29 +263,28 @@ class QuadcopterEnv(DirectRLEnv):
 
         self._current_motor_speeds = torch.zeros(self.num_envs, 4, device=self.device)
 
-        # 初始化控制器 (传入异构张量)
-        
-        self._controller = SimpleQuadrotorController(
-            num_envs=self.num_envs,
-            device=self.device,
-            mass=self.mass_tensor,
-            arm_length=self.arm_l_tensor,
-            inertia=self.inertia_tensor,
-            thrust_to_weight=self.twr_tensor,
-            kappa=self.kappa_tensor,
-        )
-
-        # self._controller = PaperPhysControllerTensor(
-        #     num_envs=self.num_envs,
-        #     device=self.device,
-        #     mass=self.mass_tensor,
-        #     arm_length=self.arm_l_tensor,
-        #     inertia=self.inertia_tensor,
-        #     thrust_to_weight=self.twr_tensor,
-        #     kappa=self.kappa_tensor,
-        #     motor_alpha_up=self.motor_alpha_up,
-        #     motor_alpha_down=self.motor_alpha_down,
-        # )
+        if self.cfg.use_pid:
+            self._controller = PaperPhysControllerTensor(
+                num_envs=self.num_envs,
+                device=self.device,
+                mass=self.mass_tensor,
+                arm_length=self.arm_l_tensor,
+                inertia=self.inertia_tensor,
+                thrust_to_weight=self.twr_tensor,
+                kappa=self.kappa_tensor,
+                motor_alpha_up=self.motor_alpha_up,
+                motor_alpha_down=self.motor_alpha_down,
+            )
+        else:
+            self._controller = SimpleQuadrotorController(
+                num_envs=self.num_envs,
+                device=self.device,
+                mass=self.mass_tensor,
+                arm_length=self.arm_l_tensor,
+                inertia=self.inertia_tensor,
+                thrust_to_weight=self.twr_tensor,
+                kappa=self.kappa_tensor,
+            )
 
         # 状态标志位
         self._is_langevin_task = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
@@ -661,59 +658,37 @@ class QuadcopterEnv(DirectRLEnv):
         self._map_generation_timer = 0
 
     def _pre_physics_step(self, actions: torch.Tensor):
+        
+        if self.cfg.use_pid:
+            # 1. 获取状态
+            cur_pos = self._robot.data.root_pos_w
+            cur_vel = self._robot.data.root_lin_vel_w
+            cur_quat = self._robot.data.root_quat_w
+            cur_ang_vel = self._robot.data.root_ang_vel_b
+            
+            # 2. 计算期望转速 (Controller)
+            action_norm = self._controller.compute_target_speeds(
+                cur_pos, cur_vel, cur_quat, cur_ang_vel,
+                self.pos_des, self.vel_des, self.acc_des, self.yaw_des,
+                self._current_motor_speeds
+            )
+        else:
+            raw_clamped = torch.clamp(actions, -1.0, 1.0)
+            action_norm = (raw_clamped + 1.0) * 0.5
+            self._actions = raw_clamped.clone()
 
-        raw_clamped = torch.clamp(actions, -1.0, 1.0)
-        action_norm = (raw_clamped + 1.0) * 0.5
-        self._actions = raw_clamped.clone()
-
-        # 判断是加速还是减速
-        # 如果 target > current, 使用 alpha_up
-        # 如果 target < current, 使用 alpha_down
+        # 3. 模拟电机响应
         target = action_norm
         current = self._current_motor_speeds
-        
-        # 构造混合 alpha
-        # 这里使用了 torch.where: condition ? alpha_up : alpha_down
         alpha = torch.where(target > current, self.motor_alpha_up, self.motor_alpha_down)
-        
-        # 一阶低通滤波
         self._current_motor_speeds = alpha * target + (1.0 - alpha) * current
 
-        # 计算力与力矩
-        force_b, torque_b = self._controller.motor_speeds_to_wrench(self._current_motor_speeds)    
+        force_b, torque_b = self._controller.motor_speeds_to_wrench(self._current_motor_speeds)
+        
         self._forces.zero_()
         self._torques.zero_()
         self._forces[:, 0, :] = force_b
         self._torques[:, 0, :] = torque_b
-
-
-    # def _pre_physics_step(self, actions: torch.Tensor):
-        
-    #     # 1. 获取状态
-    #     cur_pos = self._robot.data.root_pos_w
-    #     cur_vel = self._robot.data.root_lin_vel_w
-    #     cur_quat = self._robot.data.root_quat_w
-    #     cur_ang_vel = self._robot.data.root_ang_vel_b
-        
-    #     # 2. 计算期望转速 (Controller)
-    #     motor_speeds_cmd = self._controller.compute_target_speeds(
-    #         cur_pos, cur_vel, cur_quat, cur_ang_vel,
-    #         self.pos_des, self.vel_des, self.acc_des, self.yaw_des
-    #         self._current_motor_speeds
-    #     )
-
-    #     # 3. 模拟电机响应
-    #     target = motor_speeds_cmd
-    #     current = self._current_motor_speeds
-    #     alpha = torch.where(target > current, self.motor_alpha_up, self.motor_alpha_down)
-    #     self._current_motor_speeds = alpha * target + (1.0 - alpha) * current
-
-    #     force_b, torque_b = self._controller.motor_speeds_to_wrench(self._current_motor_speeds)
-        
-    #     self._forces.zero_()
-    #     self._torques.zero_()
-    #     self._forces[:, 0, :] = force_b
-    #     self._torques[:, 0, :] = torque_b
 
     def _apply_action(self):
         self._robot.set_external_force_and_torque(self._forces, self._torques, body_ids=self._body_id)

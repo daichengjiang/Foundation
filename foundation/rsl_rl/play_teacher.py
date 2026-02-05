@@ -30,6 +30,7 @@ parser.add_argument(
     "--disable_fabric", action="store_true", default=False, help="Disable fabric and use USD I/O operations."
 )
 parser.add_argument("--realtime", action="store_true", default=False, help="Run in real-time, if possible.")
+parser.add_argument("--use_pid", action="store_true", default=False, help="the flag to indicate use pid controller or not")
 # append RSL-RL cli arguments (this includes --checkpoint)
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -105,74 +106,18 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env_cfg.seed = args_cli.seed
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
     env_cfg.sim.use_fabric = not args_cli.disable_fabric if args_cli.disable_fabric is not None else env_cfg.sim.use_fabric
+    env_cfg.use_pid = args_cli.use_pid
 
-    # #38
-    # env_cfg.dynamics.mass = 0.10481928562837814
-    # env_cfg.dynamics.arm_length = 0.06638733128139446
-    # env_cfg.dynamics.inertia = (0.0003116944234071324,0.0003116944234071324,0.0005710241836818665)
-    # env_cfg.dynamics.thrust_to_weight = 3.3747481735510236
-    # env_cfg.dynamics.motor_tau_up = 0.07580553016348295
-    # env_cfg.dynamics.motor_tau_down = 0.06260816371910138
-    # env_cfg.dynamics.moment_scale = 0.029114762254111186
+    # Example dynamics (Teacher usually works on specific dynamics)
+    dynamics_dict = [0.09777998465800675,0.07081547934541962,0.00037916553112477935,0.00037916553112477935,0.0006946312530205958,2.91200001513932,0.04353632598181455,0.20681289322588903,0.006225218573472514]
+    env_cfg.dynamics.mass = dynamics_dict[0]
+    env_cfg.dynamics.arm_length = dynamics_dict[1]
+    env_cfg.dynamics.inertia = (dynamics_dict[2], dynamics_dict[3], dynamics_dict[4])
+    env_cfg.dynamics.thrust_to_weight = dynamics_dict[5]
+    env_cfg.dynamics.motor_tau_up = dynamics_dict[6]
+    env_cfg.dynamics.motor_tau_down = dynamics_dict[7]
+    env_cfg.dynamics.moment_scale = dynamics_dict[8]
 
-    # #45
-    # env_cfg.dynamics.mass = 0.10667879070394651
-    # env_cfg.dynamics.arm_length = 0.06275213191421349
-    # env_cfg.dynamics.inertia = (0.0005043252020762681,0.0005043252020762681,0.0009239237702037232)
-    # env_cfg.dynamics.thrust_to_weight = 3.663525773296906
-    # env_cfg.dynamics.motor_tau_up = 0.04962523021404839
-    # env_cfg.dynamics.motor_tau_down = 0.05780714703383573
-    # env_cfg.dynamics.moment_scale = 0.03801975614353795
-
-    # #48
-    # env_cfg.dynamics.mass = 0.19379698404409604
-    # env_cfg.dynamics.arm_length = 0.08600256197519564
-    # env_cfg.dynamics.inertia = (0.0009557337894321202,0.0009557337894321202,0.0017509043022396443)
-    # env_cfg.dynamics.thrust_to_weight = 2.2940332948761846
-    # env_cfg.dynamics.motor_tau_up = 0.08731096402801336
-    # env_cfg.dynamics.motor_tau_down = 0.17994658484697898
-    # env_cfg.dynamics.moment_scale = 0.018203602917120764
-
-    # #51
-    # env_cfg.dynamics.mass = 1.609227138424464
-    # env_cfg.dynamics.arm_length = 0.1993012121308172
-    # env_cfg.dynamics.inertia = (0.00954720225941577,0.00954720225941577,0.01749047453924969)
-    # env_cfg.dynamics.thrust_to_weight = 1.8324065494629935
-    # env_cfg.dynamics.motor_tau_up = 0.0650783063743488
-    # env_cfg.dynamics.motor_tau_down = 0.1764833852951275
-    # env_cfg.dynamics.moment_scale = 0.027613859343962963
-
-    # #52
-    # env_cfg.dynamics.mass = 0.3256278994379038
-    # env_cfg.dynamics.arm_length = 0.09936175479103562
-    # env_cfg.dynamics.inertia = (0.013973807523222226,0.013973807523222226,0.02560001538254312)
-    # env_cfg.dynamics.thrust_to_weight = 4.856311162052575
-    # env_cfg.dynamics.motor_tau_up = 0.06466019905714934
-    # env_cfg.dynamics.motor_tau_down = 0.1991020307540624
-    # env_cfg.dynamics.moment_scale = 0.0481624606230106
-
-    # #22
-    # env_cfg.dynamics.mass = 1.5417999156542592
-    # env_cfg.dynamics.arm_length = 0.15739782775950703
-    # env_cfg.dynamics.inertia = (0.02801919067000304,0.02801919067000304,0.05133115730744557)
-    # env_cfg.dynamics.thrust_to_weight = 2.50691164920116
-    # env_cfg.dynamics.motor_tau_up = 0.08924475074182275
-    # env_cfg.dynamics.motor_tau_down = 0.0986217760865855
-    # env_cfg.dynamics.moment_scale = 0.04602730277040338
-
-    #26
-    env_cfg.dynamics.mass = 1.3301380725412735
-    env_cfg.dynamics.arm_length = 0.1554153949322734
-    env_cfg.dynamics.inertia = (0.02051945563367653,0.02051945563367653,0.03759164272089541)
-    env_cfg.dynamics.thrust_to_weight = 3.435745781660817
-    env_cfg.dynamics.motor_tau_up = 0.08556498615430419
-    env_cfg.dynamics.motor_tau_down = 0.09978410686486691
-    env_cfg.dynamics.moment_scale = 0.04724647584323626
-
-    # get checkpoint path
-    checkpoint_path = retrieve_file_path(args_cli.checkpoint)
-    print(f"[INFO]: Loading best model checkpoint from: {checkpoint_path}")
-    
     # specify directory for logging this play session
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
     log_root_path = os.path.abspath(log_root_path)
@@ -201,12 +146,23 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env = RslRlVecEnvWrapper(env)
     runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
     
-    print(f"[INFO]: Loading model checkpoint from: {checkpoint_path}")
-    runner.load(checkpoint_path, load_optimizer=False)
-    
-    runner.eval_mode()
-    policy = runner.get_inference_policy(device=agent_cfg.device)
-    policy_model = runner.alg.policy
+    if not args_cli.use_pid:
+        if not args_cli.checkpoint:
+            raise ValueError("Argument '--checkpoint' is required when NOT using PID controller.")
+            
+        checkpoint_path = retrieve_file_path(args_cli.checkpoint)
+        print(f"[INFO]: Loading model checkpoint from: {checkpoint_path}")
+        runner.load(checkpoint_path, load_optimizer=False)
+        
+        runner.eval_mode()
+        policy = runner.get_inference_policy(device=agent_cfg.device)
+        policy_model = runner.alg.policy
+    else:
+        print(f"[INFO]: Using PID Controller. SKIPPING model loading.")
+        # 创建一个“哑巴”策略，输入 obs，输出全 0 动作
+        policy = lambda obs: torch.zeros(env.num_envs, 4, device=env.device)
+        policy_model = None
+
     dt = env.unwrapped.step_dt
     obs, _ = env.get_observations()
     
@@ -362,7 +318,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     with open(stats_file, 'w') as f:
         f.write(f"RAPTOR Paper Metrics Evaluation\n")
         f.write(f"{'=' * 80}\n")
-        f.write(f"Checkpoint: {checkpoint_path}\n")
         f.write(f"Task: {args_cli.task}\n")
         f.write(f"Stats Start Step: {STATS_START_STEP}\n")
         f.write(f"Total Steps: {timestep}\n")

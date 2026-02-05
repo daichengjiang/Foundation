@@ -31,30 +31,30 @@ class PaperPhysControllerTensor:
         
         # 质量 < 200g (0.2kg) -> wn = 6.0
         # 质量 >= 200g (0.2kg) -> wn = 2.0
-        threshold_mass = 0.2 # 200g
-        wn_light = 6.0
-        wn_heavy = 2.0
+        # threshold_mass = 0.2 # 200g
+        # wn_light = 6.0
+        # wn_heavy = 2.0
 
-        # --- 2. 控制器增益 (来自 positioncontroller.py / attitudecontroller.py) ---
-        self.wn = torch.where(
-                self.mass < threshold_mass,
-                torch.tensor(wn_light, device=device),
-                torch.tensor(wn_heavy, device=device)
-        )
+        # # --- 2. 控制器增益 (来自 positioncontroller.py / attitudecontroller.py) ---
+        # self.wn = torch.where(
+        #         self.mass < threshold_mass,
+        #         torch.tensor(wn_light, device=device),
+        #         torch.tensor(wn_heavy, device=device)
+        # )
         
-        self.zeta = torch.full((num_envs,), 0.7, device=device)
-        self.tc_ang_rp = torch.full((num_envs,), 0.08, device=device)
-        self.tc_ang_y = torch.full((num_envs,), 0.40, device=device)
-        self.tc_rate_rp = torch.full((num_envs,), 0.04, device=device)
-        self.tc_rate_y = torch.full((num_envs,), 0.20, device=device)
+        # self.zeta = torch.full((num_envs,), 0.7, device=device)
+        # self.tc_ang_rp = torch.full((num_envs,), 0.08, device=device)
+        # self.tc_ang_y = torch.full((num_envs,), 0.40, device=device)
+        # self.tc_rate_rp = torch.full((num_envs,), 0.04, device=device)
+        # self.tc_rate_y = torch.full((num_envs,), 0.20, device=device)
 
-        # param_list = [3.0309736728668213,0.6789804697036743,0.1660696119070053,0.3423488438129425,0.06988178938627243,0.16802886128425598]  # Default gains
-        # self.wn = torch.full((num_envs,), param_list[0], device=device)
-        # self.zeta = torch.full((num_envs,), param_list[1], device=device)
-        # self.tc_ang_rp = torch.full((num_envs,), param_list[2], device=device)
-        # self.tc_ang_y = torch.full((num_envs,), param_list[3], device=device)
-        # self.tc_rate_rp = torch.full((num_envs,), param_list[4], device=device)
-        # self.tc_rate_y = torch.full((num_envs,), param_list[5], device=device)
+        param_list = [2.483903169631958,0.7526758909225464,0.20132757723331451,0.3580484390258789,0.03857744485139847,0.1552553027868271]  # Default gains
+        self.wn = torch.full((num_envs,), param_list[0], device=device)
+        self.zeta = torch.full((num_envs,), param_list[1], device=device)
+        self.tc_ang_rp = torch.full((num_envs,), param_list[2], device=device)
+        self.tc_ang_y = torch.full((num_envs,), param_list[3], device=device)
+        self.tc_rate_rp = torch.full((num_envs,), param_list[4], device=device)
+        self.tc_rate_y = torch.full((num_envs,), param_list[5], device=device)
 
         # --- 3. 构建混控矩阵 (源自 mixer.py) ---
         # 原 mixer.py 代码:
@@ -84,72 +84,64 @@ class PaperPhysControllerTensor:
         self.tc_rate_rp = tc_rate_rp.to(self.device)
         self.tc_rate_y = tc_rate_y.to(self.device)
 
+    def _matrix_to_quat(self, res_R):
+        """
+        针对 PyTorch 向量化实现的矩阵转四元数 (Shepperd's Algorithm 简化版)
+        """
+        m00, m11, m22 = res_R[:, 0, 0], res_R[:, 1, 1], res_R[:, 2, 2]
+        trace = m00 + m11 + m22
+
+        # 简单的实现，如果 trace > 0 比较安全
+        # 在高性能控制器中，通常会根据 trace 分支处理，这里提供一个基础版本
+        w = torch.sqrt(torch.clamp(1.0 + trace, min=1e-6)) / 2.0
+        x = (res_R[:, 2, 1] - res_R[:, 1, 2]) / (4.0 * w + 1e-6)
+        y = (res_R[:, 0, 2] - res_R[:, 2, 0]) / (4.0 * w + 1e-6)
+        z = (res_R[:, 1, 0] - res_R[:, 0, 1]) / (4.0 * w + 1e-6)
+        
+        q = torch.stack([w, x, y, z], dim=-1)
+        return q / torch.norm(q, dim=1, keepdim=True)
+    
     def compute_target_speeds(self, cur_pos, cur_vel, cur_quat, cur_ang_vel, des_pos, des_vel, des_acc_ff, des_yaw, cur_motor_speed):
-        """
-        流程：PositionController -> AttitudeController -> Mixer -> Speed
-        对应文件：positioncontroller.py, attitudecontroller.py, mixer.py
-        """
         # ============================================
-        # 1. Position Controller (positioncontroller.py)
+        # 1. Position Controller (位置环计算加速度指令)
         # ============================================
-        # get_acceleration_command
-        kp = self.wn**2
-        kd = 2 * self.wn * self.zeta
-
-        kp_vec = kp.unsqueeze(-1)
-        kd_vec = kd.unsqueeze(-1)
-
-        # cmd_acc = Kp*e + Kd*e_dot + acc_ff
+        kp_vec = (self.wn**2).unsqueeze(-1)
+        kd_vec = (2 * self.wn * self.zeta).unsqueeze(-1)
         acc_cmd = (des_pos - cur_pos) * kp_vec + (des_vel - cur_vel) * kd_vec + des_acc_ff
         
         # ============================================
-        # 2. Attitude Controller (attitudecontroller.py)
+        # 2. Attitude Controller (改进方案 A: 矩阵构造法)
         # ============================================
-        # 2.1 加上重力得到期望推力向量
+        # 2.1 计算推力矢量和模长 (thrust_norm 这里被提取出来)
         g = torch.zeros_like(acc_cmd); g[:, 2] = self.gravity
         thrust_vec = acc_cmd + g
         
-        # 2.2 计算期望姿态 (结合 Yaw 跟踪)
-        thrust_norm = torch.norm(thrust_vec, dim=1, keepdim=True)
-        des_thrust_dir = thrust_vec / (thrust_norm + 1e-6)
+        # 【关键修正】：这里保存 thrust_norm 供后续 Mixer 使用
+        thrust_norm = torch.norm(thrust_vec, dim=1, keepdim=True) 
+        z_body = thrust_vec / (thrust_norm + 1e-6)
         
-        e3 = torch.zeros_like(des_thrust_dir); e3[:, 2] = 1.0
-        
-        # --- 计算倾斜四元数 (Tilt Quaternion) ---
-        rot_ax = torch.cross(e3, des_thrust_dir, dim=1)
-        dot = torch.sum(e3 * des_thrust_dir, dim=1, keepdim=True)
-        angle = torch.acos(torch.clamp(dot, -1.0, 1.0))
-        
-        ax_norm = torch.norm(rot_ax, dim=1, keepdim=True)
-        mask = (ax_norm > 1e-6).squeeze()
-        
-        q_tilt = torch.zeros((self.num_envs, 4), device=self.device)
-        q_tilt[:, 0] = 1.0 # Identity
-        
-        if mask.any():
-            theta = angle[mask] / 2.0
-            w = torch.cos(theta)
-            xyz = (rot_ax[mask] / ax_norm[mask]) * torch.sin(theta)
-            q_tilt[mask] = torch.cat([w, xyz], dim=-1)
-
-        # --- 计算偏航四元数 (Yaw Quaternion) ---
-        # 构造绕 [0, 0, 1] 轴旋转 des_yaw 的四元数
-        yaw_half = des_yaw / 2.0
-        q_yaw = torch.stack([
-            torch.cos(yaw_half),
-            torch.zeros_like(yaw_half),
-            torch.zeros_like(yaw_half),
-            torch.sin(yaw_half)
+        # 2.2 根据 des_yaw 确定参考 X 轴 (世界系水平面)
+        x_world_ref = torch.stack([
+            torch.cos(des_yaw),
+            torch.sin(des_yaw),
+            torch.zeros_like(des_yaw)
         ], dim=-1)
-
-        # --- 组合最终期望姿态 ---
-        # des_att = q_yaw * q_tilt (先应用倾斜，再应用世界坐标系的偏航)
-        des_att = quat_mul(q_yaw, q_tilt)
-            
-        # 2.3 计算角速度误差 (Step 1.2)
-        # desRotVec = (desAtt * curAtt.inv()).to_rotation_vector()
+        
+        # 2.3 叉乘构建机体坐标系 [x_body, y_body, z_body]
+        # y 轴垂直于推力方向和期望偏航方向
+        y_body = torch.cross(z_body, x_world_ref, dim=1)
+        y_body = y_body / (torch.norm(y_body, dim=1, keepdim=True) + 1e-6)
+        
+        # x 轴重新正交化，确保 Z 轴优先级最高
+        x_body = torch.cross(y_body, z_body, dim=1)
+        
+        # 2.4 构建旋转矩阵并转为四元数
+        # res_R shape: [N, 3, 3]
+        res_R = torch.stack([x_body, y_body, z_body], dim=-1)
+        des_att = self._matrix_to_quat(res_R) # 见下方辅助函数
+                
+        # 2.5 计算角速度误差 (Rate Loop)
         q_err = quat_mul(des_att, quat_inv(cur_quat))
-        # Small angle approximation for rotation vector: 2 * v * sign(w)
         q_v = q_err[:, 1:]; q_w = q_err[:, 0:1]
         rot_vec_err = 2.0 * torch.sign(q_w) * q_v 
         
@@ -158,45 +150,32 @@ class PaperPhysControllerTensor:
         des_ang_vel[:, 1] = rot_vec_err[:, 1] / self.tc_ang_rp
         des_ang_vel[:, 2] = rot_vec_err[:, 2] / self.tc_ang_y
         
-        # 2.4 计算角加速度 (Step 2.1)
-        des_ang_acc = des_ang_vel - cur_ang_vel
+        des_ang_acc = (des_ang_vel - cur_ang_vel)
         des_ang_acc[:, 0] /= self.tc_rate_rp
         des_ang_acc[:, 1] /= self.tc_rate_rp
         des_ang_acc[:, 2] /= self.tc_rate_y
-        
+
         # ============================================
-        # 3. Mixer (mixer.py)
+        # 3. Mixer (动力分配)
         # ============================================
-        # get_motor_force_cmd
-        # F_tot = mass * thrust_norm
-        f_total = self.mass * thrust_norm.squeeze()
-        # f_total_vec = torch.zeros((self.num_envs, 3), device=self.device)
-        # f_total_vec[:, 2] = f_total
-        # Moments = Inertia * AngAcc
+        # 使用刚才保存的 thrust_norm 计算总力
+        f_total = self.mass * thrust_norm.squeeze() 
         moments = self.inertia * des_ang_acc
         
-        # [F_tot, Mx, My, Mz]
         u = torch.cat([f_total.unsqueeze(1), moments], dim=1)
-        
-        # motor_forces = Inv(M) * u
         motor_forces = torch.bmm(self.mat_inv, u.unsqueeze(-1)).squeeze(-1)
         motor_forces = torch.clamp(motor_forces, min=0.0)
         
         # ============================================
-        # 4. Command Conversion (motor.py)
+        # 4. Motor Command (映射到 0.0 - 1.0)
         # ============================================
-        # line 46: speedCommand = sqrt(cmd / speedSqrToThrust)
-
         max_thrust_motor = self.thrust_to_weight * self.mass * self.gravity / 4.0
         target = torch.sqrt(motor_forces / (max_thrust_motor.unsqueeze(-1)))
         target = torch.clamp(target, 0.0, 1.0)
         
         alpha = torch.where(target > cur_motor_speed, self.motor_alpha_up, self.motor_alpha_down)
         motor_speeds_cmd = cur_motor_speed + (target - cur_motor_speed) / alpha
-        motor_speeds_cmd = torch.clamp(motor_speeds_cmd, 0.0, 1.0)
-
-        # return f_total_vec, moments
-        return motor_speeds_cmd
+        return torch.clamp(motor_speeds_cmd, 0.0, 1.0)
 
 
     def motor_speeds_to_wrench(self, motor_actions: torch.Tensor) -> tuple:
