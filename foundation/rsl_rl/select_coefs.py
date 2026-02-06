@@ -19,10 +19,10 @@ BASELINE_COEFS = {
 
 # 2. 测试范围
 TEST_RANGES = {
-    "reward_coef_position_cost": [0.5, 0.8, 1.0, 1.5, 2.0],
-    "reward_coef_d_action_cost": [0.1, 0.3, 0.5, 0.8, 1.2],
+    # "reward_coef_position_cost": [0.5, 0.8, 1.0, 1.5, 2.0],
+    # "reward_coef_d_action_cost": [0.1, 0.3, 0.5, 0.8, 1.2],
     "reward_coef_orientation_cost": [0.05, 0.1, 0.2, 0.4],
-    # "reward_constant": [1.0, 1.5, 2.0]
+    "reward_constant": [1.0, 1.5, 2.0]
 }
 
 # 3. 固定 PPO 参数 (请填入您筛选出的最优值)
@@ -30,7 +30,7 @@ FIXED_PPO_PARAMS = {
     "override_hidden_dims": ["128", "128", "128"],
     "override_entropy": "0.005",  
     "override_schedule": "adaptive",
-    "override_num_learning_epochs": "4"
+    "override_num_learning_epochs": "1"
 }
 
 # ===========================================
