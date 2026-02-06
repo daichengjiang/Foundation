@@ -30,7 +30,7 @@ class QuadcopterTeacherRunnerCfg(RslRlOnPolicyRunnerCfg):
         use_clipped_value_loss=True,
         clip_param=0.2,
         entropy_coef=0.01, #0.0002
-        num_learning_epochs=4,  #4
+        num_learning_epochs=1,  #4
         num_mini_batches=64,   #4
         learning_rate=1.0e-4,
         schedule="adaptive",  #"adaptive" “fixed”

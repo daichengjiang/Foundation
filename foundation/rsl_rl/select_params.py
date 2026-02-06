@@ -14,10 +14,14 @@ def main():
     train_script_path = os.path.join(current_dir, "train_teacher_single.py")
 
     # 1. 定义参数空间
-    hidden_dims_opts = [[128, 128, 128], [64, 64, 64]]
-    entropy_opts = [0.01, 0.002, 0.0002]
-    schedule_opts = ["adaptive", "fixed"]
-    epochs_opts = [1, 4]
+    # hidden_dims_opts = [[128, 128, 128], [64, 64, 64]]
+    # entropy_opts = [0.01, 0.002, 0.0002]
+    # schedule_opts = ["adaptive", "fixed"]
+    # epochs_opts = [1, 4]
+    hidden_dims_opts = [[128, 128, 128]]
+    entropy_opts = [0.02, 0.01, 0.005, 0.002, 0.001]
+    schedule_opts = ["adaptive"]
+    epochs_opts = [1]
 
     # 生成所有组合 (共 24 种)
     combinations = list(itertools.product(hidden_dims_opts, entropy_opts, schedule_opts, epochs_opts))
