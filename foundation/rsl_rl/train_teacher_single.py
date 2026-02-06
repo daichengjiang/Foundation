@@ -34,6 +34,13 @@ parser.add_argument("--override_schedule", type=str, default=None, help="Overrid
 parser.add_argument("--override_num_learning_epochs", type=int, default=None, help="Override num learning epochs per iteration")
 parser.add_argument("--run_name_suffix", type=str, default=None, help="Suffix for wandb run name")
 parser.add_argument("--wandb_project", type=str, default=None, help="WandB project name")
+
+# [NEW] 奖励系数参数 (默认值为 None，表示使用 Config 中的原始值)
+parser.add_argument("--reward_coef_position_cost", type=float, default=None, help="Override position cost coef")
+parser.add_argument("--reward_coef_orientation_cost", type=float, default=None, help="Override orientation cost coef")
+parser.add_argument("--reward_coef_d_action_cost", type=float, default=None, help="Override action smooth cost coef")
+parser.add_argument("--reward_coef_termination_penalty", type=float, default=None, help="Override termination penalty")
+parser.add_argument("--reward_constant", type=float, default=None, help="Override reward constant")
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -120,6 +127,29 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # 修改 run_name，这样 WandB 上能直接看出参数组合
         agent_cfg.run_name = f"Search_{args_cli.run_name_suffix}"
         
+
+    # [NEW] 覆盖奖励系数
+    # 请根据你 teacher_env.py 中 QuadcopterEnvCfg 的实际结构调整以下属性名
+    if args_cli.reward_coef_position_cost is not None:
+        print(f"[INFO] Overriding Position Cost to: {args_cli.reward_coef_position_cost}")
+        # 如果你的参数在 env_cfg.rewards 下，请改为 env_cfg.rewards.xxx.weight
+        env_cfg.reward_coef_position_cost = args_cli.reward_coef_position_cost
+        
+    if args_cli.reward_coef_orientation_cost is not None:
+        print(f"[INFO] Overriding Orientation Cost to: {args_cli.reward_coef_orientation_cost}")
+        env_cfg.reward_coef_orientation_cost = args_cli.reward_coef_orientation_cost
+        
+    if args_cli.reward_coef_d_action_cost is not None:
+        print(f"[INFO] Overriding Action Cost to: {args_cli.reward_coef_d_action_cost}")
+        env_cfg.reward_coef_d_action_cost = args_cli.reward_coef_d_action_cost
+
+    if args_cli.reward_coef_termination_penalty is not None:
+        print(f"[INFO] Overriding Termination Penalty to: {args_cli.reward_coef_termination_penalty}")
+        env_cfg.reward_coef_termination_penalty = args_cli.reward_coef_termination_penalty
+        
+    if args_cli.reward_constant is not None:
+        print(f"[INFO] Overriding Reward Constant to: {args_cli.reward_constant}")
+        env_cfg.reward_constant = args_cli.reward_constant
 
     # set the environment seed
     # note: certain randomizations occur in the environment initialization so we set the seed here
