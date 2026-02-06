@@ -789,7 +789,7 @@ class QuadcopterEnv(DirectRLEnv):
         self._current_motor_speeds = alpha * target + (1.0 - alpha) * current
 
         # 计算力与力矩
-        force_b, torque_b, _ = self._controller.motor_speeds_to_wrench(self._current_motor_speeds) 
+        force_b, torque_b = self._controller.motor_speeds_to_wrench(self._current_motor_speeds) 
 
         # 5. 施加力
         self._forces.zero_()

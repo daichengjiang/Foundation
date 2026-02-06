@@ -77,7 +77,7 @@ class QuadcopterDistillationPolicyCfg(RslRlPpoActorCriticCfg):
     """
     
     # *** 教师网络参数 (用于蒸馏) ***
-    teacher_hidden_dims: list[int] = [64, 64, 64]  # 教师网络的隐藏层维度
+    teacher_hidden_dims: list[int] = [128, 128, 128]  # 教师网络的隐藏层维度
     teacher_recurrent: bool = False               # 教师为MLP (非循环网络)
     
     # *** 学生网络/策略通用参数 ***
