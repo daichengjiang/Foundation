@@ -30,7 +30,7 @@ FIXED_PPO_PARAMS = {
     "override_hidden_dims": ["128", "128", "128"],
     "override_entropy": "0.005",  
     "override_schedule": "adaptive",
-    "override_num_learning_epochs": "4"
+    "override_num_learning_epochs": "1"
 }
 
 # ===========================================

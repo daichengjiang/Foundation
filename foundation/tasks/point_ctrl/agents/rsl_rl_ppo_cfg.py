@@ -29,7 +29,7 @@ class QuadcopterTeacherRunnerCfg(RslRlOnPolicyRunnerCfg):
         value_loss_coef=1.0,
         use_clipped_value_loss=True,
         clip_param=0.2,
-        entropy_coef=0.01, #0.0002
+        entropy_coef=0.005, #0.0002
         num_learning_epochs=1,  #4
         num_mini_batches=64,   #4
         learning_rate=1.0e-4,
@@ -77,7 +77,7 @@ class QuadcopterDistillationPolicyCfg(RslRlPpoActorCriticCfg):
     """
     
     # *** 教师网络参数 (用于蒸馏) ***
-    teacher_hidden_dims: list[int] = [64, 64, 64]  # 教师网络的隐藏层维度
+    teacher_hidden_dims: list[int] = [128, 128, 128]  # 教师网络的隐藏层维度
     teacher_recurrent: bool = False               # 教师为MLP (非循环网络)
     
     # *** 学生网络/策略通用参数 ***
