@@ -39,6 +39,7 @@ import csv
 from foundation.utils.train_terrain import MapGenerator
 from foundation.utils.raster import TerrainRasterMap
 from foundation.utils.simple_controller import SimpleQuadrotorController
+from foundation.utils.pid_controller import PaperPhysControllerTensor
 from rsl_rl.modules import StudentTeacherRecurrentCustom
 from enum import IntEnum
 import collections
@@ -286,7 +287,7 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     student_post_rnn_dim = 16
     
     # 策略原本的观测维度 (Distillation Env 中的 student_observation_space = 22)
-    policy_obs_dim = 22
+    policy_obs_dim = 24
 
     mass = 0.027
     arm_length = 0.046
@@ -364,14 +365,16 @@ class QuadcopterEnv(DirectRLEnv):
         #     thrust_to_weight=torch.full((self.num_envs,), 2, device=self.device),
         #     moment_scale=torch.full((self.num_envs,), 0.025, device=self.device)
         # )
-        self._controller = SimpleQuadrotorController(
+        self._controller = PaperPhysControllerTensor(
             num_envs=self.num_envs,
             device=self.device,
             mass=self.mass_tensor,
             arm_length=self.arm_l_tensor,
             inertia=self.inertia_tensor,
             thrust_to_weight=self.twr_tensor,
-            moment_scale=self.kappa_tensor
+            kappa=self.kappa_tensor,
+            motor_alpha_up=torch.full((self.num_envs,), 0.025, device=self.device),
+            motor_alpha_down=torch.full((self.num_envs,), 0.025, device=self.device)
         )
         # [新增] 2. 加载学生策略网络
         print(f"Loading Student Policy from: {self.cfg.student_checkpoint_path}")
@@ -748,11 +751,11 @@ class QuadcopterEnv(DirectRLEnv):
                     cam_x, cam_y, cam_z = self.camera_offsets[i].cpu().numpy()
 
                     # 获取控制器中的张量数据
-                    m_c = self._controller.mass_[i].item()
-                    a_c = self._controller.arm_l_[i].item()
-                    ixx_c, iyy_c, izz_c = self._controller.inertia_[i].cpu().numpy()
-                    twr_c = self._controller.thrust_to_weight_[i].item()
-                    k_c = self._controller.kappa_[i].item()
+                    m_c = self._controller.mass[i].item()
+                    a_c = self._controller.arm_length[i].item()
+                    ixx_c, iyy_c, izz_c = self._controller.inertia[i].cpu().numpy()
+                    twr_c = self._controller.thrust_to_weight[i].item()
+                    k_c = self._controller.kappa[i].item()
 
                     # 打印环境数据行，包含相机偏移
                     print(f"{i:<8} | {'ENV':<10} | {m_e:<8.4f} | {a_e:<8.4f} | {ixx_e:<8.2e} | {iyy_e:<8.2e} | {izz_e:<8.2e} | {twr_e:<6.2f} | {k_e:<6.4f} | ({cam_x:6.3f}, {cam_y:6.3f}, {cam_z:6.3f})")
@@ -847,14 +850,18 @@ class QuadcopterEnv(DirectRLEnv):
         
         upper_pos_scale = 2.0
         upper_vel_scale = 2.0
+        upper_yaw_scale = 2.0
         delta_p_b = actions[:, :3] * upper_pos_scale
         delta_v_b = actions[:, 3:6] * upper_vel_scale
+        delta_yaw = actions[:, 6:7] * upper_yaw_scale
 
         # 3. 准备下层 Student 网络的输入 (22维)
         quat_w = self._robot.data.root_quat_w
         rot_matrix_b2w = matrix_from_quat(quat_w)
         rot_flat = rot_matrix_b2w.reshape(self.num_envs, 9)
         ang_vel_b = self._robot.data.root_ang_vel_b
+        yaw_error_sin = torch.sin(delta_yaw.squeeze())
+        yaw_error_cos = torch.cos(delta_yaw.squeeze())
 
         # 核心：使用专门的 _last_lower_actions (4维电机转速)
         student_obs = torch.cat([
@@ -863,6 +870,8 @@ class QuadcopterEnv(DirectRLEnv):
             delta_v_b,                # 3: 上层给的纠偏速度误差
             ang_vel_b,                # 3: 真实角速度
             self._last_lower_actions, # 4: 【关键】下层网络的上一帧动作
+            yaw_error_sin,            # 1: 偏航角误差的正弦
+            yaw_error_cos             # 1: 偏航角误差的余弦
         ], dim=-1)
 
         # 4. 下层网络推理
@@ -890,7 +899,7 @@ class QuadcopterEnv(DirectRLEnv):
         self._last_lower_actions = torch.clamp(student_raw_actions, -1.0, 1.0).clone()
 
         # 7. [修改] 使用“实际/滤波后”的转速计算物理力和力矩
-        force, torque, _ = self._controller.motor_speeds_to_wrench(self._current_motor_speeds)
+        force, torque = self._controller.motor_speeds_to_wrench(self._current_motor_speeds)
         
         self._forces.zero_()
         self._torques.zero_()
