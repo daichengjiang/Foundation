@@ -850,12 +850,12 @@ class QuadcopterEnv(DirectRLEnv):
         
         upper_pos_scale = 2.0
         upper_vel_scale = 2.0
-        upper_yaw_scale = math.pi
+        upper_yaw_error_scale = math.pi
 
         delta_p_b = actions[:, :3] * upper_pos_scale
         delta_v_b = actions[:, 3:6] * upper_vel_scale
 
-        yaw_error = actions[:, 6] * upper_yaw_scale 
+        yaw_error = actions[:, 6] * upper_yaw_error_scale 
         yaw_error_sin = torch.sin(yaw_error).unsqueeze(-1)
         yaw_error_cos = torch.cos(yaw_error).unsqueeze(-1)
 
@@ -1085,7 +1085,7 @@ class QuadcopterEnv(DirectRLEnv):
 
         speed = self._robot.data.root_lin_vel_w.norm(dim=1, keepdim=True)
         vel_speed_match_reward = torch.exp(-5.0 * torch.abs(speed - self._desired_vel)) * 2.0
-        vel_speed_match_reward = vel_speed_match_reward.squeeze()
+        vel_speed_match_reward = vel_speed_match_reward.squeeze(-1)
 
         z_pos = pos_w[:, 2]
         floor_dist = z_pos - (self._desired_pos_w[:, 2]) + 0.2

@@ -4,9 +4,12 @@ from __future__ import annotations
 import argparse
 import sys
 import torch
+import torch.nn as nn      # [新增] 导入 nn
+import copy                # [新增] 导入 copy
 import numpy as np
 import cv2  # 需要安装: pip install opencv-python
 import math
+import os
 from isaaclab.app import AppLauncher
 
 # --- 手写数学转换函数 ---
@@ -29,6 +32,68 @@ def euler_from_matrix(matrix: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor,
 
     return roll, pitch, yaw
 # ----------------------
+
+# --- [新增] 实物部署模型封装 Wrapper ---
+class UpperActorDeployWrapper(nn.Module):
+    def __init__(self, policy, obs_normalizer, device):
+        super().__init__()
+        # 1. 拷贝归一化器
+        if obs_normalizer is not None:
+            self.obs_normalizer = copy.deepcopy(obs_normalizer).to(device)
+        else:
+            self.obs_normalizer = nn.Identity().to(device)
+
+        # 2. 提取参数配置
+        self.obs_size = policy.obs_size
+        self.obs_history_length = policy.obs_history_length
+        self.depth_history_length = policy.depth_history_length
+        self.depth_height = policy.depth_height
+        self.depth_width = policy.depth_width
+
+        # 3. 提取神经网络模块
+        self.actor_cnn = copy.deepcopy(policy.actor_cnn).to(device)
+        self.actor_obs_his_mlp = copy.deepcopy(policy.actor_obs_his_mlp).to(device)
+        
+        # 关键：提取底层的纯 PyTorch RNN/GRU，抛弃 RSL-RL 的 Memory 外壳
+        self.actor_rnn = copy.deepcopy(policy.actor_memory.rnn).to(device)
+        self.actor_mlp = copy.deepcopy(policy.actor).to(device)
+
+        # 4. 初始化 GRU 隐藏状态 (实物部署 batch_size=1)
+        num_layers = self.actor_rnn.num_layers
+        hidden_size = self.actor_rnn.hidden_size
+        self.hidden_states = torch.zeros(num_layers, 1, hidden_size, device=device)
+
+    def forward(self, observations: torch.Tensor) -> torch.Tensor:
+        # 1. 观测值归一化
+        observations = self.obs_normalizer(observations)
+
+        # 2. 切分数据
+        obs = observations[:, :self.obs_size]
+        depth_start_idx = self.obs_size + self.obs_history_length * self.obs_size
+        depth_obs = observations[:, depth_start_idx:]
+
+        # 3. 处理深度图
+        depth_obs = depth_obs.reshape(-1, self.depth_history_length, self.depth_height, self.depth_width)
+        depth_features = self.actor_cnn(depth_obs)
+
+        # 4. 特征融合
+        if self.obs_history_length != 0:
+            obs_history = observations[:, self.obs_size:depth_start_idx]
+            obs_history_features = self.actor_obs_his_mlp(obs_history)
+            fused_features = torch.cat([obs_history_features, depth_features], dim=-1)
+        else:
+            fused_features = torch.cat([obs, depth_features], dim=-1)
+
+        # 5. GRU 时序推理 (需增加 sequence length 维度)
+        rnn_in = fused_features.unsqueeze(0)
+        rnn_out, self.hidden_states = self.actor_rnn(rnn_in, self.hidden_states)
+        features = rnn_out.squeeze(0)
+
+        # 6. MLP 输出动作并限幅
+        actions_mean = self.actor_mlp(features)
+        actions = torch.clamp(actions_mean, -1.0, 1.0)
+        return actions
+# ------------------------------------
 
 def _parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="IsaacLab Evaluation for Quadcopter")
@@ -70,11 +135,10 @@ def main() -> None:
             self.death_counts = {"COLLISION": 0, "TOO_LOW": 0, "TOO_HIGH": 0, "UNSTABLE": 0, "TIMEOUT": 0, "OTHER": 0}
             self.Outcome = self._unwrapped.EpisodeOutcome
             
-            # [新增] 构建 Outcome 枚举值到名称的映射字典
-            # 例如: {0: 'SUCCESS', 1: 'COLLISION', ...}
+            # 构建 Outcome 枚举值到名称的映射字典
             self.outcome_map = {v: k for k, v in self.Outcome.__members__.items()}
 
-            # [新增] 存储每个环境上一次的结束状态
+            # 存储每个环境上一次的结束状态
             self.n_envs = self._unwrapped.num_envs
             self.last_outcomes = ["Running"] * self.n_envs
 
@@ -107,15 +171,10 @@ def main() -> None:
                     actions = self._policy(obs)
                     obs, rewards, dones, infos = self._env.step(actions)
                 
-                # --- [新增] 更新环境结果状态 ---
-                # 获取所有刚刚重置的环境 ID
+                # --- 更新环境结果状态 ---
                 reset_idxs = torch.nonzero(dones).flatten().cpu().numpy()
-                
-                # 获取本步产生的所有 outcomes (从 Log 中提取)
                 current_outcomes_list = self._unwrapped.extras.get("log", {}).get("Metrics/outcome_episodes_per_step", [])
                 
-                # 如果有环境重置，且数量对得上，就更新显示标签
-                # (注意：这里假设 extras 里的 outcomes 列表顺序与 dones 的索引顺序一致，这是常规实现逻辑)
                 if len(reset_idxs) > 0 and len(reset_idxs) == len(current_outcomes_list):
                     for idx, outcome_val in zip(reset_idxs, current_outcomes_list):
                         outcome_name = self.outcome_map.get(outcome_val, "Unknown")
@@ -188,30 +247,26 @@ def main() -> None:
                 cv2.putText(canvas_large, label_id, (base_x + 5, base_y + 20), 
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
-                # --- [B] 右上角: 上次结束结果 (新增) ---
+                # --- [B] 右上角: 上次结束结果 ---
                 outcome_text = self.last_outcomes[i]
                 
-                # 决定颜色
                 if outcome_text == "SUCCESS":
-                    text_color = (0, 255, 0) # 绿色
+                    text_color = (0, 255, 0)
                 elif outcome_text == "TIMEOUT":
-                    text_color = (0, 255, 255) # 黄色/青色
+                    text_color = (0, 255, 255)
                 elif outcome_text == "Running":
-                    text_color = (200, 200, 200) # 灰色
-                else: # Collision, Too_Low, etc.
-                    text_color = (0, 0, 255) # 红色
+                    text_color = (200, 200, 200)
+                else:
+                    text_color = (0, 0, 255)
 
-                # 计算文字宽度以便右对齐
                 font_scale_status = 0.45
                 (text_w, text_h), _ = cv2.getTextSize(outcome_text, cv2.FONT_HERSHEY_SIMPLEX, font_scale_status, 1)
                 
-                # 坐标: base_x + 宽度 - 文字宽度 - 5 (留点边距)
                 status_x = base_x + (self.img_width * self.vis_scale) - text_w - 5
                 status_y = base_y + 20
 
-                # 绘制
                 cv2.putText(canvas_large, outcome_text, (status_x, status_y), 
-                            cv2.FONT_HERSHEY_SIMPLEX, font_scale_status, (0, 0, 0), 3) # 黑边
+                            cv2.FONT_HERSHEY_SIMPLEX, font_scale_status, (0, 0, 0), 3)
                 cv2.putText(canvas_large, outcome_text, (status_x, status_y), 
                             cv2.FONT_HERSHEY_SIMPLEX, font_scale_status, text_color, 1)
 
@@ -227,7 +282,6 @@ def main() -> None:
                 
                 start_draw_y = bottom_y - (3 * line_height) 
 
-                # 绘制刻度尺 (10-90)
                 ruler_base_y = start_draw_y - 4
                 bar_zero_x = start_x + 20
                 for deg in range(10, 91, 10):
@@ -239,16 +293,13 @@ def main() -> None:
                         cv2.putText(canvas_large, str(deg), text_pos, 
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.3, (220, 220, 220), 1)
 
-                # 绘制数据条
                 for idx, (name, val) in enumerate(zip(names, values)):
                     curr_y = start_draw_y + idx * line_height
                     color = (0, 255, 0) if val >= 0 else (0, 0, 255)
                     length = max(min(int(abs(val) * pixels_per_deg), max_bar_width), 1)
 
-                    # Label
                     cv2.putText(canvas_large, name, (start_x, curr_y), 
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
-                    # Bar
                     cv2.rectangle(canvas_large, (bar_zero_x, curr_y - 8), (bar_zero_x + length, curr_y + 2), color, -1)
                     cv2.rectangle(canvas_large, (bar_zero_x, curr_y - 8), (bar_zero_x + length, curr_y + 2), (0, 0, 0), 1)
 
@@ -319,6 +370,46 @@ def main() -> None:
         print(f"Loading: {args_cli.model_path}")
         ppo_runner.load(args_cli.model_path)
         
+        # =========================================================================
+        # [新增] 开始导出实物部署模型 (TorchScript)
+        # =========================================================================
+        export_device = agent_cfg.device
+        print(f"\n[INFO] 正在构建 Upper 实物部署模型...")
+        try:
+            policy_nn = ppo_runner.alg.policy
+            obs_normalizer = getattr(ppo_runner, "obs_normalizer", None)
+            
+            # 1. 实例化 Wrapper 并置为 eval 模式
+            deploy_model = UpperActorDeployWrapper(
+                policy=policy_nn, 
+                obs_normalizer=obs_normalizer, 
+                device=export_device
+            )
+            deploy_model.eval()
+            
+            # 2. 从环境中获取准确的观测维度
+            obs, _ = env.get_observations()
+            total_obs_dim = obs.shape[1]
+            print(f"[INFO] 预期实物端输入的单帧观测向量维度 (obs_dim): {total_obs_dim}")
+            
+            # 3. 构造 batch_size=1 的 dummy input 进行 JIT 追踪编译
+            dummy_obs_input = torch.randn(1, total_obs_dim, device=export_device)
+            
+            with torch.inference_mode():
+                trace_model = torch.jit.script(deploy_model, dummy_obs_input)
+                
+                # 默认保存在当前 checkpoint 的同目录下
+                export_dir = os.path.dirname(args_cli.model_path)
+                export_path = os.path.join(export_dir, "upper_actor_deploy.pt")
+                trace_model.save(export_path)
+                
+                print(f"[SUCCESS] Upper 部署模型已成功保存至: {export_path}")
+                print(f"        -> 实体机(LibTorch)直接加载此文件即可运行")
+                print(f"        -> 实物端调用输入形状需严格为: (1, {total_obs_dim})\n")
+        except Exception as e:
+            print(f"[ERROR] 导出部署模型失败: {e}\n")
+        # =========================================================================
+
         bridge = EvaluationBridge(
             env, 
             simulation_app, 

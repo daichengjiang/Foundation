@@ -53,6 +53,8 @@ import gymnasium as gym
 import os
 import time
 import torch
+import torch.nn as nn      # [新增] 
+import copy                # [新增]
 import numpy as np
 from datetime import datetime
 
@@ -84,6 +86,53 @@ torch.backends.cudnn.benchmark = False
 STATS_START_STEP = 3000
 # ==========================================
 
+# =========================================================================
+# [新增] 下层学生网络实物部署 Wrapper
+# =========================================================================
+class LowerActorDeployWrapper(nn.Module):
+    def __init__(self, policy, obs_normalizer, device):
+        super().__init__()
+        # 1. 拷贝归一化器
+        if obs_normalizer is not None:
+            self.obs_normalizer = copy.deepcopy(obs_normalizer).to(device)
+        else:
+            self.obs_normalizer = nn.Identity().to(device)
+
+        # 2. 拷贝学生网络的独立组件 (跳过 Teacher 部分)
+        self.pre_rnn_mlp = copy.deepcopy(policy.pre_rnn_mlp).to(device)
+        self.rnn = copy.deepcopy(policy.rnn).to(device)
+        self.post_rnn_mlp = copy.deepcopy(policy.post_rnn_mlp).to(device)
+        self.student = copy.deepcopy(policy.student).to(device)
+
+        # 3. 初始化 GRU 隐状态
+        # 针对实物端: num_layers=1, batch_size=1, hidden_size=16
+        num_layers = self.rnn.num_layers
+        hidden_size = self.rnn.hidden_size
+        self.hidden_state = torch.zeros(num_layers, 1, hidden_size, device=device)
+
+    def forward(self, observations: torch.Tensor) -> torch.Tensor:
+        # 1. 归一化
+        x = self.obs_normalizer(observations)
+        
+        # 2. 前置 MLP
+        x = self.pre_rnn_mlp(x)
+        
+        # 3. GRU 推理 (需扩展 Seq=1 维度)
+        x = x.unsqueeze(0)
+        x, self.hidden_state = self.rnn(x, self.hidden_state)
+        x = x.squeeze(0)
+        
+        # 4. 后置 MLP
+        x = self.post_rnn_mlp(x)
+        
+        # 5. 输出动作层
+        actions_mean = self.student(x)
+        
+        # 6. 安全限幅
+        actions = torch.clamp(actions_mean, -1.0, 1.0)
+        return actions
+# =========================================================================
+
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg):
     """Play and evaluate trajectory tracking with best model."""
@@ -114,48 +163,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env_cfg.dynamics.motor_tau_up = 0.06
     env_cfg.dynamics.motor_tau_down = 0.15
     env_cfg.dynamics.moment_scale = 0.025
-
-    # # x500
-    # env_cfg.dynamics.mass = 2
-    # env_cfg.dynamics.arm_length = 0.25
-    # env_cfg.dynamics.inertia = (0.022,0.022,0.04)
-    # env_cfg.dynamics.thrust_to_weight = 2.2
-    # env_cfg.dynamics.motor_tau_up = 0.06
-    # env_cfg.dynamics.motor_tau_down = 0.15
-    # env_cfg.dynamics.moment_scale = 0.025
-
-    # # Flightmare
-    # env_cfg.dynamics.mass = 0.73
-    # env_cfg.dynamics.arm_length = 0.085
-    # env_cfg.dynamics.inertia = (7.911e-3,7.911e-3,1.231e-2)
-    # env_cfg.dynamics.thrust_to_weight = 4.5
-    # env_cfg.dynamics.motor_tau_up = 0.06
-    # env_cfg.dynamics.motor_tau_down = 0.15
-    # env_cfg.dynamics.moment_scale = 0.025
-
-    # env_cfg.dynamics.mass = 0.6863819667949842
-    # env_cfg.dynamics.arm_length = 0.12728135908262386
-    # env_cfg.dynamics.inertia = (0.0058040111630157975,0.0058040111630157975,0.010632948450644941)
-    # env_cfg.dynamics.thrust_to_weight = 2.6983768014823015
-    # env_cfg.dynamics.motor_tau_up = 0.06495171311000257
-    # env_cfg.dynamics.motor_tau_down = 0.2601621073237004
-    # env_cfg.dynamics.moment_scale = 0.04343799444626214
-
-    # env_cfg.dynamics.mass = 0.9723406524454805
-    # env_cfg.dynamics.arm_length = 0.1440677911119537
-    # env_cfg.dynamics.inertia = (0.005845751033218391,0.005845751033218391,0.010709415892856093)
-    # env_cfg.dynamics.thrust_to_weight = 3.419472671407245
-    # env_cfg.dynamics.motor_tau_up = 0.030316265523195485
-    # env_cfg.dynamics.motor_tau_down = 0.20380266906645023
-    # env_cfg.dynamics.moment_scale = 0.0168386257003069
-
-    # env_cfg.dynamics.mass = 4.170006822537896
-    # env_cfg.dynamics.arm_length = 0.23338959219177477
-    # env_cfg.dynamics.inertia = (0.025736608433949416,0.025736608433949416,0.04714946665099533)
-    # env_cfg.dynamics.thrust_to_weight = 1.7042349524548057
-    # env_cfg.dynamics.motor_tau_up = 0.04830513035810187
-    # env_cfg.dynamics.motor_tau_down = 0.2732373476309069
-    # env_cfg.dynamics.moment_scale = 0.0451817502153234
 
     # get checkpoint path
     checkpoint_path = retrieve_file_path(args_cli.checkpoint)
@@ -222,6 +229,45 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     policy_model = runner.alg.policy
     dt = env.unwrapped.step_dt
     obs, _ = env.get_observations()
+
+    # =========================================================================
+    # [新增] 导出实物部署模型 (TorchScript) - Student/Lower Network
+    # =========================================================================
+    export_device = agent_cfg.device
+    print(f"\n[INFO] 正在构建 Lower (Student) 实物部署模型...")
+    try:
+        # 获取最新的 normalizer（如果有的话）
+        obs_normalizer = getattr(runner, "obs_normalizer", None)
+        
+        # 1. 实例化 Wrapper 并置为 eval 模式
+        deploy_model = LowerActorDeployWrapper(
+            policy=policy_model, 
+            obs_normalizer=obs_normalizer, 
+            device=export_device
+        )
+        deploy_model.eval()
+        
+        # 2. 根据环境推断单帧观测维度
+        total_obs_dim = obs.shape[1]
+        print(f"[INFO] 预期实物端输入的单帧观测向量维度 (obs_dim): {total_obs_dim}")
+        
+        # 3. 构造 dummy_input 追踪 JIT 编译
+        dummy_obs_input = torch.randn(1, total_obs_dim, device=export_device)
+        
+        with torch.inference_mode():
+            trace_model = torch.jit.script(deploy_model, dummy_obs_input)
+            
+            # 保存在当前 checkpoint 目录下
+            export_dir = os.path.dirname(checkpoint_path)
+            export_path = os.path.join(export_dir, "down_actor_deploy.pt")
+            trace_model.save(export_path)
+            
+            print(f"[SUCCESS] Lower 部署模型已成功保存至: {export_path}")
+            print(f"        -> 实体机(LibTorch)直接加载此文件即可运行")
+            print(f"        -> 实物端调用输入形状需严格为: (1, {total_obs_dim})\n")
+    except Exception as e:
+        print(f"[ERROR] 导出部署模型失败: {e}\n")
+    # =========================================================================
     
     # Data storage
     trajectory_data = {
