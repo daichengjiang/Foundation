@@ -147,13 +147,13 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     history_depth = 2
     history_obs = 10
 
-    frame_observation_space = 3 + 9 + 2 + 1 + 1 + 6
+    frame_observation_space = 3 + 9 + 2 + 1 + 1 + 7
 
     gamma = 0.99
 
     episode_length_s = 96
     decimation = 1
-    action_space = 6
+    action_space = 7
 
     state_space = 0
 
@@ -850,18 +850,20 @@ class QuadcopterEnv(DirectRLEnv):
         
         upper_pos_scale = 2.0
         upper_vel_scale = 2.0
-        upper_yaw_scale = 2.0
+        upper_yaw_scale = math.pi
+
         delta_p_b = actions[:, :3] * upper_pos_scale
         delta_v_b = actions[:, 3:6] * upper_vel_scale
-        delta_yaw = actions[:, 6:7] * upper_yaw_scale
+
+        yaw_error = actions[:, 6] * upper_yaw_scale 
+        yaw_error_sin = torch.sin(yaw_error).unsqueeze(-1)
+        yaw_error_cos = torch.cos(yaw_error).unsqueeze(-1)
 
         # 3. 准备下层 Student 网络的输入 (22维)
         quat_w = self._robot.data.root_quat_w
         rot_matrix_b2w = matrix_from_quat(quat_w)
         rot_flat = rot_matrix_b2w.reshape(self.num_envs, 9)
         ang_vel_b = self._robot.data.root_ang_vel_b
-        yaw_error_sin = torch.sin(delta_yaw.squeeze())
-        yaw_error_cos = torch.cos(delta_yaw.squeeze())
 
         # 核心：使用专门的 _last_lower_actions (4维电机转速)
         student_obs = torch.cat([
@@ -870,8 +872,8 @@ class QuadcopterEnv(DirectRLEnv):
             delta_v_b,                # 3: 上层给的纠偏速度误差
             ang_vel_b,                # 3: 真实角速度
             self._last_lower_actions, # 4: 【关键】下层网络的上一帧动作
-            yaw_error_sin,            # 1: 偏航角误差的正弦
-            yaw_error_cos             # 1: 偏航角误差的余弦
+            yaw_error_sin,            # 1: 【新增】yaw error sin
+            yaw_error_cos,            # 1: 【新增】yaw error cos
         ], dim=-1)
 
         # 4. 下层网络推理
@@ -1068,7 +1070,8 @@ class QuadcopterEnv(DirectRLEnv):
 
         diff_actions = self._actions - self._last_actions
 
-        weights = torch.tensor([1.0, 1.0, 1.0, 1.0, 1.0, 1.0], device=self.device)
+        # 【修改】将 weights 增加到 7 维，最后一维控制 yaw 指令的平滑度惩罚
+        weights = torch.tensor([1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0], device=self.device)
         diff_actions_weighted = diff_actions * weights
         action_change_penalty = - (diff_actions_weighted ** 2).sum(dim=1)
 
