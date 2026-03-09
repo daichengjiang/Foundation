@@ -28,7 +28,7 @@ class ActorCriticRNN(nn.Module):
         depth_cnn_out_dim=256,
         depth_height=60,
         depth_width=100,
-        obs_size=23,
+        obs_size=22,
         depth_history_length = 1, #2
         obs_history_length =0, #10
         rnn_type="gru",

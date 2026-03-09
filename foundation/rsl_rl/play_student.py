@@ -55,6 +55,7 @@ import time
 import torch
 import torch.nn as nn      # [新增] 
 import copy                # [新增]
+from isaaclab.utils.math import euler_xyz_from_quat
 import numpy as np
 from datetime import datetime
 
@@ -275,6 +276,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         'actual_pos': [],
         'desired_vel': [],
         'actual_vel': [],
+        'desired_yaw': [], 
+        'actual_yaw': [],
         'actions': [],
         'timestamps': []
     }
@@ -316,6 +319,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             squared_error = torch.sum(pos_error_vec**2, dim=1) 
             squared_error_xy = torch.sum(pos_error_vec[:, :2]**2, dim=1) 
             vel_mag = torch.norm(current_vel, dim=1)
+
+            quat_w = env.unwrapped._robot.data.root_quat_w
+            _, _, yaw_curr = euler_xyz_from_quat(quat_w)
             
             # === ONLY ACCUMULATE STATISTICS IF TIMESTEP >= STATS_START_STEP ===
             if timestep >= STATS_START_STEP:
@@ -341,6 +347,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 trajectory_data['actual_vel'].append(current_vel[0].cpu().numpy())
                 trajectory_data['actions'].append(actions[0].cpu().numpy())
                 trajectory_data['timestamps'].append(timestep * dt)
+                trajectory_data['desired_yaw'].append(env.unwrapped.yaw_des[0].cpu().numpy())
+                trajectory_data['actual_yaw'].append(yaw_curr[0].cpu().numpy())
                         
             timestep += 1
             
@@ -348,8 +356,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 # Print instantaneous RMSE for monitoring
                 cur_rmse = np.sqrt(torch.mean(squared_error).item())
                 cur_rmse_xy = np.sqrt(torch.mean(squared_error_xy).item())
+
+                batch_yaw_err = env.unwrapped.yaw_des - yaw_curr
+                batch_yaw_err = torch.remainder(batch_yaw_err + torch.pi, 2 * torch.pi) - torch.pi
+                cur_yaw_rmse = np.degrees(torch.sqrt(torch.mean(batch_yaw_err**2)).item())
+
                 status = " (Collecting Stats)" if timestep >= STATS_START_STEP else " (Warmup)"
-                print(f"Step {timestep:5d}{status} | RMSE: {cur_rmse:.4f}m | RMSE w/o z: {cur_rmse_xy:.4f}m")
+                print(f"Step {timestep:5d}{status} | RMSE: {cur_rmse:.4f}m | RMSE w/o z: {cur_rmse_xy:.4f}m | Yaw RMSE: {cur_yaw_rmse:.4f} deg")
                 
         if args_cli.realtime:
             sleep_time = dt - (time.time() - step_start_time)
@@ -366,11 +379,23 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         rmse_final = 0.0
         rmse_xy_final = 0.0
     
+    desired_yaw = np.array(trajectory_data['desired_yaw'])
+    actual_yaw = np.array(trajectory_data['actual_yaw'])
+    
+    valid_des_yaw = desired_yaw[STATS_START_STEP:]
+    valid_act_yaw = actual_yaw[STATS_START_STEP:]
+    
+    yaw_error = valid_des_yaw - valid_act_yaw
+    yaw_error = (yaw_error + np.pi) % (2 * np.pi) - np.pi
+    yaw_rmse = np.sqrt(np.mean(yaw_error**2))
+    yaw_rmse_deg = np.degrees(yaw_rmse)
+    
     print(f"\n{'=' * 80}")
     print(f"Paper Metrics Results (Calculated from step {STATS_START_STEP} onwards):")
     print(f"{'-' * 80}")
     print(f"  RMSE [m]:             {rmse_final:.4f}")
     print(f"  RMSE w/o z [m]:       {rmse_xy_final:.4f}")
+    print(f"  Yaw RMSE [deg]:       {yaw_rmse_deg:.4f}") # [新增]
     print(f"  Max velocity [m/s]:   {max_velocity_observed:.4f}")
     print(f"{'-' * 80}")
     print(f"  Total Steps:          {timestep}")
@@ -388,6 +413,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         f.write(f"\nKEY METRICS (Steps >= {STATS_START_STEP}):\n")
         f.write(f"  RMSE [m]:             {rmse_final:.4f}\n")
         f.write(f"  RMSE w/o z [m]:       {rmse_xy_final:.4f}\n")
+        f.write(f"  Yaw RMSE [deg]:       {yaw_rmse_deg:.4f}\n")  # [新增]
         f.write(f"  Max velocity [m/s]:   {max_velocity_observed:.4f}\n")
         
     print(f"\nStatistics saved to: {stats_file}")
@@ -399,6 +425,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                  actual_pos=np.array(trajectory_data['actual_pos']),
                  desired_vel=np.array(trajectory_data['desired_vel']),
                  actual_vel=np.array(trajectory_data['actual_vel']),
+                 desired_yaw=np.array(trajectory_data['desired_yaw']), # [新增]
+                 actual_yaw=np.array(trajectory_data['actual_yaw']),   # [新增]
                  actions=np.array(trajectory_data['actions']),
                  timestamps=np.array(trajectory_data['timestamps']),
                  # Save calculated metrics and the start step used
