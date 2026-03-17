@@ -147,13 +147,13 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     history_depth = 2
     history_obs = 10
 
-    frame_observation_space = 3 + 9 + 2 + 1 + 1 + 6
+    frame_observation_space = 3 + 9 + 2 + 1 + 1 + 7
 
     gamma = 0.99
 
     episode_length_s = 96
     decimation = 1
-    action_space = 6
+    action_space = 7
 
     state_space = 0
 
@@ -195,8 +195,8 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     ceiling_height = too_high
 
     reward_coef_distance_reward: float = 0.0
-    reward_coef_action_magnitude_penalty: float = 0.0
-    reward_coef_action_change_penalty: float = 0.0
+    reward_coef_action_magnitude_penalty: float = 0.05
+    reward_coef_action_change_penalty: float = 0.5
     reward_coef_vel_speed_excess_penalty: float = 1.0
     reward_coef_vel_speed_match_reward: float = 0.0
     reward_coef_z_position_penalty: float = 0.3
@@ -287,7 +287,7 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     student_post_rnn_dim = 16
     
     # 策略原本的观测维度 (Distillation Env 中的 student_observation_space = 22)
-    policy_obs_dim = 22
+    policy_obs_dim = 24
 
     mass = 0.027
     arm_length = 0.046
@@ -812,12 +812,20 @@ class QuadcopterEnv(DirectRLEnv):
                         map.build_occupancy_grid_from_points(self.occ_kdtree.data)
                         map.dilate_existing_obstacles(self.cfg.dilation_kernel_size)
 
-                        if self.cfg.enable_larger_dilation:
-                            map.compute_distance_to_goal_larger_dilation(goal_world_pos=goal)
-                            map.compute_esdf()
-                        else:
-                            map.compute_distance_to_goal(goal_world_pos=goal)
-                            map.compute_esdf()
+                        # if self.cfg.enable_larger_dilation:
+                        #     map.compute_distance_to_goal_larger_dilation(goal_world_pos=goal)
+                        #     map.compute_esdf()
+                        # else:
+                        #     map.compute_distance_to_goal(goal_world_pos=goal)
+                        #     map.compute_esdf()
+
+                        map.compute_esdf()
+                        map.compute_cost_aware_distance_to_goal(
+                            goal_world_pos=goal, 
+                            safe_margin=0.6, 
+                            alpha=20.0
+                        )
+
                         if os.path.isdir(self.cfg.grid_path):
                             map.save_to_file(self.cfg.grid_path + f"/raster_map_{i}_{j}.npz")
                         else:
@@ -844,20 +852,20 @@ class QuadcopterEnv(DirectRLEnv):
 
     def _pre_physics_step(self, actions: torch.Tensor):
 
-        # 1. actions 是上层 RL 输出的 6 维向量 [-1, 1]
-        actions = torch.clamp(actions, -1.0, 1.0)
-        self._actions = actions.clone() # 这里的 self._actions 对应 action_space=6
-        
-        upper_pos_scale = 2.0
+        raw_actions = torch.clamp(actions, -1.0, 1.0)
+        alpha = 0.5 
+        self._actions = alpha * raw_actions + (1.0 - alpha) * self._last_actions
+
+        upper_pos_scale = 2.0  
         upper_vel_scale = 2.0
-        # upper_yaw_error_scale = math.pi
+        upper_yaw_error_scale = math.pi
 
-        delta_p_b = actions[:, :3] * upper_pos_scale
-        delta_v_b = actions[:, 3:6] * upper_vel_scale
+        delta_p_b = self._actions[:, :3] * upper_pos_scale
+        delta_v_b = self._actions[:, 3:6] * upper_vel_scale
 
-        # yaw_error = actions[:, 6] * upper_yaw_error_scale 
-        # yaw_error_sin = torch.sin(yaw_error).unsqueeze(-1)
-        # yaw_error_cos = torch.cos(yaw_error).unsqueeze(-1)
+        yaw_error = self._actions[:, 6] * upper_yaw_error_scale 
+        yaw_error_sin = torch.sin(yaw_error).unsqueeze(-1)
+        yaw_error_cos = torch.cos(yaw_error).unsqueeze(-1)
 
         # 3. 准备下层 Student 网络的输入 (22维)
         quat_w = self._robot.data.root_quat_w
@@ -872,8 +880,8 @@ class QuadcopterEnv(DirectRLEnv):
             delta_v_b,                # 3: 上层给的纠偏速度误差
             ang_vel_b,                # 3: 真实角速度
             self._last_lower_actions, # 4: 【关键】下层网络的上一帧动作
-            # yaw_error_sin,            # 1: 【新增】yaw error sin
-            # yaw_error_cos,            # 1: 【新增】yaw error cos
+            yaw_error_sin,            # 1: 【新增】yaw error sin
+            yaw_error_cos,            # 1: 【新增】yaw error cos
         ], dim=-1)
 
         # 4. 下层网络推理
@@ -1065,14 +1073,14 @@ class QuadcopterEnv(DirectRLEnv):
         distance_reward = 10.0 * delta_distance
 
         act_abs = torch.abs(self._actions)
-        action_magnitude = torch.square(act_abs[:, 0]) + torch.square(act_abs[:, 1])
+        action_magnitude = torch.sum(torch.square(act_abs[:, :6]), dim=1)
         action_magnitude_penalty = -action_magnitude
 
         diff_actions = self._actions - self._last_actions
 
         # 【修改】将 weights 增加到 7 维，最后一维控制 yaw 指令的平滑度惩罚
-        weights = torch.tensor([1.0, 1.0, 1.0, 1.0, 1.0, 1.0], device=self.device)
-        # weights = torch.tensor([1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0], device=self.device)
+        # weights = torch.tensor([1.0, 1.0, 1.0, 1.0, 1.0, 1.0], device=self.device)
+        weights = torch.tensor([1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0], device=self.device)
         diff_actions_weighted = diff_actions * weights
         action_change_penalty = - (diff_actions_weighted ** 2).sum(dim=1)
 

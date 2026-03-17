@@ -448,6 +448,25 @@ class TerrainRasterMap:
         self.distance_grid, self.parent_grid = dijkstra_algorithm_with_parent(
             self.occupancy_grid, self.grid_size, tuple(goal_grid_pos), connectivity, self.resolution
         )
+
+    def compute_cost_aware_distance_to_goal(self, goal_world_pos, connectivity=26, safe_margin=0.6, alpha=20.0):
+        """Compute shortest path distances combined with ESDF safety penalty."""
+        # 必须确保 esdf 已经提前计算好了
+        if self.esdf_grid is None:
+            raise ValueError("ESDF grid must be computed before cost-aware Dijkstra. Call compute_esdf() first.")
+
+        self.goal_position = np.array(goal_world_pos)
+        goal_grid_pos = self.world_to_grid(goal_world_pos)
+        
+        # 如果终点恰好在障碍物内，找最近的空余点
+        if self.occupancy_grid[tuple(goal_grid_pos)]:
+            goal_grid_pos = find_nearest_free_space(self.occupancy_grid, self.grid_size, goal_grid_pos)
+        
+        # 调用我们刚写的代价感知 Dijkstra
+        self.distance_grid, self.parent_grid = cost_aware_dijkstra_algorithm_with_parent(
+            self.occupancy_grid, self.grid_size, tuple(goal_grid_pos), connectivity, self.resolution,
+            self.esdf_grid, safe_margin, alpha
+        )
     
     def compute_distance_to_goal_larger_dilation(self, goal_world_pos, connectivity=26, kernel_size=2):
         from scipy.ndimage import binary_dilation
@@ -979,6 +998,70 @@ def dijkstra_algorithm_with_parent(occupancy_grid, grid_size, goal_pos, connecti
     
     return distance_grid.reshape(grid_size), parent_grid.reshape(grid_size)
 
+def cost_aware_dijkstra_algorithm_with_parent(occupancy_grid, grid_size, goal_pos, connectivity, resolution, esdf_grid, safe_margin=0.5, alpha=10.0):
+    """Cost-aware Dijkstra's algorithm penalizing cells close to obstacles using ESDF."""
+    flat_size = np.prod(grid_size)
+    distance_grid = np.full(flat_size, np.inf, dtype=np.float64)
+    parent_grid = np.full(flat_size, -1, dtype=np.int64)
+    visited = np.zeros(flat_size, dtype=bool)
+    
+    def ravel(x, y, z):
+        return x * grid_size[1] * grid_size[2] + y * grid_size[2] + z
+    
+    def unravel(idx):
+        x = idx // (grid_size[1] * grid_size[2])
+        y = (idx % (grid_size[1] * grid_size[2])) // grid_size[2]
+        z = idx % grid_size[2]
+        return x, y, z
+    
+    goal_idx = ravel(*goal_pos)
+    distance_grid[goal_idx] = 0.0
+    parent_grid[goal_idx] = goal_idx
+    heap = [(0.0, goal_idx)]
+    
+    if connectivity == 6:
+        offsets = [(-1,0,0),(1,0,0),(0,-1,0),(0,1,0),(0,0,-1),(0,0,1)]
+        costs = [resolution] * 6
+    else:
+        offsets = [(dx,dy,dz) for dx in [-1,0,1] for dy in [-1,0,1] for dz in [-1,0,1] if not (dx==0 and dy==0 and dz==0)]
+        costs = [np.sqrt(dx*dx+dy*dy+dz*dz)*resolution for dx,dy,dz in offsets]
+    
+    occ_flat = occupancy_grid.ravel()
+    esdf_flat = esdf_grid.ravel()  # 获取展平的 ESDF 数组
+    
+    while heap:
+        min_dist, idx = heapq.heappop(heap)
+        if visited[idx]:
+            continue
+        visited[idx] = True
+        x, y, z = unravel(idx)
+        
+        for i, (dx, dy, dz) in enumerate(offsets):
+            nx, ny, nz = x+dx, y+dy, z+dz
+            if (0 <= nx < grid_size[0] and 0 <= ny < grid_size[1] and 0 <= nz < grid_size[2]):
+                nidx = ravel(nx, ny, nz)
+                if occ_flat[nidx] or visited[nidx]:
+                    continue
+                
+                # ======== 核心修改：注入 ESDF 惩罚 ========
+                esdf_v = esdf_flat[nidx]
+                # 只有当靠近障碍物（小于 safe_margin）时，才施加二次方惩罚
+                if esdf_v > 0 and esdf_v < safe_margin:
+                    safety_penalty = alpha * ((safe_margin - esdf_v) ** 2)
+                else:
+                    safety_penalty = 0.0
+                
+                # 总步长代价 = 几何代价 + 安全惩罚
+                edge_cost = costs[i] + safety_penalty
+                new_distance = min_dist + edge_cost
+                # ==========================================
+                
+                if new_distance < distance_grid[nidx]:
+                    distance_grid[nidx] = new_distance
+                    parent_grid[nidx] = idx
+                    heapq.heappush(heap, (new_distance, nidx))
+    
+    return distance_grid.reshape(grid_size), parent_grid.reshape(grid_size)
 
 def find_nearest_free_space(occupancy_grid, grid_size, occupied_pos):
     """Find nearest free space using BFS."""
