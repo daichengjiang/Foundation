@@ -822,8 +822,8 @@ class QuadcopterEnv(DirectRLEnv):
                         map.compute_esdf()
                         map.compute_cost_aware_distance_to_goal(
                             goal_world_pos=goal, 
-                            safe_margin=0.6, 
-                            alpha=20.0
+                            safe_margin=0.2, 
+                            alpha=10.0
                         )
 
                         if os.path.isdir(self.cfg.grid_path):
