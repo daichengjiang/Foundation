@@ -71,10 +71,15 @@ class PaperPhysControllerTensor:
         # r2 = torch.stack([-d, -d, d, d], dim=1)                 # Pitch
         # r3 = torch.stack([k, -k, k, -k], dim=1)                 # Yaw (Scaled by Thrust)
         # 实物相同
-        r0 = torch.ones(self.num_envs, 4, device=self.device)   # 推力 (Thrust)
-        r1 = torch.stack([-d,  d,  d, -d], dim=1)               # 滚转 (Roll: 左正右负)
-        r2 = torch.stack([ d, -d,  d, -d], dim=1)               # 俯仰 (Pitch: 前正后负)
-        r3 = torch.stack([-k, -k,  k,  k], dim=1)               # 偏航 (Yaw: CW正, CCW负)
+        # r0 = torch.ones(self.num_envs, 4, device=self.device)   # 推力 (Thrust)
+        # r1 = torch.stack([-d,  d,  d, -d], dim=1)               # 滚转 (Roll: 左正右负)
+        # r2 = torch.stack([ d, -d,  d, -d], dim=1)               # 俯仰 (Pitch: 前正后负)
+        # r3 = torch.stack([-k, -k,  k,  k], dim=1)               # 偏航 (Yaw: CW正, CCW负)
+        # 第三版
+        r0 = torch.ones(self.num_envs, 4, device=self.device)   # Thrust (恒为正)
+        r1 = torch.stack([-d,  d,  d, -d], dim=1)                # Roll: 左正右负 (0右, 1左, 2左, 3右)
+        r2 = torch.stack([-d,  d, -d,  d], dim=1)                # Pitch: 后正前负 (0前, 1后, 2前, 3后)
+        r3 = torch.stack([-k, -k,  k,  k], dim=1)                # Yaw: 保持对角线同号 (0和1反号, 2和3同号)
 
         mat = torch.stack([r0, r1, r2, r3], dim=1)
         
