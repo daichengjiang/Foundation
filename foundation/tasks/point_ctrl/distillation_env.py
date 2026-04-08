@@ -391,7 +391,7 @@ class QuadcopterEnv(DirectRLEnv):
         self._figure8_scale_x = 1.0
         self._figure8_scale_y = 0.5
         self._figure8_height = 3.0
-        self._figure8_warmup_duration = 5.0
+        self._figure8_warmup_duration = 50.0
 
         # Logging
         self._episode_sums = {

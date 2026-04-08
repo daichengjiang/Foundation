@@ -156,14 +156,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env_cfg.sim.use_fabric = not args_cli.disable_fabric if args_cli.disable_fabric is not None else env_cfg.sim.use_fabric
 
     # Example dynamics parameters (Modify as needed or keep commented to use defaults)
-    # crazyfile
-    env_cfg.dynamics.mass = 0.027
-    env_cfg.dynamics.arm_length = 0.046
-    env_cfg.dynamics.inertia = (1.657e-5,1.665e-5,2.926e-5)
-    env_cfg.dynamics.thrust_to_weight = 2
-    env_cfg.dynamics.motor_tau_up = 0.06
-    env_cfg.dynamics.motor_tau_down = 0.15
-    env_cfg.dynamics.moment_scale = 0.025
+    # # crazyfile
+    # env_cfg.dynamics.mass = 0.027
+    # env_cfg.dynamics.arm_length = 0.046
+    # env_cfg.dynamics.inertia = (1.657e-5,1.665e-5,2.926e-5)
+    # env_cfg.dynamics.thrust_to_weight = 2
+    # env_cfg.dynamics.motor_tau_up = 0.06
+    # env_cfg.dynamics.motor_tau_down = 0.15
+    # env_cfg.dynamics.moment_scale = 0.025
 
     # x500
     # env_cfg.dynamics.mass = 2
@@ -183,14 +183,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # env_cfg.dynamics.motor_tau_down = 0.15
     # env_cfg.dynamics.moment_scale = 0.025
 
-    # dynamics_dict = [0.153643254847717,0.075243797123877,0.000409381561426928,0.000409381561426928,0.000749987020534131,2.97714411561979,0.0637168711122302,0.062396508781855,0.0190941516379497]
-    # env_cfg.dynamics.mass = dynamics_dict[0]
-    # env_cfg.dynamics.arm_length = dynamics_dict[1]
-    # env_cfg.dynamics.inertia = (dynamics_dict[2], dynamics_dict[3], dynamics_dict[4])
-    # env_cfg.dynamics.thrust_to_weight = dynamics_dict[5]
-    # env_cfg.dynamics.motor_tau_up = dynamics_dict[6]
-    # env_cfg.dynamics.motor_tau_down = dynamics_dict[7]
-    # env_cfg.dynamics.moment_scale = dynamics_dict[8]
+    dynamics_dict = [0.153643254847717,0.075243797123877,0.000409381561426928,0.000409381561426928,0.000749987020534131,2.97714411561979,0.0637168711122302,0.062396508781855,0.0190941516379497]
+    env_cfg.dynamics.mass = dynamics_dict[0]
+    env_cfg.dynamics.arm_length = dynamics_dict[1]
+    env_cfg.dynamics.inertia = (dynamics_dict[2], dynamics_dict[3], dynamics_dict[4])
+    env_cfg.dynamics.thrust_to_weight = dynamics_dict[5]
+    env_cfg.dynamics.motor_tau_up = dynamics_dict[6]
+    env_cfg.dynamics.motor_tau_down = dynamics_dict[7]
+    env_cfg.dynamics.moment_scale = dynamics_dict[8]
 
     # get checkpoint path
     checkpoint_path = retrieve_file_path(args_cli.checkpoint)
@@ -306,7 +306,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         'desired_yaw': [], 
         'actual_yaw': [],
         'actions': [],
-        'timestamps': []
+        'timestamps': [],
+        'hidden_states': []
     }
     
     print(f"\n{'=' * 80}")
@@ -333,6 +334,18 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             desired_vel = env.unwrapped.vel_des.clone()
             
             actions = policy(obs)
+
+            # --- [新增] 提取隐状态 ---
+            # GRU 的 hidden_state 形状是 (num_layers, num_envs, hidden_dim)
+            h_state = policy_model.get_hidden_states()
+            if h_state is not None:
+                # 压缩掉 num_layers 维度，得到 (num_envs, hidden_dim)
+                h_current = h_state.squeeze(0).detach().cpu().numpy()
+            else:
+                # 极少数初始化情况下的 fallback
+                h_current = np.zeros((env.num_envs, policy_model.rnn_hidden_dim))
+            # ------------------------
+
             obs, rewards, dones, extras = env.step(actions)
 
             if hasattr(policy_model, "reset"):
@@ -376,6 +389,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 trajectory_data['timestamps'].append(timestep * dt)
                 trajectory_data['desired_yaw'].append(env.unwrapped.yaw_des[0].cpu().numpy())
                 trajectory_data['actual_yaw'].append(yaw_curr[0].cpu().numpy())
+                trajectory_data['hidden_states'].append(h_current[0])
                         
             timestep += 1
             
@@ -456,6 +470,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                  actual_yaw=np.array(trajectory_data['actual_yaw']),   # [新增]
                  actions=np.array(trajectory_data['actions']),
                  timestamps=np.array(trajectory_data['timestamps']),
+                 hidden_states=np.array(trajectory_data['hidden_states']),
                  # Save calculated metrics and the start step used
                  metrics=np.array([rmse_final, rmse_xy_final, max_velocity_observed, STATS_START_STEP]))
         print(f"Trajectory data saved to: {traj_file}")
