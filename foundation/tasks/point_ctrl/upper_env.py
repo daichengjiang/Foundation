@@ -558,12 +558,9 @@ class QuadcopterEnv(DirectRLEnv):
 
         self._last_lower_actions = torch.zeros(self.num_envs, self.cfg.student_action_space, device=self.device)
 
-        self.motor_alpha_up = self.step_dt / (self.step_dt + self.motor_tau_up_tensor) # 使用从CSV加载的张量
-        self.motor_alpha_down = self.step_dt / (self.step_dt + self.motor_tau_down_tensor)
-        # self.motor_alpha_up = self.step_dt / (self.step_dt + self.cfg.motor_tau_up)
-        # self.motor_alpha_down = self.step_dt / (self.step_dt + self.cfg.motor_tau_down)  
-        # self.motor_alpha_up = self.step_dt / (self.step_dt + 0.05)
-        # self.motor_alpha_down = self.step_dt / (self.step_dt + 0.10)  
+        self.motor_alpha_up = self.dt / torch.clamp(self.motor_tau_up_tensor, min=1e-6)
+        self.motor_alpha_down = self.dt / torch.clamp(self.motor_tau_down_tensor, min=1e-6)
+ 
         # [新增] 初始化当前实际电机转速 (0-1 归一化)
         self._current_motor_speeds = torch.zeros(self.num_envs, 4, device=self.device)
 
@@ -903,7 +900,8 @@ class QuadcopterEnv(DirectRLEnv):
         )
         
         # 一阶低通滤波更新实际转速
-        self._current_motor_speeds = alpha * target_motor_speeds + (1.0 - alpha) * self._current_motor_speeds
+        self._current_motor_speeds = self._current_motor_speeds + alpha * (target_motor_speeds - self._current_motor_speeds)
+        self._current_motor_speeds = torch.clamp(self._current_motor_speeds, 0.0, 1.0)
 
         # 6. 更新动作记忆 (用于下一帧的观测)
         self._last_lower_actions = torch.clamp(student_raw_actions, -1.0, 1.0).clone()

@@ -258,8 +258,8 @@ class QuadcopterEnv(DirectRLEnv):
         if self.motor_tau_down_tensor.shape != (self.num_envs, 1):
              self.motor_tau_down_tensor = self.motor_tau_down_tensor.view(self.num_envs, 1)
              
-        self.motor_alpha_up = self.dt / (self.dt + self.motor_tau_up_tensor)
-        self.motor_alpha_down = self.dt / (self.dt + self.motor_tau_down_tensor)
+        self.motor_alpha_up = self.dt / torch.clamp(self.motor_tau_up_tensor, min=1e-6)
+        self.motor_alpha_down = self.dt / torch.clamp(self.motor_tau_down_tensor, min=1e-6)
 
         self._current_motor_speeds = torch.zeros(self.num_envs, 4, device=self.device)
 
@@ -669,7 +669,8 @@ class QuadcopterEnv(DirectRLEnv):
         target = action_norm
         current = self._current_motor_speeds
         alpha = torch.where(target > current, self.motor_alpha_up, self.motor_alpha_down)
-        self._current_motor_speeds = alpha * target + (1.0 - alpha) * current
+        self._current_motor_speeds = current + alpha * (target - current)
+        self._current_motor_speeds = torch.clamp(self._current_motor_speeds, 0.0, 1.0)
 
         force_b, torque_b = self._controller.motor_speeds_to_wrench(self._current_motor_speeds)
         
