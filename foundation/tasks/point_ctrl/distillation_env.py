@@ -791,6 +791,51 @@ class QuadcopterEnv(DirectRLEnv):
         # 计算力与力矩
         force_b, torque_b = self._controller.motor_speeds_to_wrench(self._current_motor_speeds) 
 
+        # # ================= [新增：卸桨平放/完美悬停 Debug 实验] =================
+        # if self.cfg.trajectory_type == "figure8":
+        #     current_t = self._figure8_time[0].item()
+        #     if current_t < self._figure8_warmup_duration:
+        #         # 1. 打印你想看的 motor speeds (也就是卸桨平放时，电机的期望转速)
+        #         step_count = int(current_t / self.dt)
+        #         if step_count % 1 == 0:
+        #             print(f"[Desk Test {current_t:.2f}s] Env 0 motor speeds: {self._current_motor_speeds[0].cpu().numpy()}")
+        #             print(f"[Desk Test {current_t:.2f}s] Env 0 target actions: {action_setpoint_normalized[0].cpu().numpy()}")
+                
+        #         # 2. 物理断开：不论策略输出什么力矩和推力，全设为 0
+        #         force_b = torch.zeros_like(force_b)
+        #         torque_b = torch.zeros_like(torque_b)
+                
+        #         # 施加一个完美的抗重力 (假设 Z 轴朝上，重力加速度为 9.81)
+        #         # 这样物理引擎里它就不会往下掉
+        #         force_b[:, 2] = self.mass_tensor * 9.81
+                
+        #         # 3. 强行锁死状态：防止物理引擎由于浮点数误差产生任何微小漂移
+        #         env_ids = torch.arange(self.num_envs, device=self.device)
+                
+        #         # ================= [修改：构造右前方倾斜的姿态] =================
+        #         # 右前倾斜：相当于同时产生 Roll (右倾) 和 Pitch (前倾) 
+        #         # 假设设定倾斜角为 15 度
+        #         tilt_deg = 0.0
+        #         roll_angle = math.radians(-tilt_deg)   # 正值通常为右倾
+        #         pitch_angle = math.radians(tilt_deg)  # 正值通常为前倾
+                
+        #         roll_t = torch.full((self.num_envs,), roll_angle, device=self.device)
+        #         pitch_t = torch.full((self.num_envs,), pitch_angle, device=self.device)
+        #         yaw_t = torch.full((self.num_envs,), math.radians(0.0), device=self.device)
+                
+        #         # 利用现成的工具函数生成四元数
+        #         tilted_quat = quat_from_euler_xyz(roll_t, pitch_t, yaw_t)
+                
+        #         # 拼装固定位姿
+        #         fixed_pose = torch.cat([self.pos_des, tilted_quat], dim=-1)
+        #         # ==============================================================
+        #         fixed_vel = torch.zeros(self.num_envs, 6, device=self.device)
+                
+        #         # 每一步都把位置锁死在期望悬停点，速度全部清零
+        #         self._robot.write_root_pose_to_sim(fixed_pose, env_ids)
+        #         self._robot.write_root_velocity_to_sim(fixed_vel, env_ids)
+        # # ======================================================================
+
         # 5. 施加力
         self._forces.zero_()
         self._torques.zero_()
@@ -873,6 +918,49 @@ class QuadcopterEnv(DirectRLEnv):
         obs_teacher = self.CHECK_NAN(obs_teacher, "Teacher Observation")
         obs_student = self.CHECK_NAN(obs_student, "Student Observation")
         
+        # # ================= [新增：注入实物左前倾斜的真实日志数据] =================
+        # if self.cfg.trajectory_type == "figure8":
+        #     current_t = self._figure8_time[0].item()
+        #     if current_t < self._figure8_warmup_duration:
+        #         ideal_obs = torch.zeros_like(obs_student)
+                
+        #         # 1. Pos Err (B)
+        #         ideal_obs[:, 0:3] = torch.tensor([0.0067, -0.0247, -0.0512], device=self.device)
+                
+        #         # 2. Rotation Matrix
+        #         ideal_obs[:, 3:12] = torch.tensor([0.9993, -0.0053, 0.0363, 0.0061, 0.9998, -0.0214, -0.0362, 0.0216, 0.9991], device=self.device)
+                
+        #         # 3. Vel Err (B)
+        #         ideal_obs[:, 12:15] = torch.tensor([0.0232, 0.2497, 0.8012], device=self.device)
+                
+        #         # 4. Ang Vel
+        #         ideal_obs[:, 15:18] = torch.tensor([-0.0054, -0.0577, 0.0072], device=self.device)
+                
+        #         # 5. Last Act
+        #         # 这里我们保持闭环 (使用 self._last_actions)，以便观察电机转速会收敛到什么状态去救机。
+        #         # 如果你想严格测试网络面对上一帧确切动作时的"单步推理结果"，可以把下面那行解开注释：
+        #         ideal_obs[:, 18:22] = self._last_actions 
+        #         # ideal_obs[:, 18:22] = torch.tensor([-0.58, -1.00, -0.97, -0.81], device=self.device)
+                
+        #         # 6. Yaw Err Sin/Cos
+        #         ideal_obs[:, 22] = 0.0007
+        #         ideal_obs[:, 23] = 0.9999
+                
+        #         # 覆写真实观测
+        #         obs_student = ideal_obs
+
+        #         # 打印确认
+        #         step_count = int(current_t / self.dt)
+        #         if step_count % 50 == 0:
+        #             import numpy as np
+        #             np_set_printoptions = np.get_printoptions()
+        #             np.set_printoptions(precision=4, suppress=True)
+        #             print(f"\n--- [Desk Test {current_t:.2f}s] Env 0 FORCED REAL LOG Obs ---")
+        #             print(f"Forced Obs array: {obs_student[0].cpu().numpy()}")
+        #             print(f"--------------------------------------------------")
+        #             np.set_printoptions(**np_set_printoptions)
+        # # =========================================================================
+        # print("obs_student:", obs_student[0].cpu().numpy())        
         return {"policy": obs_student, "teacher": obs_teacher, "rnd_state": obs_student}
     def _get_rewards(self) -> torch.Tensor:
 

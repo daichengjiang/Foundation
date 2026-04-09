@@ -132,6 +132,11 @@ class LowerActorDeployWrapper(nn.Module):
         # 6. 安全限幅
         actions = torch.clamp(actions_mean, -1.0, 1.0)
         return actions
+
+    @torch.jit.export
+    def reset(self):
+        """清空 RNN 隐状态，防止实机部署时产生历史记忆毒化"""
+        self.hidden_state = torch.zeros_like(self.hidden_state)
 # =========================================================================
 
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
