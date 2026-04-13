@@ -316,6 +316,18 @@ class QuadcopterEnv(DirectRLEnv):
 
         # Store the robot mass for reference (e.g. wind force calculation if added later)
         self._robot_mass = self.mass_tensor 
+        
+# ==    ========================================
+        # [修改] 1a. 初始化重心位置随机化 Tensor (按臂长自适应，三轴独立)
+        # ==========================================
+        # 设置 X, Y, Z 三轴的独立偏移比例
+        com_ratios = torch.tensor([0.20, 0.10, 0.10], device=self.device)
+        
+        # 计算最大偏移量，形状会自动广播为 (num_envs, 3)
+        max_com_offset = self.arm_l_tensor.unsqueeze(1) * com_ratios
+        
+        # 生成 [-1, 1] 范围的随机偏移，并对应乘上各自轴的最大允许偏移量
+        self.com_tensor = (torch.rand(self.num_envs, 3, device=self.device) * 2.0 - 1.0) * max_com_offset
         self.dt = self.cfg.sim.dt
 
         # if self.motor_tau.shape != (self.num_envs, 1):
@@ -743,9 +755,16 @@ class QuadcopterEnv(DirectRLEnv):
             # 1. 修改质量
             prims_utils.set_prim_property(body_path, "physics:mass", mass_val)
             # 2. 修改惯性张量 (Isaac Sim 接受 (Ixx, Iyy, Izz) 对角形式)
-            prims_utils.set_prim_property(body_path, "physics:diagonalInertia", inertia_val)
-            # 3. 强制重心
-            prims_utils.set_prim_property(body_path, "physics:centerOfMass", (0.0, 0.0, 0.0))
+            # prims_utils.set_prim_property(body_path, "physics:diagonalInertia", inertia_val)
+            # # 3. 强制重心
+            # prims_utils.set_prim_property(body_path, "physics:centerOfMass", (0.0, 0.0, 0.0))
+
+            # ==========================================
+            # [修改] 1b. 应用各个环境独立的随机重心
+            # 之前是: prims_utils.set_prim_property(body_path, "physics:centerOfMass", (0.0, 0.0, 0.0))
+            # ==========================================
+            com_val = tuple(self.com_tensor[i].tolist())
+            prims_utils.set_prim_property(body_path, "physics:centerOfMass", com_val)
 
             # --- 设置可见性 ---
             if self.cfg.robot_vis:
@@ -1061,9 +1080,24 @@ class QuadcopterEnv(DirectRLEnv):
         self._robot.reset(env_ids)
         super()._reset_idx(env_ids)
 
-        # 清除动作和物理标志位
+        # # 清除动作和物理标志位
         self._actions[env_ids] = 0.0
-        self._last_actions[env_ids] = 0.0
+        # [修改] 2. last_action 改为推重比的倒数
+        # 根据你 _pre_physics_step 中的逻辑：action_setpoint = (action + 1) * 0.5
+        # 悬停所需的绝对油门比例是 1.0 / TWR。
+        # 为了让 last_action 处于神经网络的 [-1, 1] 动作空间内，需要反推：action = (1 / TWR) * 2 - 1
+        # ==========================================
+        twr_inv = 1.0 / self.twr_tensor[env_ids]
+        
+        # 如果你希望直接填入绝对值 [0, 1] 范围的倒数：
+        # self._last_actions[env_ids] = twr_inv.unsqueeze(1).expand(-1, 4).clone()
+        
+        # 如果你希望它匹配模型在 [-1, 1] 空间的初始悬停动作（强烈建议）：
+        hover_action = twr_inv * 2.0 - 1.0 
+        self._last_actions[env_ids] = hover_action.unsqueeze(1).expand(-1, 4).clone()
+
+
+        # self._last_actions[env_ids] = 0.0
         self._forces[env_ids] = 0.0
         self._torques[env_ids] = 0.0
         self._numerical_is_unstable[env_ids] = False
