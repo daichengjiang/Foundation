@@ -317,17 +317,6 @@ class QuadcopterEnv(DirectRLEnv):
         # Store the robot mass for reference (e.g. wind force calculation if added later)
         self._robot_mass = self.mass_tensor 
         
-# ==    ========================================
-        # [修改] 1a. 初始化重心位置随机化 Tensor (按臂长自适应，三轴独立)
-        # ==========================================
-        # 设置 X, Y, Z 三轴的独立偏移比例
-        com_ratios = torch.tensor([0.20, 0.10, 0.10], device=self.device)
-        
-        # 计算最大偏移量，形状会自动广播为 (num_envs, 3)
-        max_com_offset = self.arm_l_tensor.unsqueeze(1) * com_ratios
-        
-        # 生成 [-1, 1] 范围的随机偏移，并对应乘上各自轴的最大允许偏移量
-        self.com_tensor = (torch.rand(self.num_envs, 3, device=self.device) * 2.0 - 1.0) * max_com_offset
         self.dt = self.cfg.sim.dt
 
         # if self.motor_tau.shape != (self.num_envs, 1):
@@ -734,6 +723,10 @@ class QuadcopterEnv(DirectRLEnv):
         else:
             print("Applying single teacher params...")
 
+        # [新增] 在 _setup_scene 中初始化 com_tensor，保障生命周期安全
+        self.com_tensor = torch.zeros(self.num_envs, 3, device=self.device)
+        com_ratios = torch.tensor([0.50, 0.5, 0.5], device=self.device)
+
         # 遍历所有环境，修改底层 USD/PhysX 属性
         for i, prim_path in enumerate(robot_prims):
             body_path = f"{prim_path}/body"
@@ -747,23 +740,30 @@ class QuadcopterEnv(DirectRLEnv):
                 
                 mass_val = params['mass']
                 inertia_val = params['inertia']
+                arm_l_val = params['arm_length']
             else:
                 mass_val = self.cfg.dynamics.mass
                 inertia_val = self.cfg.dynamics.inertia
+                arm_l_val = self.cfg.dynamics.arm_length
             
+            # ==========================================
+            # [修改] 1b. 实时计算该环境独立的随机重心偏移
+            # ==========================================
+            # 生成 [-1, 1] 的随机偏移并乘上比例和对应环境的真实臂长
+            rand_offset = (torch.rand(3, device=self.device) * 2.0 - 1.0) * com_ratios * arm_l_val
+            # rand_offset = 0.8 * com_ratios * arm_l_val
+            self.com_tensor[i] = rand_offset  # 保存回 tensor 供后续可能的计算使用
+
             # --- 将配置写入底层 PhysX ---
             # 1. 修改质量
             prims_utils.set_prim_property(body_path, "physics:mass", mass_val)
             # 2. 修改惯性张量 (Isaac Sim 接受 (Ixx, Iyy, Izz) 对角形式)
-            # prims_utils.set_prim_property(body_path, "physics:diagonalInertia", inertia_val)
+            prims_utils.set_prim_property(body_path, "physics:diagonalInertia", inertia_val)
             # # 3. 强制重心
             # prims_utils.set_prim_property(body_path, "physics:centerOfMass", (0.0, 0.0, 0.0))
 
-            # ==========================================
-            # [修改] 1b. 应用各个环境独立的随机重心
-            # 之前是: prims_utils.set_prim_property(body_path, "physics:centerOfMass", (0.0, 0.0, 0.0))
-            # ==========================================
-            com_val = tuple(self.com_tensor[i].tolist())
+            # 3. 应用随机重心
+            com_val = tuple(rand_offset.tolist())
             prims_utils.set_prim_property(body_path, "physics:centerOfMass", com_val)
 
             # --- 设置可见性 ---
@@ -775,7 +775,9 @@ class QuadcopterEnv(DirectRLEnv):
             # --- 抽样检查 (Read-back Verification) ---
             if i == 0 or (has_multi_teachers and i % envs_per_teacher == 0 and i < self.num_envs):
                 actual_mass_usd = prims_utils.get_prim_property(body_path, "physics:mass")
+                actual_com_usd = prims_utils.get_prim_property(body_path, "physics:centerOfMass") # 直接从 PhysX 读回
                 print(f"[Env {i}] Teacher ID: {t_id if has_multi_teachers else 0} | Set Mass: {mass_val:.4f} | PhysX Read: {actual_mass_usd:.4f}")
+                print(f"[Env {i}] Tensor COM: {self.com_tensor[i].cpu().numpy()} | PhysX COM Read: {actual_com_usd}")
 
         print(f"{'='*60}\n")
         # ================= [DEBUG END] =================
@@ -802,6 +804,65 @@ class QuadcopterEnv(DirectRLEnv):
 
         # 计算力与力矩
         force_b, torque_b = self._controller.motor_speeds_to_wrench(self._current_motor_speeds) 
+        
+        # ================= [新增：风阻与空气动力学阻力 (Aerodynamic Drag)] =================
+        # 1. 获取当前无人机的速度和姿态
+        lin_vel_w = self._robot.data.root_lin_vel_w  # 世界系线速度 (N, 3)
+        ang_vel_b = self._robot.data.root_ang_vel_b  # 机体系角速度 (N, 3)
+        quat_w = self._robot.data.root_quat_w        # 世界系姿态四元数 (N, 4)
+
+        # 2. 坐标转换矩阵 (World -> Body)
+        rot_matrix_b2w = matrix_from_quat(quat_w)
+        rot_matrix_w2b = rot_matrix_b2w.transpose(1, 2) 
+
+        # 3. 设置环境风速 (世界坐标系)
+        wind_vel_w = torch.zeros_like(lin_vel_w)
+        # wind_vel_w[:, 0] = 1.5  # 假设有 1.5m/s 的 X 轴阵风
+
+        # 4. 计算相对于空气的线速度，并转换到机体系
+        rel_lin_vel_w = lin_vel_w - wind_vel_w
+        rel_lin_vel_b = torch.bmm(rot_matrix_w2b, rel_lin_vel_w.unsqueeze(-1)).squeeze(-1)
+
+        # 5. 定义阻力系数 (Drag Coefficients)
+        # c_drag_lin = torch.tensor([0.005, 0.005, 0.008], device=self.device)
+        # c_drag_ang = torch.tensor([0.0001, 0.0001, 0.0003], device=self.device)
+
+        c_drag_lin = torch.tensor([0, 0, 0], device=self.device)
+        c_drag_ang = torch.tensor([0, 0, 0], device=self.device)
+
+        # 6. 计算气动阻力与阻力矩
+        force_drag_b = -c_drag_lin * rel_lin_vel_b
+        torque_drag_b = -c_drag_ang * ang_vel_b
+
+        # -------------------------------------------------------------------------
+        # [新增 DEBUG] 7. 计算并打印风阻带来的额外线加速度和角加速度
+        # -------------------------------------------------------------------------
+        # 线加速度 = 力 / 质量 (注意维度对齐)
+        acc_drag_b = force_drag_b / self.mass_tensor.unsqueeze(-1)
+        
+        # 角加速度 = 力矩 / 惯性张量 (因为 inertia 是对角阵，直接元素级相除即可)
+        ang_acc_drag_b = torque_drag_b / self.inertia_tensor
+
+        # 限制打印频率 (例如每 50 步，即 0.5秒 打印一次 Env 0 的状态)
+        if hasattr(self, "_figure8_time"):
+            step_count = int(self._figure8_time[0].item() / self.dt)
+            if step_count % 50 == 0:
+                import numpy as np
+                np_set_printoptions = np.get_printoptions()
+                np.set_printoptions(precision=4, suppress=True) # 设置打印精度
+                print(f"\n--- [Wind Drag Debug {self._figure8_time[0].item():.2f}s] Env 0 ---")
+                print(f"Rel Vel (Body)      : {rel_lin_vel_b[0].cpu().numpy()} m/s")
+                print(f"Force Drag (N)      : {force_drag_b[0].cpu().numpy()}")
+                print(f"Added Lin Acc       : {acc_drag_b[0].cpu().numpy()} m/s^2")
+                print(f"Added Ang Acc       : {ang_acc_drag_b[0].cpu().numpy()} rad/s^2")
+                print(f"--------------------------------------------------")
+                np.set_printoptions(**np_set_printoptions)
+        # -------------------------------------------------------------------------
+
+        # 8. 将阻力叠加到电机的原始输出上
+        force_b = force_b + force_drag_b
+        torque_b = torque_b + torque_drag_b
+        # ========================================================================= 
 
         # # ================= [新增：卸桨平放/完美悬停 Debug 实验] =================
         # if self.cfg.trajectory_type == "figure8":
@@ -1082,20 +1143,16 @@ class QuadcopterEnv(DirectRLEnv):
 
         # # 清除动作和物理标志位
         self._actions[env_ids] = 0.0
-        # [修改] 2. last_action 改为推重比的倒数
-        # 根据你 _pre_physics_step 中的逻辑：action_setpoint = (action + 1) * 0.5
-        # 悬停所需的绝对油门比例是 1.0 / TWR。
-        # 为了让 last_action 处于神经网络的 [-1, 1] 动作空间内，需要反推：action = (1 / TWR) * 2 - 1
         # ==========================================
-        twr_inv = 1.0 / self.twr_tensor[env_ids]
+        # [修改] 2. last_action 改为推重比倒数的平方根，再映射到 [-1, 1]
+        # 推力与电机转速的平方成正比 (Thrust ∝ ω^2)
+        # 悬停所需的电机转速比例 ω = sqrt(1.0 / TWR)
+        # ==========================================
+        hover_motor_speed = torch.sqrt(1.0 / self.twr_tensor[env_ids])
         
-        # 如果你希望直接填入绝对值 [0, 1] 范围的倒数：
-        # self._last_actions[env_ids] = twr_inv.unsqueeze(1).expand(-1, 4).clone()
-        
-        # 如果你希望它匹配模型在 [-1, 1] 空间的初始悬停动作（强烈建议）：
-        hover_action = twr_inv * 2.0 - 1.0 
+        # 将 [0, 1] 的电机转速映射到神经网络的 [-1, 1] 动作空间
+        hover_action = hover_motor_speed * 2.0 - 1.0 
         self._last_actions[env_ids] = hover_action.unsqueeze(1).expand(-1, 4).clone()
-
 
         # self._last_actions[env_ids] = 0.0
         self._forces[env_ids] = 0.0
@@ -1129,7 +1186,7 @@ class QuadcopterEnv(DirectRLEnv):
                 return direction * r
 
             pos_offset = sample_in_sphere(3.0 * l_arm, num_resets)
-            lin_vel = sample_in_sphere(0.5, num_resets)
+            lin_vel = sample_in_sphere(1.0, num_resets)
             ang_vel = sample_in_sphere(0.5, num_resets)
             
             roll = (torch.rand(num_resets, device=self.device) * 2 - 1) * (math.pi / 8)
@@ -1153,6 +1210,10 @@ class QuadcopterEnv(DirectRLEnv):
             quat = torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device).repeat(num_resets, 1)
             self.yaw_des[env_ids] = 0.0
             self.yaw_rate_des[env_ids] = 0.0
+        print("pos_offset sample:", pos_offset[0].cpu().numpy())
+        print("lin_vel sample:", lin_vel[0].cpu().numpy())
+        print("ang_vel sample:", ang_vel[0].cpu().numpy())
+        print("quat sample:", quat[0].cpu().numpy())
 
         # --- 3. 根据采样结果同步初始化 Buffer 和期望值 ---
         self.pos_des[env_ids] = spawn_center

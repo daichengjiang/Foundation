@@ -57,6 +57,7 @@ import torch.nn as nn      # [新增]
 import copy                # [新增]
 from isaaclab.utils.math import euler_xyz_from_quat
 import numpy as np
+import matplotlib.pyplot as plt
 from datetime import datetime
 
 from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper
@@ -311,6 +312,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         'desired_yaw': [], 
         'actual_yaw': [],
         'actions': [],
+        'filtered_actions': [],
         'timestamps': [],
         'hidden_states': []
     }
@@ -330,6 +332,17 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     total_squared_error_pos_xy = 0.0
     max_velocity_observed = 0.0
     total_samples = 0
+
+    # ==========================================================
+    # [新增] 获取 Timeline 接口，并在循环开始前强制暂停
+    # ==========================================================
+    import omni.timeline # 如果你在文件开头已经 import 过，这句可以省略
+    timeline = omni.timeline.get_timeline_interface()
+    
+    print("[INFO] 环境加载完毕。已强制暂停仿真。")
+    print("[INFO] 👉 请在 Isaac Sim 窗口中调整视角，准备好后按下【空格键】开始运行！")
+    timeline.pause() # 强制暂停
+    # ==========================================================
 
     while simulation_app.is_running() and timestep < args_cli.max_steps:
         step_start_time = time.time()
@@ -391,6 +404,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 trajectory_data['desired_vel'].append(desired_vel[0].cpu().numpy())
                 trajectory_data['actual_vel'].append(current_vel[0].cpu().numpy())
                 trajectory_data['actions'].append(actions[0].cpu().numpy())
+                trajectory_data['filtered_actions'].append(env.unwrapped._current_motor_speeds[0].cpu().numpy())
                 trajectory_data['timestamps'].append(timestep * dt)
                 trajectory_data['desired_yaw'].append(env.unwrapped.yaw_des[0].cpu().numpy())
                 trajectory_data['actual_yaw'].append(yaw_curr[0].cpu().numpy())
@@ -466,6 +480,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     
     if args_cli.save_trajectory and len(trajectory_data['timestamps']) > 0:
         traj_file = os.path.join(log_dir, "trajectory_data.npz")
+
+        timestamps = np.array(trajectory_data['timestamps'])
+        raw_actions_arr = np.array(trajectory_data['actions'])
+        filtered_actions_arr = np.array(trajectory_data['filtered_actions'])
         np.savez(traj_file,
                  desired_pos=np.array(trajectory_data['desired_pos']),
                  actual_pos=np.array(trajectory_data['actual_pos']),
@@ -479,6 +497,41 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                  # Save calculated metrics and the start step used
                  metrics=np.array([rmse_final, rmse_xy_final, max_velocity_observed, STATS_START_STEP]))
         print(f"Trajectory data saved to: {traj_file}")
+
+        # --- [新增] 仅提取前 10 秒的数据 ---
+        time_mask = timestamps <= 90.0
+        t_plot = timestamps[time_mask]
+        # 将网络原始输出 [-1, 1] 映射到目标转速 [0, 1]
+        target_plot = (np.clip(raw_actions_arr[time_mask], -1.0, 1.0) + 1.0) * 0.5
+        filtered_plot = filtered_actions_arr[time_mask]
+
+        # --- [修改] 创建交互式绘图窗口 ---
+        print("[INFO] Opening interactive plot for first 10 seconds...")
+        fig, axs = plt.subplots(4, 1, figsize=(12, 10), sharex=True)
+        
+        for i in range(4):
+            # 将 linestyle 设置为 'None'，并使用 marker='.' 来打点
+            # markersize 可以控制点的大小
+            axs[i].plot(t_plot, target_plot[:, i], label='Target (Pre-filter)', 
+                        color='red', marker='.', linestyle='None', markersize=4, alpha=0.5)
+            
+            axs[i].plot(t_plot, filtered_plot[:, i], label='Actual (Post-filter)', 
+                        color='blue', marker='.', linestyle='None', markersize=4, alpha=0.8)
+            
+            axs[i].set_ylabel(f'Motor {i+1}')
+            axs[i].legend(loc='upper right')
+            axs[i].grid(True, which='both', linestyle='--', alpha=0.5)
+
+        axs[-1].set_xlabel('Time (s)')
+        plt.suptitle('Motor Command Comparison (First 10s) - Dots Format', fontsize=14)
+        plt.tight_layout()
+        
+        # 保存一张静态图作为备份
+        plt.savefig(os.path.join(log_dir, "motor_filter_10s_dots.png"), dpi=300)
+        
+        # --- [核心] 弹出交互页面 ---
+        # 运行到这一步时会弹出一个窗口，你可以使用工具栏的“放大镜”图标框选区域放大
+        plt.show()
 
     print(f"{'=' * 80}\n")
     env.close()
