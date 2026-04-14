@@ -725,7 +725,7 @@ class QuadcopterEnv(DirectRLEnv):
 
         # [新增] 在 _setup_scene 中初始化 com_tensor，保障生命周期安全
         self.com_tensor = torch.zeros(self.num_envs, 3, device=self.device)
-        com_ratios = torch.tensor([0.50, 0.5, 0.5], device=self.device)
+        com_ratios = torch.tensor([0.20, 0.20, 0.20], device=self.device)
 
         # 遍历所有环境，修改底层 USD/PhysX 属性
         for i, prim_path in enumerate(robot_prims):
@@ -824,11 +824,11 @@ class QuadcopterEnv(DirectRLEnv):
         rel_lin_vel_b = torch.bmm(rot_matrix_w2b, rel_lin_vel_w.unsqueeze(-1)).squeeze(-1)
 
         # 5. 定义阻力系数 (Drag Coefficients)
-        # c_drag_lin = torch.tensor([0.005, 0.005, 0.008], device=self.device)
-        # c_drag_ang = torch.tensor([0.0001, 0.0001, 0.0003], device=self.device)
+        c_drag_lin = torch.tensor([0.005, 0.005, 0.008], device=self.device)
+        c_drag_ang = torch.tensor([0.0001, 0.0001, 0.0003], device=self.device)
 
-        c_drag_lin = torch.tensor([0, 0, 0], device=self.device)
-        c_drag_ang = torch.tensor([0, 0, 0], device=self.device)
+        # c_drag_lin = torch.tensor([0, 0, 0], device=self.device)
+        # c_drag_ang = torch.tensor([0, 0, 0], device=self.device)
 
         # 6. 计算气动阻力与阻力矩
         force_drag_b = -c_drag_lin * rel_lin_vel_b
@@ -1186,7 +1186,7 @@ class QuadcopterEnv(DirectRLEnv):
                 return direction * r
 
             pos_offset = sample_in_sphere(3.0 * l_arm, num_resets)
-            lin_vel = sample_in_sphere(1.0, num_resets)
+            lin_vel = sample_in_sphere(0.5, num_resets)
             ang_vel = sample_in_sphere(0.5, num_resets)
             
             roll = (torch.rand(num_resets, device=self.device) * 2 - 1) * (math.pi / 8)
