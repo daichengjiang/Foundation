@@ -206,3 +206,64 @@ class PaperPhysControllerTensor:
         torque = wrench[:, 1:4]    # Torques
         
         return force, torque
+    
+    # def motor_speeds_to_wrench(self, motor_actions: torch.Tensor) -> tuple:
+    #     # 【修改点】：模拟低电量，最大推力只有满电的 75%
+    #     battery_degradation = 0.75 
+        
+    #     coeff = (self.thrust_to_weight * self.mass * self.gravity / 4.0).unsqueeze(-1)
+    #     # 乘以衰减系数
+    #     motor_thrusts = (coeff * battery_degradation) * (motor_actions ** 2)
+        
+    #     wrench = torch.bmm(self.mat, motor_thrusts.unsqueeze(-1)).squeeze(-1)
+    #     force = torch.zeros(self.num_envs, 3, device=self.device)
+    #     force[:, 2] = wrench[:, 0]
+    #     torque = wrench[:, 1:4]
+    #     return force, torque
+    
+    # def motor_speeds_to_wrench(self, motor_actions: torch.Tensor) -> tuple:
+    #     coeff = (self.thrust_to_weight * self.mass * self.gravity / 4.0).unsqueeze(-1)
+        
+    #     # 【修改点】：不再是完美的平方，加入线性项，或者改变指数
+    #     # 混合模型：40% 线性 + 60% 二次方
+    #     # 注意：这里保证了 motor_actions=1 时，总系数依然是 1
+    #     motor_thrusts = coeff * (0.4 * motor_actions + 0.6 * (motor_actions ** 2))
+        
+    #     # 或者试试这种：
+    #     # motor_thrusts = coeff * (motor_actions ** 1.5)
+        
+    #     wrench = torch.bmm(self.mat, motor_thrusts.unsqueeze(-1)).squeeze(-1)
+    #     force = torch.zeros(self.num_envs, 3, device=self.device)
+    #     force[:, 2] = wrench[:, 0]
+    #     torque = wrench[:, 1:4]
+    #     return force, torque
+    
+    # def motor_speeds_to_wrench(self, motor_actions: torch.Tensor) -> tuple:
+    #     coeff = (self.thrust_to_weight * self.mass * self.gravity / 4.0).unsqueeze(-1)
+    #     motor_thrusts = coeff * (motor_actions ** 2)
+        
+    #     # 【修改点】：模拟 0 号电机（右前）受损，效率只剩 80%
+    #     # 这里用张量操作避免报错，针对所有 env 的第 0 个电机打折
+    #     damage_mask = torch.tensor([0.8, 1.0, 1.0, 1.0], device=self.device)
+    #     motor_thrusts = motor_thrusts * damage_mask
+        
+    #     wrench = torch.bmm(self.mat, motor_thrusts.unsqueeze(-1)).squeeze(-1)
+    #     force = torch.zeros(self.num_envs, 3, device=self.device)
+    #     force[:, 2] = wrench[:, 0]
+    #     torque = wrench[:, 1:4]
+    #     return force, torque
+    
+    # def motor_speeds_to_wrench(self, motor_actions: torch.Tensor) -> tuple:
+    #     coeff = (self.thrust_to_weight * self.mass * self.gravity / 4.0).unsqueeze(-1)
+        
+    #     # 【修改点】：加上死区，低于 0.1 的指令直接归零
+    #     deadband_mask = (motor_actions > 0.1).float()
+    #     real_actions = motor_actions * deadband_mask
+        
+    #     motor_thrusts = coeff * (real_actions ** 2)
+        
+    #     wrench = torch.bmm(self.mat, motor_thrusts.unsqueeze(-1)).squeeze(-1)
+    #     force = torch.zeros(self.num_envs, 3, device=self.device)
+    #     force[:, 2] = wrench[:, 0]
+    #     torque = wrench[:, 1:4]
+    #     return force, torque
