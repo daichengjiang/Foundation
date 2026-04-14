@@ -139,6 +139,12 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
 
     train_or_play: bool = True 
     use_pid = False
+
+    # ================= [新增] 物理干扰开关 =================
+    enable_com_offset: bool = False     # 重心偏移开关
+    enable_aerodynamics: bool = False   # 混合空气动力学风阻开关
+    # ========================================================
+
     # gamma in ppo, only for logging
     gamma = 0.99
 
@@ -330,6 +336,34 @@ class QuadcopterEnv(DirectRLEnv):
              
         self.motor_alpha_up = self.dt / torch.clamp(self.motor_tau_up_tensor, min=1e-6)
         self.motor_alpha_down = self.dt / torch.clamp(self.motor_tau_down_tensor, min=1e-6)
+
+        # ================= [新增] 预计算混合空气动力学参数 =================
+        if self.cfg.enable_aerodynamics:
+            # 1. 线性阻力系数 (Rotor Drag) - 基于时间常数法
+            t_v_xy, t_v_z = 1.5, 1.0
+            self.c_drag_lin = torch.stack([
+                self.mass_tensor / t_v_xy,
+                self.mass_tensor / t_v_xy,
+                self.mass_tensor / t_v_z
+            ], dim=1)
+
+            # 2. 二次方寄生阻力系数 (Parasitic Drag) - 基于质量的近似表面积缩放
+            base_mass = 1.0
+            area_scale = (self.mass_tensor / base_mass) ** (2.0/3.0) 
+            area_xy = 0.02 * area_scale
+            area_z  = 0.08 * area_scale
+            rho_cd_half = 0.5 * 1.225 * 1.1  # 0.5 * rho * Cd
+            
+            self.c_drag_quad = torch.stack([
+                rho_cd_half * area_xy,
+                rho_cd_half * area_xy,
+                rho_cd_half * area_z
+            ], dim=1)
+
+            # 3. 旋转角阻尼系数
+            t_w = 0.1
+            self.c_drag_ang = self.inertia_tensor / t_w
+        # ================================================================
 
         self._current_motor_speeds = torch.zeros(self.num_envs, 4, device=self.device)
 
@@ -747,11 +781,14 @@ class QuadcopterEnv(DirectRLEnv):
                 arm_l_val = self.cfg.dynamics.arm_length
             
             # ==========================================
-            # [修改] 1b. 实时计算该环境独立的随机重心偏移
+            # [修改] 1b. 受 Flag 控制的随机重心偏移
             # ==========================================
-            # 生成 [-1, 1] 的随机偏移并乘上比例和对应环境的真实臂长
-            rand_offset = (torch.rand(3, device=self.device) * 2.0 - 1.0) * com_ratios * arm_l_val
-            # rand_offset = 0.8 * com_ratios * arm_l_val
+            if self.cfg.enable_com_offset:
+                # 生成 [-1, 1] 的随机偏移并乘上比例和对应环境的真实臂长
+                rand_offset = (torch.rand(3, device=self.device) * 2.0 - 1.0) * com_ratios * arm_l_val
+            else:
+                # 关闭偏移时，重心完美居中
+                rand_offset = torch.zeros(3, device=self.device)
             self.com_tensor[i] = rand_offset  # 保存回 tensor 供后续可能的计算使用
 
             # --- 将配置写入底层 PhysX ---
@@ -805,63 +842,79 @@ class QuadcopterEnv(DirectRLEnv):
         # 计算力与力矩
         force_b, torque_b = self._controller.motor_speeds_to_wrench(self._current_motor_speeds) 
         
-        # ================= [新增：风阻与空气动力学阻力 (Aerodynamic Drag)] =================
-        # 1. 获取当前无人机的速度和姿态
-        lin_vel_w = self._robot.data.root_lin_vel_w  # 世界系线速度 (N, 3)
-        ang_vel_b = self._robot.data.root_ang_vel_b  # 机体系角速度 (N, 3)
-        quat_w = self._robot.data.root_quat_w        # 世界系姿态四元数 (N, 4)
+        # ================= [新增] 受 Flag 控制的混合风阻 (Hybrid Drag) =================
+        if self.cfg.enable_aerodynamics:
+            # 1. 相对空速转机体系
+            lin_vel_w = self._robot.data.root_lin_vel_w
+            ang_vel_b = self._robot.data.root_ang_vel_b
+            quat_w = self._robot.data.root_quat_w
+            rot_matrix_b2w = matrix_from_quat(quat_w)
+            rot_matrix_w2b = rot_matrix_b2w.transpose(1, 2) 
+            
+            # 默认无静风。如果想加阵风干扰，可以在此处给 wind_vel_w 加上噪声
+            wind_vel_w = torch.zeros_like(lin_vel_w) 
+            rel_lin_vel_w = lin_vel_w - wind_vel_w
+            rel_lin_vel_b = torch.bmm(rot_matrix_w2b, rel_lin_vel_w.unsqueeze(-1)).squeeze(-1)
 
-        # 2. 坐标转换矩阵 (World -> Body)
-        rot_matrix_b2w = matrix_from_quat(quat_w)
-        rot_matrix_w2b = rot_matrix_b2w.transpose(1, 2) 
+            # 2. 计算总合力与合力矩
+            force_drag_b = -self.c_drag_lin * rel_lin_vel_b - self.c_drag_quad * torch.abs(rel_lin_vel_b) * rel_lin_vel_b
+            torque_drag_b = -self.c_drag_ang * ang_vel_b
 
-        # 3. 设置环境风速 (世界坐标系)
-        wind_vel_w = torch.zeros_like(lin_vel_w)
-        # wind_vel_w[:, 0] = 1.5  # 假设有 1.5m/s 的 X 轴阵风
-
-        # 4. 计算相对于空气的线速度，并转换到机体系
-        rel_lin_vel_w = lin_vel_w - wind_vel_w
-        rel_lin_vel_b = torch.bmm(rot_matrix_w2b, rel_lin_vel_w.unsqueeze(-1)).squeeze(-1)
-
-        # 5. 定义阻力系数 (Drag Coefficients)
-        c_drag_lin = torch.tensor([0.005, 0.005, 0.008], device=self.device)
-        c_drag_ang = torch.tensor([0.0001, 0.0001, 0.0003], device=self.device)
-
-        # c_drag_lin = torch.tensor([0, 0, 0], device=self.device)
-        # c_drag_ang = torch.tensor([0, 0, 0], device=self.device)
-
-        # 6. 计算气动阻力与阻力矩
-        force_drag_b = -c_drag_lin * rel_lin_vel_b
-        torque_drag_b = -c_drag_ang * ang_vel_b
+            # 3. 叠加到电机的原始输出上
+            force_b = force_b + force_drag_b
+            torque_b = torque_b + torque_drag_b
+        # ==============================================================================
 
         # -------------------------------------------------------------------------
-        # [新增 DEBUG] 7. 计算并打印风阻带来的额外线加速度和角加速度
+        # [修改] 独立采样的 DEBUG 打印：根据 Flag 分别打印重心和风阻
         # -------------------------------------------------------------------------
-        # 线加速度 = 力 / 质量 (注意维度对齐)
-        acc_drag_b = force_drag_b / self.mass_tensor.unsqueeze(-1)
-        
-        # 角加速度 = 力矩 / 惯性张量 (因为 inertia 是对角阵，直接元素级相除即可)
-        ang_acc_drag_b = torque_drag_b / self.inertia_tensor
-
-        # 限制打印频率 (例如每 50 步，即 0.5秒 打印一次 Env 0 的状态)
         if hasattr(self, "_figure8_time"):
             step_count = int(self._figure8_time[0].item() / self.dt)
-            if step_count % 50 == 0:
+            
+            # 每 100 步 (即 1.0 秒) 且 至少开启了一个干扰开关时打印
+            if step_count % 100 == 0 and (self.cfg.enable_com_offset or self.cfg.enable_aerodynamics):
                 import numpy as np
                 np_set_printoptions = np.get_printoptions()
-                np.set_printoptions(precision=4, suppress=True) # 设置打印精度
-                print(f"\n--- [Wind Drag Debug {self._figure8_time[0].item():.2f}s] Env 0 ---")
-                print(f"Rel Vel (Body)      : {rel_lin_vel_b[0].cpu().numpy()} m/s")
-                print(f"Force Drag (N)      : {force_drag_b[0].cpu().numpy()}")
-                print(f"Added Lin Acc       : {acc_drag_b[0].cpu().numpy()} m/s^2")
-                print(f"Added Ang Acc       : {ang_acc_drag_b[0].cpu().numpy()} rad/s^2")
-                print(f"--------------------------------------------------")
+                np.set_printoptions(precision=4, suppress=True)
+                
+                print(f"\n{'='*15} [Debug: Env 0 物理状态 @ {self._figure8_time[0].item():.2f}s] {'='*15}")
+                
+                # --- 独立打印 A: 重心位置信息 (受 enable_com_offset 控制) ---
+                if self.cfg.enable_com_offset:
+                    pos_w = self._robot.data.root_pos_w
+                    quat_w = self._robot.data.root_quat_w
+                    # 重新计算旋转矩阵（因为如果风阻没开，上面就不会算）
+                    rot_mat_b2w = matrix_from_quat(quat_w)
+                    
+                    com_local = self.com_tensor[0]
+                    com_offset_w = torch.matmul(rot_mat_b2w[0], com_local)
+                    com_world = pos_w[0] + com_offset_w
+                    
+                    print(f"[*] COM Local Offset (m) : {com_local.cpu().numpy()}")
+                    print(f"[*] Base World Pos (m)   : {pos_w[0].cpu().numpy()}")
+                    print(f"[*] COM World Pos (m)    : {com_world.cpu().numpy()}")
+                    
+                    # 如果下面还要打印风阻，加个分割线
+                    if self.cfg.enable_aerodynamics:
+                        print("-" * 50)
+                
+                # --- 独立打印 B: 风阻加速度信息 (受 enable_aerodynamics 控制) ---
+                if self.cfg.enable_aerodynamics:
+                    # 线加速度 = 力 / 质量
+                    acc_drag_b = force_drag_b[0] / self.mass_tensor[0]
+                    # 角加速度 = 力矩 / 惯性张量
+                    ang_acc_drag_b = torque_drag_b[0] / self.inertia_tensor[0]
+                    
+                    g_force_eq = torch.norm(acc_drag_b).item() / 9.81
+                    
+                    print(f"[*] Rel Airspeed (m/s)   : {rel_lin_vel_b[0].cpu().numpy()}")
+                    print(f"[*] Drag Linear Acc      : {acc_drag_b.cpu().numpy()} m/s^2  (约 {g_force_eq:.3f} G)")
+                    print(f"[*] Drag Angular Acc     : {ang_acc_drag_b.cpu().numpy()} rad/s^2")
+                
+                print("="*60)
                 np.set_printoptions(**np_set_printoptions)
         # -------------------------------------------------------------------------
 
-        # 8. 将阻力叠加到电机的原始输出上
-        force_b = force_b + force_drag_b
-        torque_b = torque_b + torque_drag_b
         # ========================================================================= 
 
         # # ================= [新增：卸桨平放/完美悬停 Debug 实验] =================
