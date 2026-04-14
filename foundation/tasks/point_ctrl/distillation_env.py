@@ -132,6 +132,12 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
 
     history_len = 5
 
+    add_obs_noise: bool = True     # 训练时是否开启加噪
+    noise_std_pos: float = 0.05    # 位置误差噪声 (m)
+    noise_std_rot: float = 0.03    # 姿态矩阵噪声
+    noise_std_vel: float = 0.1    # 速度误差噪声 (m/s)
+    noise_std_ang_vel: float = 0.1 # 角速度噪声 (rad/s)
+
     prob_null_trajectory = 0.0  # 50% 概率做定点控制
 
     # 轨迹类型选择: "langevin" 或 "figure8"
@@ -1040,6 +1046,13 @@ class QuadcopterEnv(DirectRLEnv):
             yaw_error_cos,              # 1 
             self._current_motor_speeds, # 4
         ], dim=-1)
+
+        if self.cfg.add_obs_noise:
+            # 直接在张量的特定切片上加上高斯噪声
+            obs_student[:, 0:3] += torch.randn_like(obs_student[:, 0:3]) * self.cfg.noise_std_pos
+            obs_student[:, 3:12] += torch.randn_like(obs_student[:, 3:12]) * self.cfg.noise_std_rot
+            obs_student[:, 12:15] += torch.randn_like(obs_student[:, 12:15]) * self.cfg.noise_std_vel
+            obs_student[:, 15:18] += torch.randn_like(obs_student[:, 15:18]) * self.cfg.noise_std_ang_vel
 
         obs_teacher = self.CHECK_NAN(obs_teacher, "Teacher Observation")
         obs_student = self.CHECK_NAN(obs_student, "Student Observation")
