@@ -132,10 +132,10 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
 
     history_len = 5
 
-    add_obs_noise: bool = True     # 训练时是否开启加噪
-    noise_std_pos: float = 0.05    # 位置误差噪声 (m)
+    add_obs_noise: bool = False     # 训练时是否开启加噪
+    noise_std_pos: float = 0.02    # 位置误差噪声 (m)
     noise_std_rot: float = 0.03    # 姿态矩阵噪声
-    noise_std_vel: float = 0.1    # 速度误差噪声 (m/s)
+    noise_std_vel: float = 0.04    # 速度误差噪声 (m/s)
     noise_std_ang_vel: float = 0.1 # 角速度噪声 (rad/s)
 
     prob_null_trajectory = 0.0  # 50% 概率做定点控制
@@ -996,8 +996,8 @@ class QuadcopterEnv(DirectRLEnv):
         rot_matrix_w2b = rot_matrix_b2w.transpose(1, 2) 
 
         # yaw角观测
-        _, _, y = euler_xyz_from_quat(quat_w)
-        yaw_error = self.yaw_des - y
+        roll, pitch, yaw = euler_xyz_from_quat(quat_w)
+        yaw_error = self.yaw_des - yaw
         yaw_error = torch.remainder(yaw_error + math.pi, 2 * math.pi) - math.pi
         yaw_error_sin = torch.sin(yaw_error).unsqueeze(1) # (N, 1)
         yaw_error_cos = torch.cos(yaw_error).unsqueeze(1) # (N, 1)
@@ -1047,12 +1047,26 @@ class QuadcopterEnv(DirectRLEnv):
             self._current_motor_speeds, # 4
         ], dim=-1)
 
+        self.extras["clean_obs"] = obs_student.clone()
+
         if self.cfg.add_obs_noise:
             # 直接在张量的特定切片上加上高斯噪声
             obs_student[:, 0:3] += torch.randn_like(obs_student[:, 0:3]) * self.cfg.noise_std_pos
-            obs_student[:, 3:12] += torch.randn_like(obs_student[:, 3:12]) * self.cfg.noise_std_rot
             obs_student[:, 12:15] += torch.randn_like(obs_student[:, 12:15]) * self.cfg.noise_std_vel
             obs_student[:, 15:18] += torch.randn_like(obs_student[:, 15:18]) * self.cfg.noise_std_ang_vel
+            
+            roll_noisy = roll + torch.randn_like(roll) * self.cfg.noise_std_rot
+            pitch_noisy = pitch + torch.randn_like(pitch) * self.cfg.noise_std_rot
+            yaw_noisy = yaw + torch.randn_like(yaw) * self.cfg.noise_std_rot
+            noisy_quat = quat_from_euler_xyz(roll_noisy, pitch_noisy, yaw_noisy)
+            rot_matrix_noisy = matrix_from_quat(noisy_quat)
+            rot_flat_noisy = rot_matrix_noisy.reshape(self.num_envs, 9)
+            obs_student[:, 3:12] = rot_flat_noisy
+
+            noisy_yaw_error = self.yaw_des - yaw_noisy
+            noisy_yaw_error = torch.remainder(noisy_yaw_error + math.pi, 2 * math.pi) - math.pi
+            obs_student[:, 22] = torch.sin(noisy_yaw_error)
+            obs_student[:, 23] = torch.cos(noisy_yaw_error)
 
         obs_teacher = self.CHECK_NAN(obs_teacher, "Teacher Observation")
         obs_student = self.CHECK_NAN(obs_student, "Student Observation")
@@ -1276,10 +1290,10 @@ class QuadcopterEnv(DirectRLEnv):
             quat = torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device).repeat(num_resets, 1)
             self.yaw_des[env_ids] = 0.0
             self.yaw_rate_des[env_ids] = 0.0
-        print("pos_offset sample:", pos_offset[0].cpu().numpy())
-        print("lin_vel sample:", lin_vel[0].cpu().numpy())
-        print("ang_vel sample:", ang_vel[0].cpu().numpy())
-        print("quat sample:", quat[0].cpu().numpy())
+        # print("pos_offset sample:", pos_offset[0].cpu().numpy())
+        # print("lin_vel sample:", lin_vel[0].cpu().numpy())
+        # print("ang_vel sample:", ang_vel[0].cpu().numpy())
+        # print("quat sample:", quat[0].cpu().numpy())
 
         # --- 3. 根据采样结果同步初始化 Buffer 和期望值 ---
         self.pos_des[env_ids] = spawn_center

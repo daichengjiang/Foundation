@@ -314,7 +314,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         'actions': [],
         'filtered_actions': [],
         'timestamps': [],
-        'hidden_states': []
+        'hidden_states': [],
+        'obs_clean': [],  # [新增] 干净的观测
+        'obs_noisy': []   # [新增] 带噪声的观测
     }
     
     print(f"\n{'=' * 80}")
@@ -409,6 +411,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 trajectory_data['desired_yaw'].append(env.unwrapped.yaw_des[0].cpu().numpy())
                 trajectory_data['actual_yaw'].append(yaw_curr[0].cpu().numpy())
                 trajectory_data['hidden_states'].append(h_current[0])
+                clean_obs = env.unwrapped.extras["clean_obs"]
+                trajectory_data['obs_clean'].append(clean_obs[0].cpu().numpy())
+                trajectory_data['obs_noisy'].append(obs[0].cpu().numpy()) # obs 是环境直接返回的带噪观测
                         
             timestep += 1
             
@@ -499,7 +504,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         print(f"Trajectory data saved to: {traj_file}")
 
         # --- [新增] 仅提取前 10 秒的数据 ---
-        time_mask = timestamps <= 90.0
+        time_mask = timestamps <= 10.0
         t_plot = timestamps[time_mask]
         # 将网络原始输出 [-1, 1] 映射到目标转速 [0, 1]
         target_plot = (np.clip(raw_actions_arr[time_mask], -1.0, 1.0) + 1.0) * 0.5
@@ -528,6 +533,43 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         
         # 保存一张静态图作为备份
         plt.savefig(os.path.join(log_dir, "motor_filter_10s_dots.png"), dpi=300)
+
+        print("[INFO] Generating Observation Comparison plots...")
+        clean_arr = np.array(trajectory_data['obs_clean'])
+        noisy_arr = np.array(trajectory_data['obs_noisy'])
+        
+        fig_obs, axs_obs = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
+        
+        # 为了对比清晰，每个物理量我们只挑 X 轴来画
+        # 干净信号用蓝色实线，噪声信号用红色散点
+
+        # 子图 1: 位置误差 X 轴 (维 0)
+        axs_obs[0].plot(t_plot, noisy_arr[time_mask, 0], label='Noisy Pos X (Network Input)', color='red', linewidth=1, alpha=0.4, zorder=1)
+        axs_obs[0].plot(t_plot, clean_arr[time_mask, 0], label='Clean Pos X (Ground Truth)', color='blue', linewidth=2, zorder=2)
+        axs_obs[0].set_ylabel('Pos Error X (m)')
+        axs_obs[0].legend(loc='upper right')
+        axs_obs[0].grid(True, linestyle='--', alpha=0.5)
+        axs_obs[0].set_title("Sim2Real: Clean vs Noisy Observations (First 5s)", fontsize=14, fontweight='bold')
+        
+        # 子图 2: 速度误差 X 轴 (维 12)
+        axs_obs[1].plot(t_plot, noisy_arr[time_mask, 12], label='Noisy Vel X', color='red', linewidth=1, alpha=0.4, zorder=1)
+        axs_obs[1].plot(t_plot, clean_arr[time_mask, 12], label='Clean Vel X', color='blue', linewidth=2, zorder=2)
+        axs_obs[1].set_ylabel('Vel Error X (m/s)')
+        axs_obs[1].legend(loc='upper right')
+        axs_obs[1].grid(True, linestyle='--', alpha=0.5)
+        
+        # 子图 3: 机体角速度 X 轴 (维 15)
+        axs_obs[2].plot(t_plot, noisy_arr[time_mask, 15], label='Noisy Ang Vel X', color='red', linewidth=1, alpha=0.4, zorder=1)
+        axs_obs[2].plot(t_plot, clean_arr[time_mask, 15], label='Clean Ang Vel X', color='blue', linewidth=2, zorder=2)
+        axs_obs[2].set_ylabel('Ang Vel X (rad/s)')
+        axs_obs[2].legend(loc='upper right')
+        axs_obs[2].grid(True, linestyle='--', alpha=0.5)
+        
+        axs_obs[-1].set_xlabel('Time (s)')
+        axs_obs[-1].set_xticks(np.arange(0, 5.1, 0.5))
+
+        plt.tight_layout()
+        plt.savefig(os.path.join(log_dir, "observations_clean_vs_noisy.png"), dpi=300)
         
         # --- [核心] 弹出交互页面 ---
         # 运行到这一步时会弹出一个窗口，你可以使用工具栏的“放大镜”图标框选区域放大
