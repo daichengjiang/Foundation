@@ -192,6 +192,7 @@ class PaperPhysControllerTensor:
     def motor_speeds_to_wrench(self, motor_actions: torch.Tensor) -> tuple:
 
         # Calculate Thrust per motor (Newtons)
+        motor_actions = 0.9 * motor_actions + 0.1 
         coeff = (self.thrust_to_weight * self.mass * self.gravity / 4.0).unsqueeze(-1)
         motor_thrusts = coeff * (motor_actions ** 2)
         
