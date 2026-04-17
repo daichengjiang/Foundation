@@ -75,6 +75,9 @@ class QuadcopterDynamicsCfg:
 
     multi_teacher_params: list[dict] | None = None
 
+    apply_disturbance: bool = True         
+    max_disturbance_force: float = 0.1       # 最大力(牛顿)。如果是大飞机，可以调大到 0.5~1.0
+
 # [0, 2pi] -> [-pi, pi]
 def normallize_angle(angle: torch.Tensor):
     return torch.fmod(angle + math.pi, 2 * math.pi) - math.pi
@@ -262,6 +265,8 @@ class QuadcopterEnv(DirectRLEnv):
         self.motor_alpha_down = self.dt / torch.clamp(self.motor_tau_down_tensor, min=1e-6)
 
         self._current_motor_speeds = torch.zeros(self.num_envs, 4, device=self.device)
+
+        self.env_wind_force = torch.zeros((self.num_envs, 3), device=self.device)
 
         self._controller = PaperPhysControllerTensor(
             num_envs=self.num_envs,
@@ -674,6 +679,16 @@ class QuadcopterEnv(DirectRLEnv):
 
         force_b, torque_b = self._controller.motor_speeds_to_wrench(self._current_motor_speeds)
         
+        # 随机力扰动
+        if self.cfg.dynamics.apply_disturbance:
+            base_quat = self._robot.data.root_quat_w
+            rot_matrix = matrix_from_quat(base_quat) # 世界到机体的正向旋转矩阵 [num_envs, 3, 3]
+            rot_matrix_inv = rot_matrix.transpose(1, 2) # 正交矩阵的转置即为逆矩阵 (世界 -> 机体)
+            # 3.1 外部风扰：世界系 -> 机体系
+            wind_body = torch.bmm(rot_matrix_inv, self.env_wind_force.unsqueeze(-1)).squeeze(-1)
+            # 3.2 叠加机体系下的受力
+            force_b +=  wind_body
+
         self._forces.zero_()
         self._torques.zero_()
         self._forces[:, 0, :] = force_b
@@ -1022,6 +1037,21 @@ class QuadcopterEnv(DirectRLEnv):
             self._robot.data.default_joint_vel[env_ids], 
             None, env_ids
         )
+
+        # [新增] 为重置的环境重新采样外部扰动力
+        if self.cfg.dynamics.apply_disturbance:
+            # 1. 随机生成 3D 方向向量 (使用高斯分布以保证各个方向概率均匀)
+            directions = torch.randn(len(env_ids), 3, device=self.device)
+            directions = F.normalize(directions, dim=-1) # 归一化为单位向量
+            
+            # 2. 随机生成力的标量大小 [0, max_disturbance_force]
+            magnitudes = torch.rand(len(env_ids), 1, device=self.device) * self.cfg.dynamics.max_disturbance_force
+            
+            # 3. 赋值给这些刚刚重置的环境
+            self.env_wind_force[env_ids] = directions * magnitudes
+        else:
+            # 如果开关关闭，风力设为 0
+            self.env_wind_force[env_ids] = 0.0
 
     def _set_debug_vis_impl(self, debug_vis: bool):
         if debug_vis:
