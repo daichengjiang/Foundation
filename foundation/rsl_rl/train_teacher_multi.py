@@ -112,6 +112,7 @@ def run_training(teacher_id, dynamics, timestamp, gpu_id=0, csv_path="teacher_dy
     Pos_threshold = -2000
     Ori_threshold = -700
     Smooth_threshold = -600
+    Total_threshold = 10000
 
     print(f"==================================================")
     print(f"Starting Teacher {teacher_id} | GPU {gpu_id} | Headless: {headless}")
@@ -136,13 +137,15 @@ def run_training(teacher_id, dynamics, timestamp, gpu_id=0, csv_path="teacher_dy
                     pos_reward = stats.get("position", -float('inf'))
                     ori_reward = stats.get("orientation", -float('inf'))
                     smooth_reward = stats.get("action_smooth", -float('inf'))
+                    total_reward = stats.get("total", -float('inf'))
                     
                     print(f"Teacher {teacher_id} Metrics: Pos={pos_reward:.2f}, Ori={ori_reward:.2f}, Smooth={smooth_reward:.2f}")
 
                     # [关键修改] 三个条件同时满足
                     if (pos_reward > Pos_threshold and 
                         ori_reward > Ori_threshold and 
-                        smooth_reward > Smooth_threshold):
+                        smooth_reward > Smooth_threshold and
+                        total_reward > Total_threshold):
                         
                         print(f"SUCCESS: All conditions met. Saving...")
                         save_params_to_csv(csv_path, teacher_id, dynamics)

@@ -893,7 +893,8 @@ class QuadcopterEnv(DirectRLEnv):
                         stats = {
                             "position": np.mean(self.iter_mean_pos_history),
                             "orientation": np.mean(self.iter_mean_ori_history),
-                            "action_smooth": np.mean(self.iter_mean_smooth_history)
+                            "action_smooth": np.mean(self.iter_mean_smooth_history),
+                            "total": float(window_avg_reward)
                         }
 
                         # 写入临时文件
