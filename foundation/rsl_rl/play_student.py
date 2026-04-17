@@ -189,7 +189,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # env_cfg.dynamics.motor_tau_down = 0.15
     # env_cfg.dynamics.moment_scale = 0.025
 
-    dynamics_dict = [0.153643254847717,0.075243797123877,0.000409381561426928,0.000409381561426928,0.000749987020534131,2.97714411561979,0.0637168711122302,0.062396508781855,0.0190941516379497]
+    dynamics_dict = [0.985,0.11,0.0033108290215857123,0.0033108290215857123,0.006065438767545025,2.5,0.03411967117817527,0.16118237300396918,0.02214190189156806]
     env_cfg.dynamics.mass = dynamics_dict[0]
     env_cfg.dynamics.arm_length = dynamics_dict[1]
     env_cfg.dynamics.inertia = (dynamics_dict[2], dynamics_dict[3], dynamics_dict[4])

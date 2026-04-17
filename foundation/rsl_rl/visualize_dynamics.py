@@ -200,7 +200,7 @@ if __name__ == "__main__":
         plot_parallel_coordinates(df, os.path.join(save_directory, "dynamics_parallel.png"), is_combined=False)
         
         # ==========================================
-        # 阶段二：如果输入了实机参数，生成 3 张叠加了实机数据的对比图
+        # 阶段二：如果输入了实机参数，生成 3 张叠加了实机数据的对比图，并保存为 CSV
         # ==========================================
         if args.target_mass is not None and args.target_arm is not None and args.target_twr is not None:
             print("\n>>> 阶段 2/2: 检测到实机参数，生成带有 Target Drone 标记的对比图...")
@@ -210,9 +210,25 @@ if __name__ == "__main__":
                 'twr': args.target_twr
             }
             
+            # 1. 生成实机数据
             df_target = generate_target_drone_samples(args.target_mass, args.target_arm, args.target_twr, args.num_samples)
-            combined_df = pd.concat([df, df_target], ignore_index=True)
             
+            # ================= [新增代码：保存实机参数至新 CSV] =================
+            target_csv_path = os.path.join(save_directory, "target_drone_dynamics.csv")
+            df_save = df_target.copy()
+            
+            # 添加递增的 id 列（放最前面），并删掉专为画图准备的 Type 列
+            df_save.insert(0, 'id', range(len(df_save)))
+            df_save = df_save.drop(columns=['Type'])
+            
+            # 严格按照原 CSV 的列顺序写入
+            csv_columns = ['id', 'mass', 'arm_length', 'Ixx', 'Iyy', 'Izz', 'twr', 'motor_tau_up', 'motor_tau_down', 'kappa']
+            df_save.to_csv(target_csv_path, index=False, columns=csv_columns)
+            print(f"已将 {args.num_samples} 组实机衍生参数保存至 CSV: {target_csv_path}")
+            # ====================================================================
+
+            # 2. 合并并画图
+            combined_df = pd.concat([df, df_target], ignore_index=True)
             plot_distributions_with_bounds(df, os.path.join(save_directory, "dynamics_distributions_with_target.png"), target_params)
             plot_pairplot(combined_df, os.path.join(save_directory, "dynamics_pairplot_with_target.png"), is_combined=True)
             plot_parallel_coordinates(combined_df, os.path.join(save_directory, "dynamics_parallel_with_target.png"), is_combined=True)
@@ -221,6 +237,6 @@ if __name__ == "__main__":
         else:
             print("\n未提供实机目标参数(--target_mass, --target_arm, --target_twr)。\n任务完成！共生成了 3 张图表。")
             
-        print(f"所有图片均已保存在目录: {save_directory}")
+        print(f"所有输出均保存在目录: {save_directory}")
     else:
         print("数据为空或文件格式错误。")
