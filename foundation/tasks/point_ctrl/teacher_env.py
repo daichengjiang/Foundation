@@ -960,13 +960,13 @@ class QuadcopterEnv(DirectRLEnv):
                 return d * (r * torch.pow(u, 1.0/3.0))
 
             # 采样偏移量
-            pos_offset = sample_in_sphere(3.0 * l_arm, num_resets) # 位置偏移与轴距成正比
-            lin_vel = sample_in_sphere(0.5, num_resets)            # 1m/s 内的随机初速度
-            ang_vel = sample_in_sphere(0.5, num_resets)            # 1rad/s 内的随机角速度
+            pos_offset = sample_in_sphere(10.0 * l_arm, num_resets) # 位置偏移与轴距成正比
+            lin_vel = sample_in_sphere(1.0, num_resets)            # 1m/s 内的随机初速度
+            ang_vel = sample_in_sphere(1.0, num_resets)            # 1rad/s 内的随机角速度
             
             # 随机旋转 (Roll, Pitch, Yaw)
-            r = (torch.rand(num_resets, device=self.device)*2-1) * (math.pi / 8)
-            p = (torch.rand(num_resets, device=self.device)*2-1) * (math.pi / 8)
+            r = (torch.rand(num_resets, device=self.device)*2-1) * (math.pi / 2.25)
+            p = (torch.rand(num_resets, device=self.device)*2-1) * (math.pi / 2.25)
             y = (torch.rand(num_resets, device=self.device)*2-1) * (math.pi / 6)
             quat = quat_from_euler_xyz(r, p, y)
             
