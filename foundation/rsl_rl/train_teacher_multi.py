@@ -46,14 +46,11 @@ def sample_raptor_dynamics():
         "kappa": kappa
     }
 
-def run_training(teacher_id, dynamics, timestamp, gpu_id=0, csv_path="teacher_dynamics.csv", headless=False):
+def run_training(teacher_id, dynamics, timestamp, experiment_name, gpu_id=0, csv_path="teacher_dynamics.csv", headless=False):
     """
     调用 train_teacher_single.py 并传入参数，读取JSON文件判断是否成功
     """
     inertia_str = f"[{dynamics['inertia'][0]:.10f},{dynamics['inertia'][1]:.10f},{dynamics['inertia'][2]:.10f}]"
-
-    # 确定实验名称，确保与下方路径构建一致
-    experiment_name = "multi_teachers"
 
     overrides = [
         f"env.dynamics.mass={dynamics['mass']:.8f}",
@@ -202,6 +199,7 @@ if __name__ == "__main__":
     parser.add_argument("--gpu_id", type=int, default=0)
     parser.add_argument("--timestamp", type=str, default=None) 
     parser.add_argument("--headless", action="store_true", default=False, help="Run without rendering")
+    parser.add_argument("--experiment_name", type=str, default="multi_teachers", help="Experiment name for saving logs")
 
     args = parser.parse_args()
 
@@ -210,8 +208,7 @@ if __name__ == "__main__":
     else:
         batch_timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
-    # 这里的 multi_teachers 对应 run_training 里的 experiment_name
-    log_root_dir = os.path.join("logs", "rsl_rl", "multi_teachers", batch_timestamp)
+    log_root_dir = os.path.join("logs", "rsl_rl", args.experiment_name, batch_timestamp)
     os.makedirs(log_root_dir, exist_ok=True)
     csv_path = os.path.join(log_root_dir, "teacher_dynamics.csv")
 
@@ -224,9 +221,9 @@ if __name__ == "__main__":
                 print(f"Warning: Could not remove file: {e}")
 
     print(f"Batch Timestamp: {batch_timestamp}")
+    print(f"Experiment Name: {args.experiment_name}")
     print(f"Dynamics CSV will be saved to: {csv_path}")
 
-    # [修改] 使用 while 循环来实现重试逻辑
     current_teacher_id = args.start_id
     end_teacher_id = args.start_id + args.num_teachers
 
@@ -236,17 +233,16 @@ if __name__ == "__main__":
         is_success = run_training(
             teacher_id=current_teacher_id, 
             dynamics=dyn_params, 
-            timestamp=batch_timestamp, 
+            timestamp=batch_timestamp,
+            experiment_name=args.experiment_name, 
             gpu_id=args.gpu_id,
             csv_path=csv_path,
             headless=args.headless
         )
         
         if is_success:
-            # 只有成功才移动到下一个 ID
             current_teacher_id += 1
             time.sleep(1)
         else:
-            # 失败则不增加 ID，继续循环，重新采样参数进行训练
             print(f"Retrying Teacher {current_teacher_id}...")
             time.sleep(2)
