@@ -451,6 +451,17 @@ class QuadcopterEnv(DirectRLEnv):
         self._last_actions = torch.zeros(self.num_envs, 4, device=self.device)
         self._spawn_pos_w = torch.zeros(self.num_envs, 3, device=self.device) 
 
+        # ================= [新增] 纯滞后动作队列 =================
+        # 假设 dt = 0.01 (100Hz)，你想模拟 30ms 的纯通信/推理延迟，就是 3 帧
+        # 根据你的实物情况，通常设置 3 到 5 帧
+        self.delay_steps = 4  # 包含 [T, T-1, T-2, T-3]，读取 [-1] 时刚好是 30ms 前的动作
+
+        # 建立一个维度为 (环境数, 延迟帧数, 动作维度) 的张量
+        self._action_queue = torch.zeros(
+            self.num_envs, self.delay_steps, self.cfg.action_space, device=self.device
+        )
+        # ==========================================================
+
         self._last_angular_velocity= torch.zeros(self.num_envs, 3, device=self.device)
         self._langevin_max_vel = torch.full((self.num_envs,), 1.5, device=self.device)
 
@@ -831,23 +842,58 @@ class QuadcopterEnv(DirectRLEnv):
 
         self._map_generation_timer = 0
 
+    # def _pre_physics_step(self, actions: torch.Tensor):
+
+    #     # 2. Action Clamp
+    #     raw_actions_clamped = torch.clamp(actions, -1.0, 1.0)
+    #     action_setpoint_normalized = (raw_actions_clamped + 1.0) * 0.5
+        
+    #     self._actions = raw_actions_clamped.clone()
+
+    #     target = action_setpoint_normalized
+    #     current = self._current_motor_speeds
+    #     alpha = torch.where(target > current, self.motor_alpha_up, self.motor_alpha_down)
+    #     self._current_motor_speeds = current + alpha * (target - current)
+    #     self._current_motor_speeds = torch.clamp(self._current_motor_speeds, 0.0, 1.0)
+
+    #     # 计算力与力矩
+    #     force_b, torque_b = self._controller.motor_speeds_to_wrench(self._current_motor_speeds) 
+
     def _pre_physics_step(self, actions: torch.Tensor):
 
-        # 2. Action Clamp
+        # 1. 裁剪网络当前输出的最原始动作
         raw_actions_clamped = torch.clamp(actions, -1.0, 1.0)
-        action_setpoint_normalized = (raw_actions_clamped + 1.0) * 0.5
         
+        # 将网络最新的输出保存起来（如果你的 obs 里用到了 _actions，请保持最新）
         self._actions = raw_actions_clamped.clone()
 
+        # ================= [新增] 纯滞后队列核心逻辑 =================
+        # 1. 将队列沿时间维度 (dim=1) 整体向后滑动一格 (丢弃最老的帧)
+        self._action_queue = torch.roll(self._action_queue, shifts=1, dims=1)
+        
+        # 2. 将当前最新的动作写入队列的最前面 (索引 0 代表当前最新)
+        self._action_queue[:, 0, :] = raw_actions_clamped
+        
+        # 3. 取出队列最后面的一帧 (索引 -1 代表 N 帧前的那一个确切动作)
+        # 这就是经过了纯滞后，真正到达电调的动作！
+        delayed_actions = self._action_queue[:, -1, :].clone()
+        # ==============================================================
+
+        # 2. 将【延迟后的动作】映射到 [0, 1] 占空比
+        action_setpoint_normalized = (delayed_actions + 1.0) * 0.5
         target = action_setpoint_normalized
+        
+        # 3. 经过真实电机的物理惯性 (motor_alpha)
         current = self._current_motor_speeds
         alpha = torch.where(target > current, self.motor_alpha_up, self.motor_alpha_down)
         self._current_motor_speeds = current + alpha * (target - current)
         self._current_motor_speeds = torch.clamp(self._current_motor_speeds, 0.0, 1.0)
 
-        # 计算力与力矩
+        # 4. 代入真实物理拉力拟合曲线 (二次+线性)
         force_b, torque_b = self._controller.motor_speeds_to_wrench(self._current_motor_speeds) 
         
+        # ... 后面保持原样 ...      
+
         # ================= [新增] 受 Flag 控制的混合风阻 (Hybrid Drag) =================
         if self.cfg.enable_aerodynamics:
             # 1. 相对空速转机体系
@@ -1233,6 +1279,12 @@ class QuadcopterEnv(DirectRLEnv):
         # 将 [0, 1] 的电机转速映射到神经网络的 [-1, 1] 动作空间
         hover_action = hover_motor_speed * 2.0 - 1.0 
         self._last_actions[env_ids] = hover_action.unsqueeze(1).expand(-1, 4).clone()
+
+        # ================= [新增] 重置环境时，填满纯滞后队列 =================
+        # 把刚出生的这几帧延迟，全部强行塞入悬停动作，防止起飞掉高
+        for i in range(self.delay_steps):
+            self._action_queue[env_ids, i, :] = hover_action.unsqueeze(1).expand(-1, 4).clone()
+        # ====================================================================
 
         # self._last_actions[env_ids] = 0.0
         self._forces[env_ids] = 0.0

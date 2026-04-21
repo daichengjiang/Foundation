@@ -360,6 +360,12 @@ class QuadcopterEnv(DirectRLEnv):
         self.steps_per_iteration = self.cfg.num_steps_per_env
         self.yaw_limit = math.pi / 2
 
+        # === 在 __init__ 末尾添加 ===
+        self.delay_steps = 4  # 模拟 30ms 纯滞后 (100Hz 下 3 帧)
+        self._action_queue = torch.zeros(
+            self.num_envs, self.delay_steps, self.cfg.action_space, device=self.device
+        )
+
     def CHECK_NAN(self, tensor, name):
         if torch.isnan(tensor).any().item():
             print(f"[{name}] NaN detected in tensor of shape {tensor.shape}.")
@@ -650,35 +656,61 @@ class QuadcopterEnv(DirectRLEnv):
         light_cfg.func("/World/Light", light_cfg)
         self._map_generation_timer = 0
 
-    def _pre_physics_step(self, actions: torch.Tensor):
+    # def _pre_physics_step(self, actions: torch.Tensor):
         
-        if self.cfg.use_pid:
-            # 1. 获取状态
-            cur_pos = self._robot.data.root_pos_w
-            cur_vel = self._robot.data.root_lin_vel_w
-            cur_quat = self._robot.data.root_quat_w
-            cur_ang_vel = self._robot.data.root_ang_vel_b
+    #     if self.cfg.use_pid:
+    #         # 1. 获取状态
+    #         cur_pos = self._robot.data.root_pos_w
+    #         cur_vel = self._robot.data.root_lin_vel_w
+    #         cur_quat = self._robot.data.root_quat_w
+    #         cur_ang_vel = self._robot.data.root_ang_vel_b
             
-            # 2. 计算期望转速 (Controller)
-            action_norm = self._controller.compute_target_speeds(
-                cur_pos, cur_vel, cur_quat, cur_ang_vel,
-                self.pos_des, self.vel_des, self.acc_des, self.yaw_des,
-                self._current_motor_speeds
-            )
-        else:
-            raw_clamped = torch.clamp(actions, -1.0, 1.0)
-            action_norm = (raw_clamped + 1.0) * 0.5
-            self._actions = raw_clamped.clone()
+    #         # 2. 计算期望转速 (Controller)
+    #         action_norm = self._controller.compute_target_speeds(
+    #             cur_pos, cur_vel, cur_quat, cur_ang_vel,
+    #             self.pos_des, self.vel_des, self.acc_des, self.yaw_des,
+    #             self._current_motor_speeds
+    #         )
+    #     else:
+    #         raw_clamped = torch.clamp(actions, -1.0, 1.0)
+    #         action_norm = (raw_clamped + 1.0) * 0.5
+    #         self._actions = raw_clamped.clone()
 
-        # 3. 模拟电机响应
-        target = action_norm
+    #     # 3. 模拟电机响应
+    #     target = action_norm
+    #     current = self._current_motor_speeds
+    #     alpha = torch.where(target > current, self.motor_alpha_up, self.motor_alpha_down)
+    #     self._current_motor_speeds = current + alpha * (target - current)
+    #     self._current_motor_speeds = torch.clamp(self._current_motor_speeds, 0.0, 1.0)
+
+    #     force_b, torque_b = self._controller.motor_speeds_to_wrench(self._current_motor_speeds)
+
+    def _pre_physics_step(self, actions: torch.Tensor):
+        # 1. 记录当前时刻网络最新输出 (用于 obs 或 reward)
+        raw_actions_clamped = torch.clamp(actions, -1.0, 1.0)
+        self._actions = raw_actions_clamped.clone()
+
+        # === 核心：纯滞后队列操作 ===
+        # 队列整体向后滚一格 (丢弃最老帧)
+        self._action_queue = torch.roll(self._action_queue, shifts=1, dims=1)
+        # 将当前最新动作写入队列头
+        self._action_queue[:, 0, :] = raw_actions_clamped
+        # 取出 N 帧之前的动作作为生效动作
+        delayed_actions = self._action_queue[:, -1, :].clone()
+
+        # 2. 将【延迟后】的动作映射到物理占空比 [0, 1]
+        action_setpoint_normalized = (delayed_actions + 1.0) * 0.5
+        
+        # 3. 接下来走你原有的电机惯性 (motor_alpha) 和拟合曲线逻辑
+        target = action_setpoint_normalized
         current = self._current_motor_speeds
         alpha = torch.where(target > current, self.motor_alpha_up, self.motor_alpha_down)
         self._current_motor_speeds = current + alpha * (target - current)
-        self._current_motor_speeds = torch.clamp(self._current_motor_speeds, 0.0, 1.0)
-
+        
+        # 使用你测出来的拟合系数 (0.2466*x^2 + 0.7510*x + 0.0024)
         force_b, torque_b = self._controller.motor_speeds_to_wrench(self._current_motor_speeds)
         
+        # ... 后续施加力矩逻辑不变 ...    
         # 随机力扰动
         if self.cfg.dynamics.apply_disturbance:
             base_quat = self._robot.data.root_quat_w
@@ -1052,6 +1084,21 @@ class QuadcopterEnv(DirectRLEnv):
         else:
             # 如果开关关闭，风力设为 0
             self.env_wind_force[env_ids] = 0.0
+
+        # === 新增：计算悬停动作并重置延迟队列 ===
+        # 根据物理公式：悬停速度 = sqrt(1.0 / TWR)
+        hover_motor_speed = torch.sqrt(1.0 / self.twr_tensor[env_ids])
+        # 将 [0, 1] 映射到网络动作空间 [-1, 1]
+        hover_action = hover_motor_speed * 2.0 - 1.0 
+        
+        # 填充整个队列，防止起飞瞬间因为执行了“上辈子”的动作而炸机
+        for i in range(self.delay_steps):
+            self._action_queue[env_ids, i, :] = hover_action.unsqueeze(1).expand(-1, 4).clone()
+            
+        # 同时记得重置相关的状态量
+        self._actions[env_ids] = hover_action.unsqueeze(1).expand(-1, 4)
+        self._last_actions[env_ids] = hover_action.unsqueeze(1).expand(-1, 4)
+        self._current_motor_speeds[env_ids] = hover_motor_speed.unsqueeze(1).expand(-1, 4)
 
     def _set_debug_vis_impl(self, debug_vis: bool):
         if debug_vis:
