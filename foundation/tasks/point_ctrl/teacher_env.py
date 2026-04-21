@@ -75,7 +75,7 @@ class QuadcopterDynamicsCfg:
 
     multi_teacher_params: list[dict] | None = None
 
-    apply_disturbance: bool = True         
+    apply_disturbance: bool = False         
     max_disturbance_force: float = 0.1       # 最大力(牛顿)。如果是大飞机，可以调大到 0.5~1.0
 
 # [0, 2pi] -> [-pi, pi]
