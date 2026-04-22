@@ -174,7 +174,7 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
 
     num_steps_per_env: int = 256
 
-    enable_curriculum: bool = True
+    enable_curriculum: bool = False
 
 class QuadcopterEnv(DirectRLEnv):
     cfg: QuadcopterEnvCfg
@@ -694,23 +694,23 @@ class QuadcopterEnv(DirectRLEnv):
     #     force_b, torque_b = self._controller.motor_speeds_to_wrench(self._current_motor_speeds)
 
     def _pre_physics_step(self, actions: torch.Tensor):
-        
+
         # ================= [修改] 课程学习因子更新与终端打印 =================
         if self.cfg.enable_curriculum:
             self.common_step_counter += 1
             
             # 从 QuadcopterDistillationRunnerCfg 读取的值
-            steps_per_epoch = 256
+            steps_per_epoch = 512
             
             # 每当完成一个完整的回合采集（即一个 Iteration）时打印
             if self.common_step_counter % steps_per_epoch == 0:
                 current_epoch = int(self.common_step_counter / steps_per_epoch)
                 
                 # 计算当前的 factor
-                if current_epoch < 100:
+                if current_epoch < 200:
                     self.curriculum_factor = 0.0
-                elif current_epoch < 600:
-                    self.curriculum_factor = (current_epoch - 100) / 500.0
+                elif current_epoch < 400:
+                    self.curriculum_factor = (current_epoch - 200) / 200.0
                 else:
                     self.curriculum_factor = 1.0
                 
@@ -721,10 +721,10 @@ class QuadcopterEnv(DirectRLEnv):
             else:
                 # 非整除步数时，只计算 factor 不打印
                 current_epoch = self.common_step_counter / steps_per_epoch
-                if current_epoch < 100:
+                if current_epoch < 200:
                     self.curriculum_factor = 0.0
-                elif current_epoch < 600:
-                    self.curriculum_factor = (current_epoch - 100) / 500.0
+                elif current_epoch < 400:
+                    self.curriculum_factor = (current_epoch - 200) / 200.0
                 else:
                     self.curriculum_factor = 1.0
         # =====================================================================
