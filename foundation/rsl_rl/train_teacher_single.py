@@ -165,8 +165,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # [修改] WandB 命名逻辑
     if args_cli.log_timestamp:
-        # 1. 构造新的运行名称 (长名字，用于 WandB)
-        new_run_name = f"{args_cli.log_timestamp}_{agent_cfg.run_name}"
+        # 0. 记录去掉时间戳之前的原始 run_name
+        original_run_name = agent_cfg.run_name 
+        
+        # 1. 构造用于 WandB 的长运行名称
+        new_run_name = f"{args_cli.log_timestamp}_{original_run_name}"
         
         # 2. 更新配置字典中的 run_name
         agent_cfg_dict["run_name"] = new_run_name
@@ -179,8 +182,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             agent_cfg_dict["wandb_group"] = agent_cfg_dict.get("experiment_name")
         
         # 4. 计算本地日志路径
-        teacher_suffix = new_run_name.split('_')[-1] 
-        local_run_folder = f"teacher_{teacher_suffix}" 
+        local_run_folder = original_run_name
         
         log_dir = os.path.join(log_root_path, args_cli.log_timestamp, local_run_folder)
         

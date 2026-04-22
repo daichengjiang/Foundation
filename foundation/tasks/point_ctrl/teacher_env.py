@@ -183,7 +183,7 @@ class QuadcopterEnv(DirectRLEnv):
         super().__init__(cfg, render_mode, **kwargs)
 
         self.common_step_counter = 0
-        self.curriculum_factor = 0.0
+        self.curriculum_factor = 0.0 if self.cfg.enable_curriculum else 1.0
 
         self.start_time = time.time()
         self.render_mode = "human"
@@ -730,17 +730,17 @@ class QuadcopterEnv(DirectRLEnv):
         # =====================================================================
         # ... (后续代码保持不变)
 
-            # ================= [新增] 写入 extras 传给 WandB =================
-            if "log" not in self.extras:
-                self.extras["log"] = dict()
-            
-            # 记录课程进度因子 (0.0 到 1.0)
-            self.extras["log"]["Curriculum/Factor"] = self.curriculum_factor
-            
-            # 我强烈建议你也把下面这两个物理参数传上去，这样在 WandB 里看起来更直观！
-            self.extras["log"]["Curriculum/Noise_Scale"] = self._get_curriculum_value(1.5, 10.0)
-            self.extras["log"]["Curriculum/Max_Velocity"] = self._get_curriculum_value(0.5, 3.0)
-            # =================================================================
+        # ================= [新增] 写入 extras 传给 WandB =================
+        if "log" not in self.extras:
+            self.extras["log"] = dict()
+        
+        # 记录课程进度因子 (0.0 到 1.0)
+        self.extras["log"]["Curriculum/Factor"] = self.curriculum_factor
+        
+        # 我强烈建议你也把下面这两个物理参数传上去，这样在 WandB 里看起来更直观！
+        self.extras["log"]["Curriculum/Noise_Scale"] = self._get_curriculum_value(1.5, 10.0)
+        self.extras["log"]["Curriculum/Max_Velocity"] = self._get_curriculum_value(0.5, 3.0)
+        # =================================================================
 
         # 1. 记录当前时刻网络最新输出 (用于 obs 或 reward)
         raw_actions_clamped = torch.clamp(actions, -1.0, 1.0)
