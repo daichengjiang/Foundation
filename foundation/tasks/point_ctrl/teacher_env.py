@@ -174,7 +174,7 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
 
     num_steps_per_env: int = 256
 
-    enable_curriculum: bool = False
+    enable_curriculum: bool = True
 
 class QuadcopterEnv(DirectRLEnv):
     cfg: QuadcopterEnvCfg
@@ -694,6 +694,54 @@ class QuadcopterEnv(DirectRLEnv):
     #     force_b, torque_b = self._controller.motor_speeds_to_wrench(self._current_motor_speeds)
 
     def _pre_physics_step(self, actions: torch.Tensor):
+        
+        # ================= [修改] 课程学习因子更新与终端打印 =================
+        if self.cfg.enable_curriculum:
+            self.common_step_counter += 1
+            
+            # 从 QuadcopterDistillationRunnerCfg 读取的值
+            steps_per_epoch = 256
+            
+            # 每当完成一个完整的回合采集（即一个 Iteration）时打印
+            if self.common_step_counter % steps_per_epoch == 0:
+                current_epoch = int(self.common_step_counter / steps_per_epoch)
+                
+                # 计算当前的 factor
+                if current_epoch < 100:
+                    self.curriculum_factor = 0.0
+                elif current_epoch < 600:
+                    self.curriculum_factor = (current_epoch - 100) / 500.0
+                else:
+                    self.curriculum_factor = 1.0
+                
+                # 终端实时打印进度
+                print(f">>> [Curriculum] Epoch: {current_epoch} | Factor: {self.curriculum_factor:.4f} "
+                      f"| Noise: {self._get_curriculum_value(1.5, 10.0):.2f} "
+                      f"| MaxVel: {self._get_curriculum_value(0.5, 3.0):.2f}")
+            else:
+                # 非整除步数时，只计算 factor 不打印
+                current_epoch = self.common_step_counter / steps_per_epoch
+                if current_epoch < 100:
+                    self.curriculum_factor = 0.0
+                elif current_epoch < 600:
+                    self.curriculum_factor = (current_epoch - 100) / 500.0
+                else:
+                    self.curriculum_factor = 1.0
+        # =====================================================================
+        # ... (后续代码保持不变)
+
+            # ================= [新增] 写入 extras 传给 WandB =================
+            if "log" not in self.extras:
+                self.extras["log"] = dict()
+            
+            # 记录课程进度因子 (0.0 到 1.0)
+            self.extras["log"]["Curriculum/Factor"] = self.curriculum_factor
+            
+            # 我强烈建议你也把下面这两个物理参数传上去，这样在 WandB 里看起来更直观！
+            self.extras["log"]["Curriculum/Noise_Scale"] = self._get_curriculum_value(1.5, 10.0)
+            self.extras["log"]["Curriculum/Max_Velocity"] = self._get_curriculum_value(0.5, 3.0)
+            # =================================================================
+
         # 1. 记录当前时刻网络最新输出 (用于 obs 或 reward)
         raw_actions_clamped = torch.clamp(actions, -1.0, 1.0)
         self._actions = raw_actions_clamped.clone()
@@ -742,49 +790,6 @@ class QuadcopterEnv(DirectRLEnv):
         return easy_val + self.curriculum_factor * (hard_val - easy_val)
 
     def _get_observations(self) -> dict:
-        # ================= [修改] 课程学习因子更新与终端打印 =================
-        if self.cfg.enable_curriculum:
-            self.common_step_counter += 1
-            
-            # 从 QuadcopterTeacherRunnerCfg 读取的值
-            steps_per_epoch = 256 
-            
-            if self.common_step_counter % steps_per_epoch == 0:
-                current_epoch = int(self.common_step_counter / steps_per_epoch)
-                
-                if current_epoch < 100:
-                    self.curriculum_factor = 0.0
-                elif current_epoch < 600:
-                    self.curriculum_factor = (current_epoch - 100) / 500.0
-                else:
-                    self.curriculum_factor = 1.0
-                
-                # 终端实时打印进度
-                print(f">>> [Curriculum] Epoch: {current_epoch} | Factor: {self.curriculum_factor:.4f} "
-                      f"| Noise: {self._get_curriculum_value(1.5, 10.0):.2f} "
-                      f"| MaxVel: {self._get_curriculum_value(0.5, 3.0):.2f}")
-            else:
-                current_epoch = self.common_step_counter / steps_per_epoch
-                if current_epoch < 100:
-                    self.curriculum_factor = 0.0
-                elif current_epoch < 600:
-                    self.curriculum_factor = (current_epoch - 100) / 500.0
-                else:
-                    self.curriculum_factor = 1.0
-        # =====================================================================
-        # ... (后续代码保持不变)
-
-            # ================= [新增] 写入 extras 传给 WandB =================
-            if "log" not in self.extras:
-                self.extras["log"] = dict()
-            
-            # 记录课程进度因子 (0.0 到 1.0)
-            self.extras["log"]["Curriculum/Factor"] = self.curriculum_factor
-            
-            # 我强烈建议你也把下面这两个物理参数传上去，这样在 WandB 里看起来更直观！
-            self.extras["log"]["Curriculum/Noise_Scale"] = self._get_curriculum_value(1.5, 10.0)
-            self.extras["log"]["Curriculum/Max_Velocity"] = self._get_curriculum_value(0.5, 3.0)
-            # =================================================================
 
         if self.cfg.trajectory_type == "figure8":
             self._generate_desired_trajectory_figure8()
