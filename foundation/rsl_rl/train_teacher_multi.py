@@ -80,7 +80,7 @@ def run_training(teacher_id, dynamics, timestamp, experiment_name, gpu_id=0, csv
     cmd = [
         sys.executable, train_script,
         "--task", "teacher",
-        "--num_envs", "4000",
+        "--num_envs", "8000",
         "--max_iterations", "800",
         "--device", target_device,
         "--logger", "wandb",
