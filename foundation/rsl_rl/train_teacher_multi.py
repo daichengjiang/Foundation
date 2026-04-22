@@ -109,7 +109,7 @@ def run_training(teacher_id, dynamics, timestamp, experiment_name, gpu_id=0, csv
     Pos_threshold = -3000
     Ori_threshold = -700
     Smooth_threshold = -600
-    Total_threshold = 9000
+    Total_threshold = 7000
 
     print(f"==================================================")
     print(f"Starting Teacher {teacher_id} | GPU {gpu_id} | Headless: {headless}")

@@ -216,6 +216,7 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     reward_coef_termination_penalty = 100.0
     reward_constant = 1.5
 
+    enable_curriculum: bool = False
 
 class QuadcopterEnv(DirectRLEnv):
     """A quadcopter environment adapted to use the reward logic from the training code."""
@@ -224,6 +225,11 @@ class QuadcopterEnv(DirectRLEnv):
 
     def __init__(self, cfg: QuadcopterEnvCfg, render_mode: str | None = None, **kwargs):
         super().__init__(cfg, render_mode, **kwargs)
+
+        #================= [新增] 课程学习状态量 =================
+        self.common_step_counter = 0
+        self.curriculum_factor = 0.0  # 0.0 (Easy) -> 1.0 (Hard)
+        # ========================================================
 
         self.start_time = time.time()
         self.render_mode = "human"
@@ -543,7 +549,8 @@ class QuadcopterEnv(DirectRLEnv):
         yaw_limit = self.yaw_limit # 限制在 +/- 90 度 (1.57 rad)
         yaw_k_pos = 0.2        # 弹簧刚度 (回复力)
         yaw_k_vel = 0.5        # 阻尼
-        yaw_noise_scale = 2.0  # 噪声强度
+        # yaw_noise_scale = 2.0  # 噪声强度
+        yaw_noise_scale = self._get_curriculum_value(easy_val=0.0, hard_val=2.0)
         max_yaw_rate = 2.5     # 最大角速度
             
         # 1. 获取当前状态
@@ -590,15 +597,19 @@ class QuadcopterEnv(DirectRLEnv):
         n_envs = len(env_ids)
         dt = self.dt  # 使用仿真步长，或者使用独立的轨迹步长 self._langevin_dt
         
-        # --- 参数设置 (可以提取到 Config 中) ---
-        # 弹簧刚度 (把无人机拉回原点，影响位置约束强弱)
+        # ================= [核心修改] 课程学习参数映射 =================
+        # 1. 弹簧刚度 (回复力)
         k_pos = 1.0  
-        # 阻尼系数 (防止速度过大，影响最高速度)
-        k_vel = 1.5   
-        # 加速度平滑系数 (模拟加加速度 Jerk 的惯性，值越小加速度变化越慢)
-        acc_inertia = 0.1 
-        # 噪声强度 (直接决定加速度的变化幅度)
-        noise_scale = 10.0 # 需要根据无人机推重比调整，通常 5.0 - 15.0 之间
+        # 2. 阻尼系数 (控制目标移动速度，值越大越慢)
+        k_vel = self._get_curriculum_value(easy_val=4.0, hard_val=1.5)   
+        # 3. 加速度惯性 (控制轨迹平滑度，值越小越平滑)
+        acc_inertia = self._get_curriculum_value(easy_val=0.02, hard_val=0.1) 
+        # 4. 随机力强度 (直接决定乱窜程度)
+        noise_scale = self._get_curriculum_value(easy_val=1.5, hard_val=10.0) 
+        # 5. 最大物理限制
+        max_vel = self._get_curriculum_value(easy_val=0.5, hard_val=3.0)
+        max_acc = self._get_curriculum_value(easy_val=2.0, hard_val=15.0)
+        # ==============================================================
         
         # 获取当前状态
         pos_current = self.pos_des[env_ids]
@@ -611,7 +622,7 @@ class QuadcopterEnv(DirectRLEnv):
         vel_next = vel_current + acc_current * dt
         
         # 限制最大速度 (软限制已由阻尼 k_vel 提供，这里做硬截断以防万一)
-        max_vel = 3.0 # m/s
+        # max_vel = 3.0 # m/s
         vel_norm = torch.norm(vel_next, dim=1, keepdim=True)
         scale = torch.clamp(max_vel / (vel_norm + 1e-6), max=1.0)
         vel_next = vel_next * scale
@@ -635,7 +646,7 @@ class QuadcopterEnv(DirectRLEnv):
         
         # --- 物理限制 (Clipping) ---
         # 限制最大加速度 (基于推重比，假设最大推力约为 2G 到 3G)
-        max_acc = 15.0 # m/s^2
+        # max_acc = 15.0 # m/s^2
         acc_next = torch.clamp(acc_next, -max_acc, max_acc)
  
         # --- 保存状态 ---
@@ -1024,7 +1035,57 @@ class QuadcopterEnv(DirectRLEnv):
         """Apply thrust/moment to the quadcopter."""
         self._robot.set_external_force_and_torque(self._forces, self._torques, body_ids=self._body_id)
 
+    def _get_curriculum_value(self, easy_val, hard_val):
+        """根据当前课程进度进行线性插值"""
+        return easy_val + self.curriculum_factor * (hard_val - easy_val)
+
     def _get_observations(self) -> dict:
+        # ================= [修改] 课程学习因子更新与终端打印 =================
+        if self.cfg.enable_curriculum:
+            self.common_step_counter += 1
+            
+            # 从 QuadcopterDistillationRunnerCfg 读取的值
+            steps_per_epoch = 400 
+            
+            # 每当完成一个完整的回合采集（即一个 Iteration）时打印
+            if self.common_step_counter % steps_per_epoch == 0:
+                current_epoch = int(self.common_step_counter / steps_per_epoch)
+                
+                # 计算当前的 factor
+                if current_epoch < 100:
+                    self.curriculum_factor = 0.0
+                elif current_epoch < 600:
+                    self.curriculum_factor = (current_epoch - 100) / 500.0
+                else:
+                    self.curriculum_factor = 1.0
+                
+                # 终端实时打印进度
+                print(f">>> [Curriculum] Epoch: {current_epoch} | Factor: {self.curriculum_factor:.4f} "
+                      f"| Noise: {self._get_curriculum_value(1.5, 10.0):.2f} "
+                      f"| MaxVel: {self._get_curriculum_value(0.5, 3.0):.2f}")
+            else:
+                # 非整除步数时，只计算 factor 不打印
+                current_epoch = self.common_step_counter / steps_per_epoch
+                if current_epoch < 100:
+                    self.curriculum_factor = 0.0
+                elif current_epoch < 600:
+                    self.curriculum_factor = (current_epoch - 100) / 500.0
+                else:
+                    self.curriculum_factor = 1.0
+        # =====================================================================
+        # ... (后续代码保持不变)
+
+            # ================= [新增] 写入 extras 传给 WandB =================
+            if "log" not in self.extras:
+                self.extras["log"] = dict()
+            
+            # 记录课程进度因子 (0.0 到 1.0)
+            self.extras["log"]["Curriculum/Factor"] = self.curriculum_factor
+            
+            # 我强烈建议你也把下面这两个物理参数传上去，这样在 WandB 里看起来更直观！
+            self.extras["log"]["Curriculum/Noise_Scale"] = self._get_curriculum_value(1.5, 10.0)
+            self.extras["log"]["Curriculum/Max_Velocity"] = self._get_curriculum_value(0.5, 3.0)
+            # =================================================================
 
         # 更新轨迹
         if self.cfg.trajectory_type == "figure8":
@@ -1268,7 +1329,7 @@ class QuadcopterEnv(DirectRLEnv):
         super()._reset_idx(env_ids)
 
         # # 清除动作和物理标志位
-        self._actions[env_ids] = 0.0
+        # self._actions[env_ids] = 0.0
         # ==========================================
         # [修改] 2. last_action 改为推重比倒数的平方根，再映射到 [-1, 1]
         # 推力与电机转速的平方成正比 (Thrust ∝ ω^2)
@@ -1285,6 +1346,10 @@ class QuadcopterEnv(DirectRLEnv):
         for i in range(self.delay_steps):
             self._action_queue[env_ids, i, :] = hover_action.unsqueeze(1).expand(-1, 4).clone()
         # ====================================================================
+        self._actions[env_ids] = hover_action.unsqueeze(1).expand(-1, 4).clone()
+        # 3. [补上] 最关键的一步：让电机的真实物理转速直接瞬间达到悬停转速！
+        self._current_motor_speeds[env_ids] = hover_motor_speed.unsqueeze(1).expand(-1, 4).clone()
+
 
         # self._last_actions[env_ids] = 0.0
         self._forces[env_ids] = 0.0
@@ -1297,7 +1362,6 @@ class QuadcopterEnv(DirectRLEnv):
         self._died_nan[env_ids] = False
         self._figure8_time[env_ids] = 0.0
         self._traj_origin_adjusted[env_ids] = False
-        self._current_motor_speeds[env_ids] = 0.0 
 
         # --- 2. 确定位置与随机状态采样 (核心修正点：先定义变量) ---
         spawn_center = self.env_origins[env_ids].clone()
