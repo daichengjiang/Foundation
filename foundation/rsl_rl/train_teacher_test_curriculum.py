@@ -81,13 +81,15 @@ def run_training(teacher_id, dynamics, timestamp, experiment_name, gpu_id=0, ena
             print(f"Error: Could not find {train_script}")
             return None
 
+    max_iters = "1000" if enable_curriculum else "800"
+
     target_device = f"cuda:{gpu_id}"
 
     cmd = [
         sys.executable, train_script,
         "--task", "teacher",
-        "--num_envs", "4000",
-        "--max_iterations", "800",
+        "--num_envs", "8000",
+        "--max_iterations", max_iters,
         "--device", target_device,
         "--logger", "wandb",
         "--log_project_name", "Foundation",
@@ -108,8 +110,15 @@ def run_training(teacher_id, dynamics, timestamp, experiment_name, gpu_id=0, ena
     print(f"\n[{'CURRICULUM ON' if enable_curriculum else 'CURRICULUM OFF'}] Running {run_name} ...")
     
     # 默认返回 -inf 的字典，防崩
-    stats = {"position": -float('inf'), "orientation": -float('inf'), "action_smooth": -float('inf'), "total": -float('inf')}
-    
+    stats = {
+        "position": -float('inf'), 
+        "orientation": -float('inf'), 
+        "action_smooth": -float('inf'), 
+        "base": -float('inf'),      # <--- 新增默认值
+        "terminal": -float('inf'),  # <--- 新增默认值
+        "total": -float('inf')
+    }
+
     try:
         subprocess.run(cmd, check=True, env=env_vars)
         
@@ -139,20 +148,24 @@ def save_ab_test_to_csv(file_path, teacher_id, dynamics, stats_nocurr, stats_cur
     
     with open(file_path, "a") as f:
         if not file_exists:
-            # 写入带有对比结构的表头
-            f.write("id,mass,arm_length,twr,motor_tau_up,motor_tau_down,kappa,"
-                    "pos_nocurr,ori_nocurr,smooth_nocurr,total_nocurr,"
-                    "pos_curr,ori_curr,smooth_curr,total_curr\n")
+            # 写入带有完整动力学参数和六项分数的对比表头
+            f.write("id,mass,arm_length,Ixx,Iyy,Izz,twr,motor_tau_up,motor_tau_down,kappa,"
+                    "pos_nocurr,ori_nocurr,smooth_nocurr,base_nocurr,term_nocurr,total_nocurr,"
+                    "pos_curr,ori_curr,smooth_curr,base_curr,term_curr,total_curr\n")
         
+        # 写入参数与各项得分
         f.write(f"{teacher_id},{dynamics['mass']},{dynamics['arm_length']},"
+                f"{dynamics['inertia'][0]},{dynamics['inertia'][1]},{dynamics['inertia'][2]},"
                 f"{dynamics['thrust_to_weight']},{dynamics['motor_tau_up']},"
                 f"{dynamics['motor_tau_down']},{dynamics['kappa']},"
-                # 无课程得分
+                # 无课程各项得分
                 f"{stats_nocurr['position']:.2f},{stats_nocurr['orientation']:.2f},"
-                f"{stats_nocurr['action_smooth']:.2f},{stats_nocurr['total']:.2f},"
-                # 有课程得分
+                f"{stats_nocurr['action_smooth']:.2f},{stats_nocurr['base']:.2f},"
+                f"{stats_nocurr['terminal']:.2f},{stats_nocurr['total']:.2f},"
+                # 有课程各项得分
                 f"{stats_curr['position']:.2f},{stats_curr['orientation']:.2f},"
-                f"{stats_curr['action_smooth']:.2f},{stats_curr['total']:.2f}\n")
+                f"{stats_curr['action_smooth']:.2f},{stats_curr['base']:.2f},"
+                f"{stats_curr['terminal']:.2f},{stats_curr['total']:.2f}\n")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

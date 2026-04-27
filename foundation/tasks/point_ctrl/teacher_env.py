@@ -356,6 +356,8 @@ class QuadcopterEnv(DirectRLEnv):
         self.eval_pos_sum = 0.0
         self.eval_ori_sum = 0.0
         self.eval_smooth_sum = 0.0
+        self.eval_base_sum = 0.0     # <--- 新增：存活分累加
+        self.eval_term_sum = 0.0     # <--- 新增：死亡惩罚累加
         self.eval_total_sum = 0.0
         self.reward_report_path = os.environ.get("TEACHER_REWARD_PATH", None)
         # =================================================================
@@ -964,7 +966,16 @@ class QuadcopterEnv(DirectRLEnv):
 
             # B. [修改] 专为 CSV 准备的“无偏真值”统计 (700-800轮)
             current_iter = self.common_step_counter // self.steps_per_iteration
-            if 700 <= current_iter <= 800:
+
+            # ================= [新增] 动态确定统计区间 =================
+            if self.cfg.enable_curriculum:
+                eval_start, eval_end = 900, 1000
+            else:
+                eval_start, eval_end = 700, 800
+            # ==========================================================
+
+            # 判断当前迭代是否在这个区间内
+            if eval_start <= current_iter <= eval_end:
                 # 严谨累加：不论是 1 架炸机还是 3000 架成功，权重完全按架数计算！
                 batch_count = len(env_ids)
                 self.eval_episodes += batch_count
@@ -972,7 +983,9 @@ class QuadcopterEnv(DirectRLEnv):
                 self.eval_pos_sum += torch.sum(self._episode_sums["position"][env_ids]).item()
                 self.eval_ori_sum += torch.sum(self._episode_sums["orientation"][env_ids]).item()
                 self.eval_smooth_sum += torch.sum(self._episode_sums["action_smooth"][env_ids]).item()
-                
+                self.eval_base_sum += torch.sum(self._episode_sums["base"][env_ids]).item()        # <--- 新增
+                self.eval_term_sum += torch.sum(self._episode_sums["terminal"][env_ids]).item()    # <--- 新增
+
                 # 计算这批环境的 Total 奖励总和
                 batch_total = torch.zeros(batch_count, device=self.device)
                 for k in self._episode_sums.keys():
@@ -984,6 +997,8 @@ class QuadcopterEnv(DirectRLEnv):
                     "position": self.eval_pos_sum / self.eval_episodes,
                     "orientation": self.eval_ori_sum / self.eval_episodes,
                     "action_smooth": self.eval_smooth_sum / self.eval_episodes,
+                    "base": self.eval_base_sum / self.eval_episodes,         # <--- 新增写出
+                    "terminal": self.eval_term_sum / self.eval_episodes,
                     "total": self.eval_total_sum / self.eval_episodes
                 }
                 
