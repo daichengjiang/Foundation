@@ -591,7 +591,7 @@ class QuadcopterEnv(DirectRLEnv):
         
         # --- 参数设置 (可以提取到 Config 中) ---
         # 弹簧刚度 (把无人机拉回原点，影响位置约束强弱)
-        k_pos = 1.0  
+        k_pos = torch.tensor([1.0, 1.0, 2.0], device=self.device) 
         # 阻尼系数 (防止速度过大，影响最高速度)
         k_vel = 1.5   
         # 加速度平滑系数 (模拟加加速度 Jerk 的惯性，值越小加速度变化越慢)
@@ -624,6 +624,8 @@ class QuadcopterEnv(DirectRLEnv):
         # 目标加速度变化量 (Jerk) = 随机噪声 + 回复力(拉回中心) - 阻尼力(限制速度)
         # 这是一个受到随机力扰动的弹簧阻尼二阶系统
         noise = torch.randn(n_envs, 3, device=self.device) * noise_scale
+        z_noise_attenuation = 0.4  
+        noise[:, 2] *= z_noise_attenuation
         
         # 期望的合外力 (Target Force/Mass)
         force_total = noise - k_pos * pos_err - k_vel * vel_current
