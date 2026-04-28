@@ -624,7 +624,7 @@ class QuadcopterEnv(DirectRLEnv):
         # 目标加速度变化量 (Jerk) = 随机噪声 + 回复力(拉回中心) - 阻尼力(限制速度)
         # 这是一个受到随机力扰动的弹簧阻尼二阶系统
         noise = torch.randn(n_envs, 3, device=self.device) * noise_scale
-        z_noise_attenuation = 0.4  
+        z_noise_attenuation = 0.3  
         noise[:, 2] *= z_noise_attenuation
         
         # 期望的合外力 (Target Force/Mass)
