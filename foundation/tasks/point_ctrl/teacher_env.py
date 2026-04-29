@@ -768,6 +768,12 @@ class QuadcopterEnv(DirectRLEnv):
         # 取出 N 帧之前的动作作为生效动作
         delayed_actions = self._action_queue[:, -1, :].clone()
 
+        # # ================= [新增排查代码] =================
+        # # 打印当前 Step 计数和环境 0 的整个纯滞后队列
+        # print(f"[Debug] Step: {self.common_step_counter}")
+        # print(f"Env 0 Action Queue (shape: {self._action_queue[0].shape}):\n{self._action_queue[0].detach().cpu().numpy()}\n")
+        # # =================================================
+
         # 2. 将【延迟后】的动作映射到物理占空比 [0, 1]
         action_setpoint_normalized = (delayed_actions + 1.0) * 0.5
         
