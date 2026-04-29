@@ -109,7 +109,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env_cfg.use_pid = args_cli.use_pid
 
     # Example dynamics (Teacher usually works on specific dynamics)
-    dynamics_dict = [0.09777998465800675,0.07081547934541962,0.00037916553112477935,0.00037916553112477935,0.0006946312530205958,2.91200001513932,0.04353632598181455,0.20681289322588903,0.006225218573472514]
+    dynamics_dict = [0.13961600660184037,0.07728447604273286,0.00023129921843763958,0.00023129921843763958,0.0004237401681777557,1.5518577824763342,0.04884551056248758,0.0825466320493794,0.018991069467740405]
     env_cfg.dynamics.mass = dynamics_dict[0]
     env_cfg.dynamics.arm_length = dynamics_dict[1]
     env_cfg.dynamics.inertia = (dynamics_dict[2], dynamics_dict[3], dynamics_dict[4])
@@ -194,6 +194,16 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     max_velocity_observed = 0.0
     total_samples = 0
 
+    # ==========================================================
+    # [新增] 获取 Timeline 接口，并在循环开始前强制暂停
+    # ==========================================================
+    import omni.timeline # 如果你在文件开头已经 import 过，这句可以省略
+    timeline = omni.timeline.get_timeline_interface()
+    
+    print("[INFO] 环境加载完毕。已强制暂停仿真。")
+    print("[INFO] 👉 请在 Isaac Sim 窗口中调整视角，准备好后按下【空格键】开始运行！")
+    timeline.pause() # 强制暂停
+    # ==========================================================
     while simulation_app.is_running() and timestep < args_cli.max_steps:
         step_start_time = time.time()
         
