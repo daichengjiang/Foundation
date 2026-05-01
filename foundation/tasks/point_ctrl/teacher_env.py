@@ -120,7 +120,7 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
 
     history_len = 5
 
-    prob_null_trajectory = 0.0
+    prob_null_trajectory = 1.0
     trajectory_type = "langevin"
     train_or_play: bool = True
     use_pid = False
@@ -377,7 +377,7 @@ class QuadcopterEnv(DirectRLEnv):
         self.yaw_limit = math.pi / 2
 
         # === 在 __init__ 末尾添加 ===
-        self.delay_steps = 4  # 模拟 30ms 纯滞后 (100Hz 下 3 帧)
+        self.delay_steps = 8  # 模拟 30ms 纯滞后 (100Hz 下 3 帧)
         self._action_queue = torch.zeros(
             self.num_envs, self.delay_steps, self.cfg.action_space, device=self.device
         )
