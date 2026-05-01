@@ -979,7 +979,7 @@ class QuadcopterEnv(DirectRLEnv):
             if self.cfg.enable_curriculum:
                 eval_start, eval_end = 900, 1000
             else:
-                eval_start, eval_end = 700, 800
+                eval_start, eval_end = 600, 700
             # ==========================================================
 
             # 判断当前迭代是否在这个区间内

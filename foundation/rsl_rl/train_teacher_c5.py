@@ -69,8 +69,8 @@ def run_training(teacher_id, dynamics, timestamp, experiment_name, gpu_id=0, csv
     cmd = [
         sys.executable, train_script,
         "--task", "teacher",
-        "--num_envs", "16000",
-        "--max_iterations", "800",
+        "--num_envs", "4000",
+        "--max_iterations", "700",
         "--device", target_device,
         "--logger", "wandb",
         "--log_project_name", "Foundation",
@@ -95,10 +95,10 @@ def run_training(teacher_id, dynamics, timestamp, experiment_name, gpu_id=0, csv
     # 告诉 teacher_env.py 直接把 JSON 写到这里，永久保存
     env_vars["TEACHER_REWARD_PATH"] = metrics_file_abs
 
-    Pos_threshold = -3000
-    Ori_threshold = -700
-    Smooth_threshold = -600
-    Total_threshold = 7000
+    Pos_threshold = -1000
+    Ori_threshold = -500
+    Smooth_threshold = -150
+    Total_threshold = 9000
 
     print(f"==================================================")
     print(f"Starting Teacher {teacher_id} | GPU {gpu_id} | Headless: {headless}")
@@ -110,24 +110,42 @@ def run_training(teacher_id, dynamics, timestamp, experiment_name, gpu_id=0, csv
     print(f"==================================================")
     
     success = False
-
+    
     try:
         # 执行训练
         subprocess.run(cmd, check=True, env=env_vars)
         
-        # [修改] 直接判定为成功，无条件保存模型参数
-        print(f"Teacher {teacher_id} Training Finished. Saving params (Filtering disabled).")
-        save_params_to_csv(csv_path, teacher_id, dynamics)
-        success = True
-
-        # [如果只是想看看指标不作为筛选条件，可以保留这部分读取打印，去掉 if-else 判定即可]
+        # [修改] 读取 JSON 文件并进行多条件判断
         if os.path.exists(metrics_file_abs):
             with open(metrics_file_abs, 'r') as f:
                 try:
                     stats = json.load(f)
-                    print(f"Teacher {teacher_id} Metrics: Pos={stats.get('position', 0):.2f}, Ori={stats.get('orientation', 0):.2f}, Smooth={stats.get('action_smooth', 0):.2f}")
+                    pos_reward = stats.get("position", -float('inf'))
+                    ori_reward = stats.get("orientation", -float('inf'))
+                    smooth_reward = stats.get("action_smooth", -float('inf'))
+                    total_reward = stats.get("total", -float('inf'))
+                    
+                    print(f"Teacher {teacher_id} Metrics: Pos={pos_reward:.2f}, Ori={ori_reward:.2f}, Smooth={smooth_reward:.2f}")
+
+                    # [关键修改] 三个条件同时满足
+                    if (pos_reward > Pos_threshold and 
+                        ori_reward > Ori_threshold and 
+                        smooth_reward > Smooth_threshold and
+                        total_reward > Total_threshold):
+                        
+                        print(f"SUCCESS: All conditions met. Saving...")
+                        save_params_to_csv(csv_path, teacher_id, dynamics)
+                        success = True
+                    else:
+                        print(f"FAILURE: Conditions not met.")
+                        success = False
+                        
                 except json.JSONDecodeError:
-                    pass
+                    print(f"Error: Could not decode JSON from {metrics_file_abs}")
+                    success = False
+        else:
+            print(f"FAILURE: Metrics file not found at {metrics_file_abs}")
+            success = False
 
     except subprocess.CalledProcessError as e:
         print(f"!!! Error training Teacher {teacher_id} (Process Crashed) !!!")
