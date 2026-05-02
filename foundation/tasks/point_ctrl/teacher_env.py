@@ -120,7 +120,7 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
 
     history_len = 5
 
-    prob_null_trajectory = 1.0
+    prob_null_trajectory = 0.0
     trajectory_type = "langevin"
     train_or_play: bool = True
     use_pid = False
@@ -979,7 +979,7 @@ class QuadcopterEnv(DirectRLEnv):
             if self.cfg.enable_curriculum:
                 eval_start, eval_end = 900, 1000
             else:
-                eval_start, eval_end = 600, 700
+                eval_start, eval_end = 700, 800
             # ==========================================================
 
             # 判断当前迭代是否在这个区间内

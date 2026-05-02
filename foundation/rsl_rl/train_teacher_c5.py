@@ -69,8 +69,8 @@ def run_training(teacher_id, dynamics, timestamp, experiment_name, gpu_id=0, csv
     cmd = [
         sys.executable, train_script,
         "--task", "teacher",
-        "--num_envs", "4000",
-        "--max_iterations", "700",
+        "--num_envs", "16000",
+        "--max_iterations", "800",
         "--device", target_device,
         "--logger", "wandb",
         "--log_project_name", "Foundation",
@@ -95,10 +95,10 @@ def run_training(teacher_id, dynamics, timestamp, experiment_name, gpu_id=0, csv
     # 告诉 teacher_env.py 直接把 JSON 写到这里，永久保存
     env_vars["TEACHER_REWARD_PATH"] = metrics_file_abs
 
-    Pos_threshold = -1000
-    Ori_threshold = -500
-    Smooth_threshold = -150
-    Total_threshold = 9000
+    Pos_threshold = -50000
+    Ori_threshold = -10000
+    Smooth_threshold = -10000
+    Total_threshold = 0
 
     print(f"==================================================")
     print(f"Starting Teacher {teacher_id} | GPU {gpu_id} | Headless: {headless}")
