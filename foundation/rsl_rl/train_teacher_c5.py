@@ -70,7 +70,7 @@ def run_training(teacher_id, dynamics, timestamp, experiment_name, gpu_id=0, csv
         sys.executable, train_script,
         "--task", "teacher",
         "--num_envs", "16000",
-        "--max_iterations", "800",
+        "--max_iterations", "1000",
         "--device", target_device,
         "--logger", "wandb",
         "--log_project_name", "Foundation",

@@ -120,7 +120,7 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
 
     history_len = 5
 
-    prob_null_trajectory = 0.0
+    prob_null_trajectory = 0.5
     trajectory_type = "langevin"
     train_or_play: bool = True
     use_pid = False
@@ -377,7 +377,7 @@ class QuadcopterEnv(DirectRLEnv):
         self.yaw_limit = math.pi / 2
 
         # === 在 __init__ 末尾添加 ===
-        self.delay_steps = 8  # 模拟 30ms 纯滞后 (100Hz 下 3 帧)
+        self.delay_steps = 8  
         self._action_queue = torch.zeros(
             self.num_envs, self.delay_steps, self.cfg.action_space, device=self.device
         )
@@ -979,7 +979,7 @@ class QuadcopterEnv(DirectRLEnv):
             if self.cfg.enable_curriculum:
                 eval_start, eval_end = 900, 1000
             else:
-                eval_start, eval_end = 700, 800
+                eval_start, eval_end = 900, 1000
             # ==========================================================
 
             # 判断当前迭代是否在这个区间内
@@ -1076,8 +1076,8 @@ class QuadcopterEnv(DirectRLEnv):
             ang_vel = sample_in_sphere(1.0, num_resets)            # 1rad/s 内的随机角速度
             
             # 随机旋转 (Roll, Pitch, Yaw)
-            r = (torch.rand(num_resets, device=self.device)*2-1) * (math.pi / 2.25)
-            p = (torch.rand(num_resets, device=self.device)*2-1) * (math.pi / 2.25)
+            r = (torch.rand(num_resets, device=self.device)*2-1) * (math.pi / 3)
+            p = (torch.rand(num_resets, device=self.device)*2-1) * (math.pi / 3)
             y = (torch.rand(num_resets, device=self.device)*2-1) * (math.pi / 6)
             quat = quat_from_euler_xyz(r, p, y)
             
