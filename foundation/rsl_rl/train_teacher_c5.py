@@ -95,10 +95,10 @@ def run_training(teacher_id, dynamics, timestamp, experiment_name, gpu_id=0, csv
     # 告诉 teacher_env.py 直接把 JSON 写到这里，永久保存
     env_vars["TEACHER_REWARD_PATH"] = metrics_file_abs
 
-    Pos_threshold = -50000
-    Ori_threshold = -10000
-    Smooth_threshold = -10000
-    Total_threshold = 0
+    Pos_threshold = -2000
+    Ori_threshold = -800
+    Smooth_threshold = -500
+    Total_threshold = 8000
 
     print(f"==================================================")
     print(f"Starting Teacher {teacher_id} | GPU {gpu_id} | Headless: {headless}")
