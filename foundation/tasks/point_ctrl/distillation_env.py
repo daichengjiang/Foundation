@@ -138,7 +138,7 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     noise_std_vel: float = 0.04    # 速度误差噪声 (m/s)
     noise_std_ang_vel: float = 0.1 # 角速度噪声 (rad/s)
 
-    prob_null_trajectory = 0.0  # 50% 概率做定点控制
+    prob_null_trajectory = 0.5  # 50% 概率做定点控制
 
     # 轨迹类型选择: "langevin" 或 "figure8"
     trajectory_type = "langevin"
@@ -453,7 +453,7 @@ class QuadcopterEnv(DirectRLEnv):
         # ================= [新增] 纯滞后动作队列 =================
         # 假设 dt = 0.01 (100Hz)，你想模拟 30ms 的纯通信/推理延迟，就是 3 帧
         # 根据你的实物情况，通常设置 3 到 5 帧
-        self.delay_steps = 4  # 包含 [T, T-1, T-2, T-3]，读取 [-1] 时刚好是 30ms 前的动作
+        self.delay_steps = 8  # 包含 [T, T-1, T-2, T-3]，读取 [-1] 时刚好是 30ms 前的动作
 
         # 建立一个维度为 (环境数, 延迟帧数, 动作维度) 的张量
         self._action_queue = torch.zeros(
@@ -1321,12 +1321,12 @@ class QuadcopterEnv(DirectRLEnv):
                 r = radius * torch.pow(torch.rand(n_samples, 1, device=self.device), 1.0 / 3.0)
                 return direction * r
 
-            pos_offset = sample_in_sphere(3.0 * l_arm, num_resets)
-            lin_vel = sample_in_sphere(0.5, num_resets)
-            ang_vel = sample_in_sphere(0.5, num_resets)
+            pos_offset = sample_in_sphere(10.0 * l_arm, num_resets)
+            lin_vel = sample_in_sphere(1.0, num_resets)
+            ang_vel = sample_in_sphere(1.0, num_resets)
             
-            roll = (torch.rand(num_resets, device=self.device) * 2 - 1) * (math.pi / 8)
-            pitch = (torch.rand(num_resets, device=self.device) * 2 - 1) * (math.pi / 8)
+            roll = (torch.rand(num_resets, device=self.device) * 2 - 1) * (math.pi / 3)
+            pitch = (torch.rand(num_resets, device=self.device) * 2 - 1) * (math.pi / 3)
             yaw = (torch.rand(num_resets, device=self.device) * 2 - 1) * (math.pi / 6)
             quat = quat_from_euler_xyz(roll, pitch, yaw)
 
