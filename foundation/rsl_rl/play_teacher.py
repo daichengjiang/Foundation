@@ -94,10 +94,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
     
     # Force figure-8 trajectory for testing
-    # env_cfg.trajectory_type = "figure8"
-    env_cfg.prob_null_trajectory = 1.0  # Disable null trajectory
+    env_cfg.trajectory_type = "figure8"
+    env_cfg.prob_null_trajectory = 0.0  # Disable null trajectory
 
-    env_cfg.train_or_play = True  # Set to Play mode
+    env_cfg.train_or_play = False  # Set to Play mode
     
     # Enable debug visualization for trajectory tracking
     env_cfg.debug_vis = True
@@ -109,7 +109,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env_cfg.use_pid = args_cli.use_pid
 
     # Example dynamics (Teacher usually works on specific dynamics)
-    dynamics_dict = [0.857210375547685,0.11292651113760344,0.008796937994213811,0.008796937994213811,0.016115990405399704,2.068083076253863,0.06900680967036621,0.1617734816673599,0.0137784351896969]
+    dynamics_dict = [1.045028350660195,0.10973166128291245,0.007480588837278927,0.007480588837278927,0.013704438749894994,2.5097208039981704,0.08375902134261277,0.25579559673830743,0.024000614342738206]
     env_cfg.dynamics.mass = dynamics_dict[0]
     env_cfg.dynamics.arm_length = dynamics_dict[1]
     env_cfg.dynamics.inertia = (dynamics_dict[2], dynamics_dict[3], dynamics_dict[4])

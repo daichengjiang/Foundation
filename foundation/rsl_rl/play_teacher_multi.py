@@ -1,68 +1,58 @@
-# Copyright (c) 2025 Xu Yang
-# HKUST UAV Group
+# Copyright (c) 2022-2025, The Isaac Lab Project Developers.
+# All rights reserved.
 #
-# Author: Xu Yang
-# Affiliation: HKUST UAV Group
-# License: MIT License
+# SPDX-License-Identifier: BSD-3-Clause
 
-"""Script to play and evaluate multiple teachers with heterogeneous dynamics AND models."""
+"""Script to play and evaluate multiple teacher models in parallel with heterogeneous dynamics and global statistics."""
+
+"""Launch Isaac Sim Simulator first."""
 
 import argparse
 import sys
 import os
 import glob
-import pandas as pd
-import torch
-import numpy as np
 import time
 import copy
+import csv
+import numpy as np
+import torch
+import multiprocessing as mp
+import matplotlib
+# 开启非交互式后端，极大提升多进程无头画图速度，并防止子进程崩溃
+matplotlib.use('Agg') 
+import matplotlib.pyplot as plt
+from matplotlib.collections import LineCollection
+from mpl_toolkits.mplot3d.art3d import Line3DCollection
 from datetime import datetime
 
-# [Headless Config must be before importing plt]
 from isaaclab.app import AppLauncher
+
 # local imports
 import cli_args  # isort: skip
 
 # add argparse arguments
-parser = argparse.ArgumentParser(description="Play multiple teachers with specific dynamics and models.")
+parser = argparse.ArgumentParser(description="Play and evaluate multiple teachers in parallel.")
 parser.add_argument("--video", action="store_true", default=False, help="Record videos during playing.")
 parser.add_argument("--video_length", type=int, default=2000, help="Length of the recorded video (in steps).")
-parser.add_argument("--task", type=str, default="offset", help="Name of the task (use offset for heterogeneous physics).")
-
-# ==============================================================================
-# [Unified Path Arguments]
-# ==============================================================================
-parser.add_argument("--teacher_dir", type=str, default=None, help="Path to the teacher experiment directory (containing csv and teacher_xxxx folders).")
-parser.add_argument("--teacher_ids", type=str, default="0", help="Comma-separated list or range (e.g., '0-4') of teacher IDs.")
-
-parser.add_argument("--envs_per_teacher", type=int, default=80, help="Number of environments per teacher ID.")
+parser.add_argument("--video_interval", type=int, default=10000, help="Interval between video recordings (in steps).")
+parser.add_argument("--task", type=str, default=None, required=True, help="Name of the task.")
 parser.add_argument("--seed", type=int, default=42, help="Seed used for the environment")
-parser.add_argument("--max_steps", type=int, default=8000, help="Maximum steps to run.")
+parser.add_argument("--max_steps", type=int, default=2000, help="Maximum steps to run for trajectory tracking.")
+parser.add_argument("--save_trajectory", action="store_true", default=True, help="Save trajectory data for analysis.")
 parser.add_argument(
     "--disable_fabric", action="store_true", default=False, help="Disable fabric and use USD I/O operations."
 )
+parser.add_argument("--realtime", action="store_true", default=False, help="Run in real-time, if possible.")
+
+# --- Multi-Teacher Arguments ---
+parser.add_argument("--teachers_dir", type=str, required=True, help="Path to the directory containing teacher_xxxx folders.")
+parser.add_argument("--envs_per_teacher", type=int, default=1, help="Number of environments to run per teacher.")
 
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
-
-# ==============================================================================
-# [Headless Matplotlib Configuration]
-# ==============================================================================
-import matplotlib
-if args_cli.headless:
-    print("[INFO] Headless mode detected. Setting Matplotlib backend to 'Agg'.")
-    matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-
-# ==============================================================================
-# [Manual Validation]
-# ==============================================================================
-if __name__ == "__main__":
-    if args_cli.teacher_dir is None:
-        parser.error("the following arguments are required: --teacher_dir")
 
 # always enable cameras to record video
 if args_cli.video:
@@ -75,311 +65,573 @@ sys.argv = [sys.argv[0]] + hydra_args
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
-# ==============================================================================
-# [CRITICAL] Imports that depend on Isaac Sim must happen AFTER app launch
-# ==============================================================================
+"""Rest everything follows."""
+
 import gymnasium as gym
+from isaaclab.utils.math import euler_xyz_from_quat
 from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper
 from rsl_rl.runners import OnPolicyRunner
-from isaaclab.envs import DirectMARLEnv, DirectRLEnvCfg, multi_agent_to_single_agent
-from isaaclab_tasks.utils.hydra import hydra_task_config
-from isaaclab.utils.math import matrix_from_quat  # [新增] 用于坐标系转换
 
-# Import your foundation tasks so 'offset' is registered in Gym!
+from isaaclab.envs import (
+    DirectMARLEnv,
+    DirectMARLEnvCfg,
+    DirectRLEnvCfg,
+    ManagerBasedRLEnvCfg,
+    multi_agent_to_single_agent,
+)
+from isaaclab.utils.dict import print_dict
+
+import isaaclab_tasks  # noqa: F401
+from isaaclab_tasks.utils.hydra import hydra_task_config
+
 from foundation import tasks
 
-# Statistics Start Step
-STATS_START_STEP = 5000
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.backends.cudnn.deterministic = False
+torch.backends.cudnn.benchmark = False
 
-def parse_teacher_config(teacher_dir, teacher_ids_str):
-    """
-    Loads dynamics and finds model paths based on teacher_distillation.py logic.
-    """
-    # 1. Parse IDs
-    teacher_ids = []
-    if '-' in teacher_ids_str:
-        start, end = map(int, teacher_ids_str.split('-'))
-        teacher_ids = list(range(start, end + 1))
-    else:
-        teacher_ids = [int(x) for x in teacher_ids_str.split(',')]
-    
-    # 2. Load CSV
-    csv_path = os.path.join(teacher_dir, "teacher_dynamics.csv")
-    if not os.path.exists(csv_path):
-        raise FileNotFoundError(f"Dynamics CSV not found at: {csv_path}")
-        
-    df = pd.read_csv(csv_path)
-    print(f"[INFO] Loaded dynamics from {csv_path}")
-    
-    teachers_data = []
+# ==========================================
+# CONFIGURATION: Statistics Start Step
+# ==========================================
+STATS_START_STEP = 1000
+# ==========================================
 
-    for t_id in teacher_ids:
-        row = df[df['id'] == t_id]
-        if row.empty:
-            raise ValueError(f"Teacher ID {t_id} not found in CSV.")
-        row = row.iloc[0]
-
-        params = {
-            "id": int(t_id),
-            "mass": float(row['mass']),
-            "arm_length": float(row['arm_length']),
-            "inertia": (float(row['Ixx']), float(row['Iyy']), float(row['Izz'])),
-            "twr": float(row['twr']) if 'twr' in row else float(row['thrust_to_weight']),
-            "motor_tau_up": float(row['motor_tau_up']) if 'motor_tau_up' in row else 0.05,
-            "motor_tau_down": float(row['motor_tau_down']) if 'motor_tau_down' in row else 0.07,
-            "kappa": float(row['kappa']) if 'kappa' in row else 0.016,
-        }
+# =========================================================================
+# 多模型策略聚合器 (Multi-Teacher Policy Wrapper)
+# =========================================================================
+class MultiTeacherPolicy(torch.nn.Module):
+    def __init__(self, checkpoints, runner, device, envs_per_teacher):
+        super().__init__()
+        self.policies = []
+        self.envs_per_teacher = envs_per_teacher
+        self.device = device
         
-        teacher_run_name = f"teacher_{t_id:04d}"
-        folder_path = os.path.join(teacher_dir, teacher_run_name)
-        model_path = os.path.join(folder_path, "best_model.pt")
-        if not os.path.exists(model_path):
-            search_pattern = os.path.join(folder_path, "model_*.pt")
-            models = glob.glob(search_pattern)
-            if not models:
-                print(f"[WARNING] No model found for teacher {t_id}. Will use random init.")
-                model_path = None
-            else:
-                model_path = max(models, key=os.path.getctime)
-        
-        params['model_path'] = model_path
-        teachers_data.append(params)
-        
-        if model_path:
-            print(f"  > [T-{t_id}] Mass={params['mass']:.3f} | Model: {os.path.basename(model_path)}")
-        else:
-            print(f"  > [T-{t_id}] Mass={params['mass']:.3f} | Model: NONE (Random)")
+        total_ckpts = len(checkpoints)
+        print(f"[INFO] 正在并行加载 {total_ckpts} 个 Teacher 模型...")
+        for i, ckpt in enumerate(checkpoints):
+            runner.load(ckpt, load_optimizer=False)
             
-    return teachers_data
+            ac = copy.deepcopy(runner.alg.policy).to(device)
+            ac.eval()
+            
+            if runner.obs_normalizer is not None:
+                norm = copy.deepcopy(runner.obs_normalizer).to(device)
+                norm.eval()
+            else:
+                norm = None
+                
+            self.policies.append((ac, norm))
+            
+            if (i + 1) % 10 == 0 or i == total_ckpts - 1:
+                print(f"       已加载模型: {i + 1}/{total_ckpts}")
+                
+        print(f"[INFO] 所有 Teacher 模型加载完毕！")
 
-def plot_error_distribution(teacher_id, mass, error_data, save_dir):
-    """
-    绘制并保存单个 Teacher 的误差分布图 (Body Frame)。
-    error_data shape: (N_samples, 3) where columns are Body X, Body Y, Body Z error
-    """
-    if len(error_data) > 10000:
-        indices = np.random.choice(len(error_data), 10000, replace=False)
-        data = error_data[indices]
-    else:
-        data = error_data
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        dummy_action = self.policies[0][0].act_inference(obs[0:1])
+        action_dim = dummy_action.shape[1]
+        
+        actions = torch.zeros((obs.shape[0], action_dim), device=self.device)
+        
+        for i, (ac, norm) in enumerate(self.policies):
+            start_idx = i * self.envs_per_teacher
+            end_idx = start_idx + self.envs_per_teacher
+            
+            env_obs = obs[start_idx:end_idx]
+            if norm is not None:
+                env_obs = norm(env_obs)
+                
+            actions[start_idx:end_idx] = ac.act_inference(env_obs)
+            
+        return actions
 
-    fig = plt.figure(figsize=(14, 12))
-    fig.suptitle(f"Teacher ID: {teacher_id} (Mass: {mass:.3f} kg)\nBody-Frame Position Error (m)", fontsize=16)
+    def reset(self, dones):
+        pass
 
-    # 1. 3D Scatter Plot (Top Left)
-    ax_3d = fig.add_subplot(2, 2, 1, projection='3d')
-    ax_3d.scatter(data[:, 0], data[:, 1], data[:, 2], s=1, alpha=0.3, c='blue')
-    ax_3d.set_xlabel('Body X (Forward) Error')
-    ax_3d.set_ylabel('Body Y (Left) Error')
-    ax_3d.set_zlabel('Body Z (Up) Error')
-    ax_3d.set_title('3D Error Cloud (Body Frame)')
-    ax_3d.scatter([0], [0], [0], c='red', marker='x', s=100, label='Target')
-
-    # 2. XY Plane - Top View (Top Right)
-    ax_xy = fig.add_subplot(2, 2, 2)
-    ax_xy.scatter(data[:, 0], data[:, 1], s=1, alpha=0.3, c='green')
-    ax_xy.set_xlabel('Body X (Forward) Error')
-    ax_xy.set_ylabel('Body Y (Left) Error')
-    ax_xy.set_title('Top View (XY)')
-    ax_xy.grid(True, linestyle='--', alpha=0.6)
-    ax_xy.scatter([0], [0], c='red', marker='x', s=100)
-    ax_xy.set_aspect('equal', 'box')
-
-    # 3. XZ Plane - Side View (Bottom Left)
-    ax_xz = fig.add_subplot(2, 2, 3)
-    ax_xz.scatter(data[:, 0], data[:, 2], s=1, alpha=0.3, c='purple')
-    ax_xz.set_xlabel('Body X (Forward) Error')
-    ax_xz.set_ylabel('Body Z (Up) Error')
-    ax_xz.set_title('Side View (XZ)')
-    ax_xz.grid(True, linestyle='--', alpha=0.6)
-    ax_xz.scatter([0], [0], c='red', marker='x', s=100)
-    ax_xz.set_aspect('equal', 'box')
-
-    # 4. YZ Plane - Front View (Bottom Right)
-    ax_yz = fig.add_subplot(2, 2, 4)
-    ax_yz.scatter(data[:, 1], data[:, 2], s=1, alpha=0.3, c='orange')
-    ax_yz.set_xlabel('Body Y (Left) Error')
-    ax_yz.set_ylabel('Body Z (Up) Error')
-    ax_yz.set_title('Front View (YZ)')
-    ax_yz.grid(True, linestyle='--', alpha=0.6)
-    ax_yz.scatter([0], [0], c='red', marker='x', s=100)
-    ax_yz.set_aspect('equal', 'box')
-
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+# =========================================================================
+# Paper Style 轨迹画图函数
+# =========================================================================
+def plot_paper_style_2d(desired_pos, actual_pos, actual_vel, save_path, title_suffix=""):
+    speed = np.linalg.norm(actual_vel, axis=1)
+    max_speed = np.max(speed) if np.max(speed) > 0 else 1.0
     
-    filename = f"teacher_{teacher_id:04d}_body_error.png"
-    plt.savefig(os.path.join(save_dir, filename), dpi=150)
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    norm = plt.Normalize(0, max_speed)
+    cmap = plt.get_cmap('plasma')
+    
+    planes = [
+        (0, 1, 'X (m)', 'Y (m)', f'XY Plane {title_suffix}'),
+        (0, 2, 'X (m)', 'Z (m)', f'XZ Plane {title_suffix}'),
+        (1, 2, 'Y (m)', 'Z (m)', f'YZ Plane {title_suffix}')
+    ]
+    
+    for i, (idx1, idx2, xlabel, ylabel, title) in enumerate(planes):
+        ax = axes[i]
+        ax.plot(desired_pos[:, idx1], desired_pos[:, idx2], 'k--', linewidth=1.0, alpha=0.5, label='Reference')
+        
+        points = np.array([actual_pos[:, idx1], actual_pos[:, idx2]]).T.reshape(-1, 1, 2)
+        segments = np.concatenate([points[:-1], points[1:]], axis=1)
+        
+        lc = LineCollection(segments, cmap=cmap, norm=norm)
+        lc.set_array(speed[:-1])
+        lc.set_linewidth(2.5)
+        line = ax.add_collection(lc)
+        
+        all_x = np.concatenate([desired_pos[:, idx1], actual_pos[:, idx1]])
+        all_y = np.concatenate([desired_pos[:, idx2], actual_pos[:, idx2]])
+        margin = 0.2
+        ax.set_xlim(all_x.min() - margin, all_x.max() + margin)
+        ax.set_ylim(all_y.min() - margin, all_y.max() + margin)
+        
+        ax.set_xlabel(xlabel, fontsize=12)
+        ax.set_ylabel(ylabel, fontsize=12)
+        ax.set_title(title, fontsize=14, fontweight='bold')
+        ax.grid(True, linestyle=':', alpha=0.6)
+        ax.axis('equal')
+
+    cbar_ax = fig.add_axes([0.92, 0.15, 0.015, 0.7])
+    cbar = fig.colorbar(line, cax=cbar_ax)
+    cbar.set_label('Speed [m/s]', fontsize=12)
+    plt.subplots_adjust(wspace=0.3, right=0.9)
+    plt.savefig(save_path, dpi=200, bbox_inches='tight')
     plt.close(fig)
 
-@hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
-def main(env_cfg: DirectRLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg):
-    """Play with multiple teachers, each having its own dynamics and model."""
+def plot_paper_style_3d(desired_pos, actual_pos, actual_vel, save_path, title_suffix=""):
+    speed = np.linalg.norm(actual_vel, axis=1)
+    max_speed = np.max(speed) if np.max(speed) > 0 else 1.0
     
-    # 1. 路径准备
-    csv_path = os.path.join(args_cli.teacher_dir, "teacher_dynamics.csv")
+    fig = plt.figure(figsize=(10, 8))
+    ax = fig.add_subplot(111, projection='3d')
     
-    # 2. Parse Configs and Find Models
-    print(f"\n{'='*60}")
-    print(f"Heterogeneous Multi-Teacher Evaluation Setup")
-    print(f"Teacher Dir: {args_cli.teacher_dir}")
+    ax.plot(desired_pos[:, 0], desired_pos[:, 1], desired_pos[:, 2], 
+            'k--', linewidth=0.8, alpha=0.4, label='Reference')
     
-    teachers_data = parse_teacher_config(args_cli.teacher_dir, args_cli.teacher_ids)
-    num_teachers = len(teachers_data)
-    envs_per_teacher = args_cli.envs_per_teacher
-    total_envs = num_teachers * envs_per_teacher
+    points = np.array([actual_pos[:, 0], actual_pos[:, 1], actual_pos[:, 2]]).T.reshape(-1, 1, 3)
+    segments = np.concatenate([points[:-1], points[1:]], axis=1)
     
-    print(f"Teachers Selected: {num_teachers}")
-    print(f"Envs per Teacher: {envs_per_teacher}")
-    print(f"Total Environments: {total_envs}")
-    print(f"{'='*60}\n")
+    norm = plt.Normalize(0, max_speed)
+    cmap = plt.get_cmap('plasma')
+    
+    lc = Line3DCollection(segments, cmap=cmap, norm=norm)
+    lc.set_array(speed[:-1])
+    lc.set_linewidth(2.0)
+    ax.add_collection(lc)
+    
+    max_range = np.array([
+        actual_pos[:, 0].max() - actual_pos[:, 0].min(),
+        actual_pos[:, 1].max() - actual_pos[:, 1].min(),
+        actual_pos[:, 2].max() - actual_pos[:, 2].min()
+    ]).max() / 2.0
+    
+    mid_x = (actual_pos[:, 0].max() + actual_pos[:, 0].min()) * 0.5
+    mid_y = (actual_pos[:, 1].max() + actual_pos[:, 1].min()) * 0.5
+    mid_z = (actual_pos[:, 2].max() + actual_pos[:, 2].min()) * 0.5
+    
+    ax.set_xlim(mid_x - max_range, mid_x + max_range)
+    ax.set_ylim(mid_y - max_range, mid_y + max_range)
+    ax.set_zlim(mid_z - max_range, mid_z + max_range)
+    
+    ax.set_xlabel('X (m)')
+    ax.set_ylabel('Y (m)')
+    ax.set_zlabel('Z (m)')
+    ax.set_title(f'3D Trajectory {title_suffix}', fontsize=14, fontweight='bold')
+    
+    cbar = fig.colorbar(lc, ax=ax, fraction=0.03, pad=0.1)
+    cbar.set_label('Speed [m/s]', fontsize=12)
+    plt.savefig(save_path, dpi=200, bbox_inches='tight')
+    plt.close(fig)
 
-    # 3. Configure Environment
-    env_cfg.scene.num_envs = total_envs
-    env_cfg.dynamics.multi_teacher_params = teachers_data
+# =========================================================================
+# 多进程工作节点函数 (Worker Function)
+# =========================================================================
+def worker_save_and_plot(args):
+    """供子进程独立调用的画图与数据保存函数"""
+    (teacher_id, teacher_folder, checkpoint, assigned_param,
+     dp, ap, dv, av, dy, ay, acts, t_arr,
+     rmse, rmse_xy, yaw_rmse, max_vel, stats_start_step) = args
+
+    stats_txt_path = os.path.join(teacher_folder, "tracking_statistics.txt")
+    with open(stats_txt_path, 'w') as f:
+        f.write(f"Teacher {teacher_id:04d} Tracking Statistics\n")
+        f.write(f"{'=' * 45}\n")
+        f.write(f"RMSE [m]:        {rmse:.4f}\n")
+        f.write(f"RMSE w/o z [m]:  {rmse_xy:.4f}\n")
+        f.write(f"Yaw RMSE [deg]:  {yaw_rmse:.4f}\n")
+        f.write(f"Max Vel [m/s]:   {max_vel:.4f}\n")
+        f.write(f"{'-' * 45}\n")
+        f.write(f"Source Checkpoint: {checkpoint}\n")
+        f.write(f"\n[Environment Dynamics Parameters]\n")
+        f.write(f"  Mass:          {assigned_param['mass']:.4f} kg\n")
+        f.write(f"  Arm Length:    {assigned_param['arm_length']:.4f} m\n")
+        f.write(f"  TWR:           {assigned_param['twr']:.4f}\n")
+        f.write(f"  Ixx:           {assigned_param['inertia'][0]:.4e}\n")
+        f.write(f"  Iyy:           {assigned_param['inertia'][1]:.4e}\n")
+        f.write(f"  Izz:           {assigned_param['inertia'][2]:.4e}\n")
+
+    path_2d = os.path.join(teacher_folder, '2d_velocity_trajectory.png')
+    plot_paper_style_2d(dp, ap, av, save_path=path_2d, title_suffix=f"- Teacher {teacher_id:04d}")
     
-    env_cfg.train_or_play = False
-    env_cfg.prob_null_trajectory = 0.0   
-    env_cfg.trajectory_type = "fixed"    
-    env_cfg.debug_vis = True            
+    path_3d = os.path.join(teacher_folder, '3d_velocity_trajectory.png')
+    plot_paper_style_3d(dp, ap, av, save_path=path_3d, title_suffix=f"- Teacher {teacher_id:04d}")
+
+    fig, axs = plt.subplots(4, 1, figsize=(10, 12), sharex=True)
+    fig.suptitle(f"Tracking Performance - Teacher {teacher_id:04d}", fontsize=16, fontweight='bold')
+    
+    axs[0].plot(t_arr, dp[:, 0], 'r--', label='Desired X', linewidth=2)
+    axs[0].plot(t_arr, ap[:, 0], 'b-', label='Actual X', alpha=0.8)
+    axs[0].set_ylabel('Pos X (m)')
+    axs[0].grid(True, linestyle='--', alpha=0.6)
+
+    axs[1].plot(t_arr, dp[:, 1], 'r--', label='Desired Y', linewidth=2)
+    axs[1].plot(t_arr, ap[:, 1], 'b-', label='Actual Y', alpha=0.8)
+    axs[1].set_ylabel('Pos Y (m)')
+    axs[1].grid(True, linestyle='--', alpha=0.6)
+
+    axs[2].plot(t_arr, dp[:, 2], 'r--', label='Desired Z', linewidth=2)
+    axs[2].plot(t_arr, ap[:, 2], 'b-', label='Actual Z', alpha=0.8)
+    axs[2].set_ylabel('Pos Z (m)')
+    axs[2].grid(True, linestyle='--', alpha=0.6)
+
+    axs[3].plot(t_arr, np.degrees(dy), 'r--', label='Desired Yaw', linewidth=2)
+    axs[3].plot(t_arr, np.degrees(ay), 'b-', label='Actual Yaw', alpha=0.8)
+    axs[3].set_ylabel('Yaw (deg)')
+    axs[3].set_xlabel('Time (s)')
+    axs[3].grid(True, linestyle='--', alpha=0.6)
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(teacher_folder, "tracking_curves_vs_time.png"), dpi=150)
+    plt.close(fig)
+
+    np.savez_compressed(
+        os.path.join(teacher_folder, "trajectory_data.npz"),
+        timestamps=t_arr,
+        desired_pos=dp, actual_pos=ap, 
+        desired_vel=dv, actual_vel=av,
+        desired_yaw=dy, actual_yaw=ay,
+        actions=acts,
+        metrics=np.array([rmse, rmse_xy, max_vel, stats_start_step]),
+        dynamics=assigned_param
+    )
+    
+    return teacher_id
+
+# =========================================================================
+# 主函数入口
+# =========================================================================
+@hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
+def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg):
+    """Play and evaluate multi-teacher trajectory tracking."""
+    agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
+    
+    teacher_dirs = sorted(glob.glob(os.path.join(args_cli.teachers_dir, "teacher_*")))
+    checkpoints = [os.path.join(d, "best_model.pt") for d in teacher_dirs if os.path.exists(os.path.join(d, "best_model.pt"))]
+    
+    num_teachers = len(checkpoints)
+    if num_teachers == 0:
+        raise ValueError(f"未在 {args_cli.teachers_dir} 找到任何包含 best_model.pt 的 teacher 文件夹！")
+        
+    num_envs_total = num_teachers * args_cli.envs_per_teacher
+    env_cfg.scene.num_envs = num_envs_total
+
+    env_cfg.trajectory_type = "figure8"
+    env_cfg.prob_null_trajectory = 0.0
+    env_cfg.train_or_play = True
+    env_cfg.debug_vis = True
+    
     env_cfg.seed = args_cli.seed
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
+    env_cfg.sim.use_fabric = not args_cli.disable_fabric if args_cli.disable_fabric is not None else env_cfg.sim.use_fabric
+
+    # --- 读取 CSV 并赋予异构动力学 ---
+    csv_path = os.path.join(args_cli.teachers_dir, "teacher_dynamics.csv")
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(f"[ERROR] 找不到对应的动力学参数文件: {csv_path}")
+
+    dynamics_map = {}
+    with open(csv_path, mode='r', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            dynamics_map[int(row['id'])] = {
+                'mass': float(row['mass']),
+                'arm_length': float(row['arm_length']),
+                'inertia': (float(row['Ixx']), float(row['Iyy']), float(row['Izz'])),
+                'twr': float(row['twr']),
+                'motor_tau_up': float(row['motor_tau_up']),
+                'motor_tau_down': float(row['motor_tau_down']),
+                'kappa': float(row['kappa'])
+            }
+
+    multi_env_params = []
+    for i in range(num_teachers):
+        teacher_id = int(os.path.basename(teacher_dirs[i]).split('_')[1])
+        if teacher_id not in dynamics_map:
+            raise ValueError(f"[ERROR] CSV 中缺失 id={teacher_id} 的动力学参数！")
+        base_param = dynamics_map[teacher_id]
+        
+        for j in range(args_cli.envs_per_teacher):
+            global_env_idx = i * args_cli.envs_per_teacher + j
+            multi_env_params.append({
+                'id': global_env_idx,
+                'mass': base_param['mass'],
+                'arm_length': base_param['arm_length'],
+                'inertia': base_param['inertia'],
+                'twr': base_param['twr'],
+                'motor_tau_up': base_param['motor_tau_up'],
+                'motor_tau_down': base_param['motor_tau_down'],
+                'kappa': base_param['kappa']
+            })
+
+    env_cfg.dynamics.multi_teacher_params = multi_env_params
+
+    log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
+    log_root_path = os.path.abspath(log_root_path)
+    log_dir = datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + "_multiteacher_eval"
+    log_dir = os.path.join(log_root_path, log_dir)
+    os.makedirs(log_dir, exist_ok=True)
     
-    # 4. Create Environment
+    print(f"\n{'=' * 80}")
+    print(f" Multi-Teacher Evaluation Initialization ")
+    print(f" Found Teachers: {num_teachers}")
+    print(f" Envs Per Teacher: {args_cli.envs_per_teacher}")
+    print(f" Total Envs: {num_envs_total}")
+    print(f" Logging to: {log_dir}")
+    print(f"{'=' * 80}\n")
+
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
+
     if isinstance(env.unwrapped, DirectMARLEnv):
         env = multi_agent_to_single_agent(env)
-    env_wrapper = RslRlVecEnvWrapper(env)
-    
-    base_env = env.unwrapped
-    device = base_env.device
 
-    # 5. Load Policies
-    print("[INFO] Loading individual policies for each teacher...")
-    runner = OnPolicyRunner(env_wrapper, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
-    policies = []
-    for idx, params in enumerate(teachers_data):
-        model_path = params['model_path']
-        if model_path is None or not os.path.exists(model_path):
-            policy_copy = copy.deepcopy(runner.get_inference_policy(device=agent_cfg.device))
-        else:
-            runner.load(model_path, load_optimizer=False)
-            runner.eval_mode()
-            policy_copy = copy.deepcopy(runner.get_inference_policy(device=agent_cfg.device))
-        policies.append(policy_copy)
-    print(f"[INFO] All {len(policies)} policies loaded.")
+    env = RslRlVecEnvWrapper(env)
+    
+    runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
+    policy = MultiTeacherPolicy(checkpoints, runner, agent_cfg.device, args_cli.envs_per_teacher)
 
-    # 6. 运行仿真
-    obs, _ = env_wrapper.get_observations()
+    dt = env.unwrapped.step_dt
+    obs, _ = env.get_observations()
     
-    squared_error_sum = torch.zeros((num_teachers, envs_per_teacher), device=device)
-    pos_error_sum = torch.zeros((num_teachers, envs_per_teacher, 3), device=device)
-    raw_error_history = [] 
+    time_history, des_pos_history, act_pos_history = [], [], []
+    des_vel_history, act_vel_history = [], []
+    des_yaw_history, act_yaw_history, actions_history = [], [], []
     
-    sample_count = 0
+    total_squared_error_per_env = np.zeros(num_envs_total)
+    total_squared_error_xy_per_env = np.zeros(num_envs_total)
+    total_squared_yaw_error_per_env = np.zeros(num_envs_total)
+    max_velocity_per_env = np.zeros(num_envs_total)
+    total_samples_per_env = np.zeros(num_envs_total)
     
-    print(f"[INFO] Starting simulation for {args_cli.max_steps} steps...")
+    import omni.timeline
+    timeline = omni.timeline.get_timeline_interface()
+    print("[INFO] 环境加载完毕。已强制暂停仿真。")
+    print("[INFO] 👉 请在 Isaac Sim 窗口中调整视角，准备好后按下【空格键】开始运行！")
+    timeline.pause()
     
-    for timestep in range(args_cli.max_steps):
+    timestep = 0
+    start_time = time.time()
+
+    # --- 仿真主循环 ---
+    while simulation_app.is_running() and timestep < args_cli.max_steps:
+        step_start_time = time.time()
+        
         with torch.inference_mode():
-            # 分段推理
-            action_list = []
-            for idx in range(num_teachers):
-                start = idx * envs_per_teacher
-                end = (idx + 1) * envs_per_teacher
-                action_list.append(policies[idx](obs[start:end]))
-            actions = torch.cat(action_list, dim=0)
-
-            obs, rewards, dones, extras = env_wrapper.step(actions)
+            desired_pos = env.unwrapped.pos_des.clone()
+            desired_vel = env.unwrapped.vel_des.clone()
             
+            actions = policy(obs)
+            obs, rewards, dones, extras = env.step(actions)
+
+            current_pos = env.unwrapped._robot.data.root_pos_w.clone()
+            current_vel = env.unwrapped._robot.data.root_lin_vel_w.clone()
+            
+            pos_error_vec = current_pos - desired_pos
+            squared_error = torch.sum(pos_error_vec**2, dim=1) 
+            squared_error_xy = torch.sum(pos_error_vec[:, :2]**2, dim=1) 
+            vel_mag = torch.norm(current_vel, dim=1)
+
+            quat_w = env.unwrapped._robot.data.root_quat_w
+            _, _, yaw_curr = euler_xyz_from_quat(quat_w)
+            
+            if args_cli.save_trajectory:
+                time_history.append(timestep * dt)
+                des_pos_history.append(desired_pos.cpu().numpy())
+                act_pos_history.append(current_pos.cpu().numpy())
+                des_vel_history.append(desired_vel.cpu().numpy())
+                act_vel_history.append(current_vel.cpu().numpy())
+                des_yaw_history.append(env.unwrapped.yaw_des.cpu().numpy())
+                act_yaw_history.append(yaw_curr.cpu().numpy())
+                actions_history.append(actions.cpu().numpy())
+
             if timestep >= STATS_START_STEP:
-                # 获取世界系坐标
-                current_pos_w = base_env._robot.data.root_pos_w
-                desired_pos_w = base_env.pos_des
-                current_quat_w = base_env._robot.data.root_quat_w
+                total_squared_error_per_env += squared_error.cpu().numpy()
+                total_squared_error_xy_per_env += squared_error_xy.cpu().numpy()
                 
-                # 计算世界系误差: P_err_w = P_drone - P_target
-                raw_error_w = current_pos_w - desired_pos_w
-                
-                # --- [Coordinate Transformation] ---
-                # 1. Quat -> Rot Matrix (Body to World)
-                rot_b2w = matrix_from_quat(current_quat_w)
-                # 2. Transpose -> Rot Matrix (World to Body)
-                rot_w2b = rot_b2w.transpose(1, 2)
-                
-                # 3. Transform Error: P_err_b = R_w2b @ P_err_w
-                # unsqueeze(-1) makes it (N, 3, 1) for multiplication
-                raw_error_b = torch.bmm(rot_w2b, raw_error_w.unsqueeze(-1)).squeeze(-1)
-                
-                # 统计和记录都使用 Body Frame Error
-                error_sq = torch.norm(raw_error_b, dim=1) ** 2
-                squared_error_sum += error_sq.view(num_teachers, envs_per_teacher)
-                pos_error_sum += raw_error_b.view(num_teachers, envs_per_teacher, 3)
-                
-                raw_error_history.append(raw_error_b.view(num_teachers, envs_per_teacher, 3).clone())
-                
-                sample_count += 1
-        
-        if timestep % 100 == 0:
-            print(f"Step {timestep}/{args_cli.max_steps}")
+                batch_yaw_err = env.unwrapped.yaw_des - yaw_curr
+                batch_yaw_err = torch.remainder(batch_yaw_err + torch.pi, 2 * torch.pi) - torch.pi
+                total_squared_yaw_error_per_env += (batch_yaw_err**2).cpu().numpy()
 
-    # 7. 计算统计结果
-    mean_mse_per_teacher = squared_error_sum.sum(dim=1) / (sample_count * envs_per_teacher)
-    rmse_per_teacher = torch.sqrt(mean_mse_per_teacher).cpu().numpy()
+                current_vels_np = vel_mag.cpu().numpy()
+                max_velocity_per_env = np.maximum(max_velocity_per_env, current_vels_np)
+                total_samples_per_env += 1
+                        
+            timestep += 1
+            
+            if timestep % 200 == 0:
+                cur_mean_rmse = np.sqrt(torch.mean(squared_error).item())
+                status = " (Collecting Stats)" if timestep >= STATS_START_STEP else " (Warmup)"
+                print(f"Step {timestep:5d}/{args_cli.max_steps}{status} | Batch Mean RMSE: {cur_mean_rmse:.4f}m")
+                
+        if args_cli.realtime:
+            sleep_time = dt - (time.time() - step_start_time)
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+
+    # ==========================================================
+    # 全局数据统计与最差 10% 筛选 (新增模块)
+    # ==========================================================
+    print(f"\n[INFO] 仿真结束，正在计算全局统计指标并筛查劣质 Teacher...")
     
-    mean_pos_error = pos_error_sum.sum(dim=1) / (sample_count * envs_per_teacher)
-    mean_pos_error_cpu = mean_pos_error.cpu().numpy()
+    valid_samples = np.maximum(total_samples_per_env, 1)
+    rmse_per_env = np.sqrt(total_squared_error_per_env / valid_samples)
+    rmse_xy_per_env = np.sqrt(total_squared_error_xy_per_env / valid_samples)
+    yaw_rmse_per_env = np.degrees(np.sqrt(total_squared_yaw_error_per_env / valid_samples))
 
-    # 8. 更新 CSV 文件 (Offsets Only - Now in Body Frame)
-    print(f"\n[INFO] Updating CSV file with BODY FRAME offsets: {csv_path}")
-    df = pd.read_csv(csv_path)
-    update_data = {'x_off_mean': {}, 'y_off_mean': {}, 'z_off_mean': {}}
-
-    for idx, params in enumerate(teachers_data):
-        t_id = params['id']
-        update_data['x_off_mean'][t_id] = float(mean_pos_error_cpu[idx, 0])
-        update_data['y_off_mean'][t_id] = float(mean_pos_error_cpu[idx, 1])
-        update_data['z_off_mean'][t_id] = float(mean_pos_error_cpu[idx, 2])
-
-    for col in ['x_off_mean', 'y_off_mean', 'z_off_mean']:
-        if col in df.columns:
-            df[col] = df['id'].map(update_data[col]).fillna(df[col])
-        else:
-            df[col] = df['id'].map(update_data[col]).fillna(0.0)
-
-    df.to_csv(csv_path, index=False)
-    print(f"[SUCCESS] CSV updated successfully.")
-
-    # 9. 生成点云分布图 (Body Frame)
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    plot_dir = os.path.join(args_cli.teacher_dir, f"error_plots_body_{timestamp}")
-    os.makedirs(plot_dir, exist_ok=True)
-    print(f"\n[INFO] Generating BODY FRAME error plots in: {plot_dir}")
-
-    print("  -> Processing plotting data...")
-    all_errors_gpu = torch.stack(raw_error_history, dim=0) 
-    
-    for idx, params in enumerate(teachers_data):
-        t_id = params['id']
-        mass = params['mass']
-        teacher_errors = all_errors_gpu[:, idx, :, :].reshape(-1, 3).cpu().numpy()
+    # 聚合每个 Teacher 的平均表现 (应对 envs_per_teacher > 1 的情况)
+    teacher_metrics_list = []
+    for i in range(num_teachers):
+        start_idx = i * args_cli.envs_per_teacher
+        end_idx = start_idx + args_cli.envs_per_teacher
+        teacher_id = int(os.path.basename(teacher_dirs[i]).split('_')[1])
         
-        print(f"  -> Plotting Teacher {t_id} (Samples: {len(teacher_errors)})...")
-        plot_error_distribution(t_id, mass, teacher_errors, plot_dir)
+        t_rmse = np.mean(rmse_per_env[start_idx:end_idx])
+        t_rmse_xy = np.mean(rmse_xy_per_env[start_idx:end_idx])
+        t_yaw = np.mean(yaw_rmse_per_env[start_idx:end_idx])
+        
+        teacher_metrics_list.append({
+            'id': teacher_id,
+            'rmse': t_rmse,
+            'rmse_xy': t_rmse_xy,
+            'yaw': t_yaw,
+            'param': dynamics_map[teacher_id],
+            'ckpt': checkpoints[i],
+            'env_start_idx': start_idx # 留给后面画图传参用
+        })
 
-    print(f"[SUCCESS] All plots saved to {plot_dir}")
+    # 计算全局分布统计量
+    all_rmses = np.array([m['rmse'] for m in teacher_metrics_list])
+    all_rmse_xys = np.array([m['rmse_xy'] for m in teacher_metrics_list])
+    all_yaws = np.array([m['yaw'] for m in teacher_metrics_list])
 
-    # 10. 打印报告
-    print(f"\n{'='*100}")
-    print(f"{'ID':<5} | {'Mass':<8} | {'RMSE':<10} | {'Body_X':<8} | {'Body_Y':<8} | {'Body_Z':<8}")
-    print(f"{'-'*100}")
-    for idx, params in enumerate(teachers_data):
-        t_id = params['id']
-        print(f"{t_id:<5} | {params['mass']:<8.3f} | {rmse_per_teacher[idx]:<10.4f} | "
-              f"{mean_pos_error_cpu[idx,0]:<8.4f} | {mean_pos_error_cpu[idx,1]:<8.4f} | {mean_pos_error_cpu[idx,2]:<8.4f}")
-    print(f"{'='*100}\n")
+    # 绘制并保存全局分布直方图
+    fig, axs = plt.subplots(1, 3, figsize=(15, 4))
+    axs[0].hist(all_rmses, bins=20, color='skyblue', edgecolor='black')
+    axs[0].set_title('Global RMSE Distribution (m)')
+    axs[0].set_xlabel('RMSE')
+    axs[0].set_ylabel('Frequency')
+    
+    axs[1].hist(all_rmse_xys, bins=20, color='lightgreen', edgecolor='black')
+    axs[1].set_title('Global RMSE w/o Z Distribution (m)')
+    axs[1].set_xlabel('RMSE XY')
+    
+    axs[2].hist(all_yaws, bins=20, color='salmon', edgecolor='black')
+    axs[2].set_title('Global Yaw RMSE Distribution (deg)')
+    axs[2].set_xlabel('Yaw RMSE')
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(log_dir, 'global_metrics_distribution.png'), dpi=150)
+    plt.close(fig)
+
+    # 筛选最差的 10% (以 3D RMSE 为主指标进行降序排列)
+    num_worst = max(1, int(num_teachers * 0.1))
+    sorted_teachers = sorted(teacher_metrics_list, key=lambda x: x['rmse'], reverse=True)
+    worst_10_percent = sorted_teachers[:num_worst]
+
+    # 将全局统计报告写入文件
+    global_report_path = os.path.join(log_dir, "global_evaluation_report.txt")
+    with open(global_report_path, 'w') as f:
+        f.write(f"RAPTOR Multi-Teacher Global Evaluation Report\n")
+        f.write(f"{'=' * 60}\n")
+        f.write(f"Total Teachers Evaluated: {num_teachers}\n")
+        f.write(f"Envs per Teacher:         {args_cli.envs_per_teacher}\n")
+        f.write(f"Total Simulation Steps:   {args_cli.max_steps}\n")
+        f.write(f"Stats Calculation Start:  Step {STATS_START_STEP}\n\n")
+        
+        f.write(f"--- Global Performance Statistics ---\n")
+        f.write(f"{'Metric':<15} | {'Mean':<8} | {'Median':<8} | {'Std Dev':<8} | {'Min':<8} | {'Max':<8}\n")
+        f.write(f"{'-' * 60}\n")
+        f.write(f"{'RMSE (m)':<15} | {np.mean(all_rmses):.4f}   | {np.median(all_rmses):.4f}   | {np.std(all_rmses):.4f}   | {np.min(all_rmses):.4f}   | {np.max(all_rmses):.4f}\n")
+        f.write(f"{'RMSE XY (m)':<15} | {np.mean(all_rmse_xys):.4f}   | {np.median(all_rmse_xys):.4f}   | {np.std(all_rmse_xys):.4f}   | {np.min(all_rmse_xys):.4f}   | {np.max(all_rmse_xys):.4f}\n")
+        f.write(f"{'Yaw RMSE (deg)':<15} | {np.mean(all_yaws):.4f}   | {np.median(all_yaws):.4f}   | {np.std(all_yaws):.4f}   | {np.min(all_yaws):.4f}   | {np.max(all_yaws):.4f}\n\n")
+
+        f.write(f"--- ⚠️ WARNING: Bottom 10% Teachers (Worst Tracking Accuracy) ---\n")
+        for i, bad_t in enumerate(worst_10_percent):
+            f.write(f"\n[Rank {i+1} Worst] Teacher ID: {bad_t['id']:04d}\n")
+            f.write(f"  -> RMSE: {bad_t['rmse']:>6.4f}m | RMSE XY: {bad_t['rmse_xy']:>6.4f}m | Yaw RMSE: {bad_t['yaw']:>6.4f}deg\n")
+            f.write(f"  -> Target Mass: {bad_t['param']['mass']:.4f}kg | Arm: {bad_t['param']['arm_length']:.4f}m | TWR: {bad_t['param']['twr']:.2f}\n")
+            f.write(f"  -> Checkpoint: {bad_t['ckpt']}\n")
+
+    print(f"[INFO] 全局统计完毕！报告已生成: {global_report_path}")
+
+    # ==========================================================
+    # 进入原有的多进程并行出图环节
+    # ==========================================================
+    if args_cli.save_trajectory and len(time_history) > 0:
+        t_arr = np.array(time_history)
+        des_pos_arr = np.array(des_pos_history)
+        act_pos_arr = np.array(act_pos_history)
+        des_vel_arr = np.array(des_vel_history)
+        act_vel_arr = np.array(act_vel_history)
+        des_yaw_arr = np.array(des_yaw_history)
+        act_yaw_arr = np.array(act_yaw_history)
+        actions_arr = np.array(actions_history)
+
+        tasks_list = []
+        for t_metric in teacher_metrics_list:
+            teacher_id = t_metric['id']
+            env_idx = t_metric['env_start_idx'] # 提取该教师的第一个环境用于出图
+            assigned_param = t_metric['param']
+            
+            teacher_folder = os.path.join(log_dir, f"teacher_{teacher_id:04d}")
+            os.makedirs(teacher_folder, exist_ok=True)
+            
+            task_args = (
+                teacher_id, teacher_folder, t_metric['ckpt'], assigned_param,
+                des_pos_arr[:, env_idx, :], act_pos_arr[:, env_idx, :], 
+                des_vel_arr[:, env_idx, :], act_vel_arr[:, env_idx, :],
+                des_yaw_arr[:, env_idx], act_yaw_arr[:, env_idx], actions_arr[:, env_idx, :],
+                t_arr,
+                rmse_per_env[env_idx], rmse_xy_per_env[env_idx], yaw_rmse_per_env[env_idx],
+                max_velocity_per_env[env_idx], STATS_START_STEP
+            )
+            tasks_list.append(task_args)
+
+        num_cores = max(1, mp.cpu_count() - 2) 
+        print(f"\n[INFO] 正在启动多进程加速池生成子文件夹图表 (使用 {num_cores} 个核心)...")
+        
+        with mp.Pool(processes=num_cores) as pool:
+            for count, completed_teacher_id in enumerate(pool.imap_unordered(worker_save_and_plot, tasks_list), 1):
+                print(f"       [{count}/{num_teachers}] 已成功生成 Teacher {completed_teacher_id:04d} 的图表与数据包")
+            
+            # (可选) 确保子进程被干净利落回收
+            pool.terminate()
+            pool.join()
+
+        print(f"\n[SUCCESS] 全部并行渲染完毕！所有分析结果存放于: {log_dir}")
+        
+        print("[INFO] 评估任务已全部彻底完成！触发强退指令。")
+        os._exit(0)  # 直接物理断电，规避 Isaac Sim 退出时的假死
 
     env.close()
 
 if __name__ == "__main__":
     main()
-    simulation_app.close()
+    print("[INFO] 正在关闭 Isaac Sim 底层引擎...")
+    try:
+        simulation_app.close()
+    except Exception as e:
+        print(f"[WARNING] 引擎关闭异常: {e}")
+        
+    print("[INFO] 评估任务已全部彻底完成！")
+    
+    # 直接调用即可，注意要和上方的 print 保持同样的缩进（或者顶格写）
+    os._exit(0)

@@ -29,6 +29,7 @@ parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy 
 
 parser.add_argument("--teacher_dir", type=str, default=None, required=True, help="Path to the teacher experiment directory.")
 parser.add_argument("--teacher_ids", type=str, default="0", help="Comma-separated list of teacher IDs.")
+parser.add_argument("--exclude_teacher_ids", type=str, default="", help="Comma-separated list of teacher IDs to exclude (e.g., '141,14,78').")
 parser.add_argument("--use_pid", action="store_true", default=False, help="the flag to indicate use pid controller or not")
 
 cli_args.add_rsl_rl_args(parser)
@@ -127,9 +128,22 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         start, end = map(int, args_cli.teacher_ids.split('-'))
         teacher_ids = list(range(start, end + 1))
     else:
-        teacher_ids = [int(x) for x in args_cli.teacher_ids.split(',')]
+        # 加上 if x.strip() 防止末尾多余逗号报错
+        teacher_ids = [int(x) for x in args_cli.teacher_ids.split(',') if x.strip()]
     
+    # 👇 新增：劣质 Teacher 剔除逻辑
+    if args_cli.exclude_teacher_ids:
+        exclude_ids = [int(x.strip()) for x in args_cli.exclude_teacher_ids.split(',') if x.strip()]
+        original_count = len(teacher_ids)
+        # 过滤掉存在于 exclude_ids 中的教师
+        teacher_ids = [t_id for t_id in teacher_ids if t_id not in exclude_ids]
+        print(f"\n[INFO] 发现过滤指令！已成功剔除 {original_count - len(teacher_ids)} 个劣质 Teacher。")
+        print(f"       剔除名单: {exclude_ids}\n")
+
     num_teachers = len(teacher_ids)
+    if num_teachers == 0:
+        raise ValueError("[ERROR] 剔除后没有任何 Teacher 剩余，请检查参数！")
+        
     print(f"Target Teachers ({num_teachers}): {teacher_ids}")
     
     if env_cfg.scene.num_envs % num_teachers != 0:
@@ -213,6 +227,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     print(f"{'='*60}\n")
 
+    # ... 前面的代码保持不变 ...
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
     log_root_path = os.path.abspath(log_root_path)
     print(f"[INFO] Logging experiment in directory: {log_root_path}")
@@ -221,10 +236,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if agent_cfg.run_name:
         log_dir += f"_{agent_cfg.run_name}"
     
-    if len(teacher_ids) > 1:
-        log_dir += f"_MultiT_{min(teacher_ids)}-{max(teacher_ids)}"
-    else:
-        log_dir += f"_T{teacher_ids[0]}"
+    # --- 新增命名逻辑 ---
+    # 始终显示 ID 范围
+    log_dir += f"_MultiT_{min(teacher_ids)}-{max(teacher_ids)}"
+    
+    # 如果有剔除，追加标记
+    if args_cli.exclude_teacher_ids:
+        # 将逗号替换为连字符，看起来更整洁
+        clean_excl = args_cli.exclude_teacher_ids.replace(',', '-')
+        log_dir += f"_Excluded{clean_excl}"
         
     log_dir = os.path.join(log_root_path, log_dir)
 
