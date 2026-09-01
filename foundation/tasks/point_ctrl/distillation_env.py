@@ -784,6 +784,7 @@ class QuadcopterEnv(DirectRLEnv):
                     print(f"[*] Drag Angular Acc     : {ang_acc_drag_b.cpu().numpy()} rad/s^2")
                 
                 print("="*60)
+                np.set_printoptions(**np_set_printoptions)
 
         self._forces.zero_()
         self._torques.zero_()
