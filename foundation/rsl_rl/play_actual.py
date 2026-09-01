@@ -338,6 +338,44 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     dt = env.unwrapped.step_dt
     obs, _ = env.get_observations()
     
+    # =========================================================================
+    # [新增] 导出实物部署模型 (TorchScript) - Student/Lower Network
+    # =========================================================================
+    export_device = agent_cfg.device
+    print(f"\n[INFO] 正在构建 Lower (Student) 实物部署模型...")
+    try:
+        # 获取最新的 normalizer（如果有的话）
+        obs_normalizer = getattr(runner, "obs_normalizer", None)
+        
+        # 1. 实例化 Wrapper 并置为 eval 模式
+        deploy_model = LowerActorDeployWrapper(
+            policy=policy_model, 
+            obs_normalizer=obs_normalizer, 
+            device=export_device
+        )
+        deploy_model.eval()
+        
+        # 2. 根据环境推断单帧观测维度
+        total_obs_dim = obs.shape[1]
+        print(f"[INFO] 预期实物端输入的单帧观测向量维度 (obs_dim): {total_obs_dim}")
+        
+        # 3. 构造 dummy_input 追踪 JIT 编译
+        dummy_obs_input = torch.randn(1, total_obs_dim, device=export_device)
+        
+        with torch.inference_mode():
+            trace_model = torch.jit.script(deploy_model, dummy_obs_input)
+            
+            # 保存在当前 checkpoint 目录下
+            export_dir = os.path.dirname(checkpoint_path)
+            export_path = os.path.join(export_dir, "down_actor_deploy.pt")
+            trace_model.save(export_path)
+            
+            print(f"[SUCCESS] Lower 部署模型已成功保存至: {export_path}")
+            print(f"        -> 实体机(LibTorch)直接加载此文件即可运行")
+            print(f"        -> 实物端调用输入形状需严格为: (1, {total_obs_dim})\n")
+    except Exception as e:
+        print(f"[ERROR] 导出部署模型失败: {e}\n")
+    # =========================================================================
     print(f"\n{'=' * 80}")
     print(f"Actual Drone Batch Evaluation (Robustness Test)")
     print(f"Number of target variations: {env.num_envs}")

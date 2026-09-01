@@ -28,7 +28,6 @@ from isaaclab.markers import CUBOID_MARKER_CFG, GREEN_ARROW_X_MARKER_CFG, BLUE_A
 import isaaclab.sim as sim_utils
 from isaaclab_assets import CRAZYFLIE_CFG
 from isaaclab.assets import ArticulationCfg
-# Use modern Isaac Sim core imports
 import isaacsim.core.utils.prims as prims_utils
 from pxr import PhysxSchema, Sdf, UsdGeom, UsdPhysics, Gf
 from isaaclab.utils.math import quat_from_euler_xyz
@@ -41,12 +40,11 @@ import os
 import csv
 import collections
 import itertools
-import json
 from dataclasses import dataclass
 
 from foundation.utils.simple_controller import SimpleQuadrotorController
 from foundation.utils.pid_controller import PaperPhysControllerTensor
-
+import json
 MAP_SIZE = (250, 250) 
 
 # 手动定义球体标记配置
@@ -94,8 +92,7 @@ class QuadcopterEnvWindow(BaseEnvWindow):
 class QuadcopterSceneCfg(InteractiveSceneCfg):
     num_envs: int = 512
     env_spacing: float = 64.0
-    # [关键修改] 必须为 False 以支持异构物理
-    replicate_physics: bool = False 
+    replicate_physics: bool = False
 
     terrain = TerrainImporterCfg(
         prim_path="/World/ground",
@@ -114,9 +111,8 @@ class QuadcopterSceneCfg(InteractiveSceneCfg):
 
 @configclass
 class QuadcopterEnvCfg(DirectRLEnvCfg):
-    # 15(pos_hist) + 9(rot) + 15(vel_hist) + 3(ang_vel) + 4(last_act) + 4(motor) + 3(acc_des) + 3(vel_des)
-    frame_observation_space = 58
-    observation_space = frame_observation_space
+    teacher_observation_space = 58
+    observation_space = teacher_observation_space
 
     history_len = 5
 
@@ -172,46 +168,36 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     reward_coef_termination_penalty = 100.0
     reward_constant = 1.5
 
-    num_steps_per_env: int = 256
-
-    enable_curriculum: bool = False
-
 class QuadcopterEnv(DirectRLEnv):
     cfg: QuadcopterEnvCfg
 
     def __init__(self, cfg: QuadcopterEnvCfg, render_mode: str | None = None, **kwargs):
         super().__init__(cfg, render_mode, **kwargs)
 
-        self.common_step_counter = 0
-        self.curriculum_factor = 0.0 if self.cfg.enable_curriculum else 1.0
-
         self.start_time = time.time()
         self.render_mode = "human"
         
         # ================= [关键部分：初始化异构动力学张量] =================
-        # 初始化张量容器
+
         self.mass_tensor = torch.zeros(self.num_envs, device=self.device)
         self.arm_l_tensor = torch.zeros(self.num_envs, device=self.device)
         self.twr_tensor = torch.zeros(self.num_envs, device=self.device)
         self.inertia_tensor = torch.zeros(self.num_envs, 3, device=self.device)
-        # self.motor_tau = torch.zeros(self.num_envs, 1, device=self.device)
         self.motor_tau_up_tensor = torch.zeros(self.num_envs, 1, device=self.device)
         self.motor_tau_down_tensor = torch.zeros(self.num_envs, 1, device=self.device)
         self.kappa_tensor = torch.zeros(self.num_envs, device=self.device)
 
         # ================= [修改：Buffer 存储机体坐标系误差] =================
         self.history_len = self.cfg.history_len
-        # 存储机体坐标系下的误差 (Body Frame)
         self.pos_error_b_history = torch.zeros(self.num_envs, self.history_len, 3, device=self.device)
         self.vel_error_b_history = torch.zeros(self.num_envs, self.history_len, 3, device=self.device)
 
         if self.cfg.dynamics.multi_teacher_params is not None:
-            # 这里的 params 列表应该在 play_teacher_multi.py 中注入到 env_cfg
             teacher_params_list = self.cfg.dynamics.multi_teacher_params
             num_teachers = len(teacher_params_list)
             envs_per_teacher = self.num_envs // num_teachers
             
-            print(f"[OffsetEnv] Initializing {num_teachers} heterogeneous teachers. Base envs per teacher: {envs_per_teacher}.")
+            print(f"[Multi-Teacher Env] Initializing {num_teachers} teachers. Base envs per teacher: {envs_per_teacher}.")
             
             for t_id, params in enumerate(teacher_params_list):
                 start_idx = t_id * envs_per_teacher
@@ -239,27 +225,30 @@ class QuadcopterEnv(DirectRLEnv):
                 self.motor_tau_up_tensor[indices] = params['motor_tau_up']
                 self.motor_tau_down_tensor[indices] = params['motor_tau_down']
                 self.kappa_tensor[indices] = params['kappa']
-                
-                # Debug print for first teacher
-                if t_id == 0:
-                    print(f"  > [T-0 Config] Mass: {params['mass']:.4f}, TWR: {self.twr_tensor[start_idx].item():.2f}")
+                count = end_idx - start_idx
+                print(f"  > Teacher {t_id} (ID: {params.get('id', 'N/A')}): Envs {start_idx}-{end_idx-1} (Count: {count})")
+
+            # [添加调试打印]
+            print(f"[DEBUG] Applied Multi-Teacher Params:")
+            for i in range(min(5, self.num_envs)): # 打印前5个环境的质量
+                print(f"  Env {i}: Mass = {self.mass_tensor[i].item():.4f}")
+            mid_idx = self.num_envs // 2
+            print(f"  Env {mid_idx} (Mid): Mass = {self.mass_tensor[mid_idx].item():.4f}")
+        
         else:
-            # Fallback to single config
-            print("[OffsetEnv] No multi-teacher params found. Using default homogeneous dynamics.")
+            print("[OffsetEnv] No multi-teacher params found")
             self.mass_tensor.fill_(self.cfg.dynamics.mass)
             self.arm_l_tensor.fill_(self.cfg.dynamics.arm_length)
             self.inertia_tensor[:] = torch.tensor(self.cfg.dynamics.inertia, device=self.device)
             self.twr_tensor.fill_(self.cfg.dynamics.thrust_to_weight)
-            # self.motor_tau.fill_(self.cfg.dynamics.motor_tau)
-            # [修改] 填充新参数
             self.motor_tau_up_tensor.fill_(self.cfg.dynamics.motor_tau_up)
             self.motor_tau_down_tensor.fill_(self.cfg.dynamics.motor_tau_down)
             self.kappa_tensor.fill_(self.cfg.dynamics.moment_scale)
-        
+
         # Store for reference
         self._robot_mass = self.mass_tensor 
         self.dt = self.cfg.sim.dt
-        
+
         if self.motor_tau_up_tensor.shape != (self.num_envs, 1):
              self.motor_tau_up_tensor = self.motor_tau_up_tensor.view(self.num_envs, 1)
         if self.motor_tau_down_tensor.shape != (self.num_envs, 1):
@@ -284,7 +273,6 @@ class QuadcopterEnv(DirectRLEnv):
             motor_alpha_down=self.motor_alpha_down,
         )
 
-        # 状态标志位
         self._is_langevin_task = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self._numerical_is_unstable = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self._died_pos_limit = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
@@ -298,7 +286,6 @@ class QuadcopterEnv(DirectRLEnv):
         self._forces = torch.zeros(self.num_envs, 1, 3, device=self.device)
         self._torques = torch.zeros(self.num_envs, 1, 3, device=self.device)
         
-        # 目标状态
         self.pos_des = torch.zeros(self.num_envs, 3, device=self.device)
         self.vel_des = torch.zeros(self.num_envs, 3, device=self.device)
         self.acc_des = torch.zeros(self.num_envs, 3, device=self.device)
@@ -329,29 +316,14 @@ class QuadcopterEnv(DirectRLEnv):
         self._body_id = self._robot.find_bodies("body")[0]
         self._spawn_pos_w = torch.zeros(self.num_envs, 3, device=self.device) 
         self._last_angular_velocity= torch.zeros(self.num_envs, 3, device=self.device)
-        self._langevin_max_vel = torch.full((self.num_envs,), 1.5, device=self.device)
 
         self._history_window = 100
         self._episode_outcomes = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self._episodes_completed = 0
         self._termination_reason_history = collections.deque(maxlen=self._history_window)
         self._vel_abs = collections.deque(maxlen=self._history_window)
-        
-        # # 为了计算 Reward Mean，模拟 RSL-RL buffer
-        # self.reward_rolling_buffer = deque(maxlen=100)
-        # # [新增] 分项奖励的 Rolling Buffer (用于平滑最近100个episode的表现)
-        # self.pos_reward_buffer = deque(maxlen=100)
-        # self.ori_reward_buffer = deque(maxlen=100)
-        # self.smooth_reward_buffer = deque(maxlen=100)
 
-        # # [新增] 用于存储 400-700 轮期间每一轮(iteration)的平均值
-        # self.iter_mean_pos_history = []
-        # self.iter_mean_ori_history = []
-        # self.iter_mean_smooth_history = []
-        # self.global_max_reward = -float('inf')
-        # self.reward_report_path = os.environ.get("TEACHER_REWARD_PATH", None)
-
-        # ================= [新增] 替换为严谨的全局累加器 =================
+        # ================= 全局累加器 =================
         self.eval_episodes = 0
         self.eval_pos_sum = 0.0
         self.eval_ori_sum = 0.0
@@ -367,16 +339,10 @@ class QuadcopterEnv(DirectRLEnv):
         self._traj_origin_adjusted = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
 
         self._calc_env_origins()
-
-        # [新增] 用于统计 400-700 轮平均奖励的变量
-        self.iteration_mean_rewards = []
-        self.last_recorded_iteration = -1
-        # RSL-RL 默认每轮步数 (n_steps)。
-        # 如果你的配置里改了，请相应修改这个值，或者从外部传入
+        # [新增] 用于统计平均奖励的变量
         self.steps_per_iteration = self.cfg.num_steps_per_env
         self.yaw_limit = math.pi / 2
 
-        # === 在 __init__ 末尾添加 ===
         self.delay_steps = 8  
         self._action_queue = torch.zeros(
             self.num_envs, self.delay_steps, self.cfg.action_space, device=self.device
@@ -388,6 +354,8 @@ class QuadcopterEnv(DirectRLEnv):
             nan_env_mask = torch.any(torch.isnan(tensor), dim=1)
             self._died_nan = torch.logical_or(self._died_nan, nan_env_mask)
             self._numerical_is_unstable = torch.logical_or(self._numerical_is_unstable, nan_env_mask)
+            nan_env_indices = torch.where(nan_env_mask)[0]
+            print(f"NaN positions: {nan_env_indices}")
             tensor = tensor.nan_to_num(nan=0.0)
             return tensor
         else:
@@ -427,8 +395,7 @@ class QuadcopterEnv(DirectRLEnv):
         yaw_limit = self.yaw_limit # 限制在 +/- 90 度 (1.57 rad)
         yaw_k_pos = 0.2        # 弹簧刚度 (回复力)
         yaw_k_vel = 0.5        # 阻尼
-        # yaw_noise_scale = 2.0  # 噪声强度
-        yaw_noise_scale = self._get_curriculum_value(easy_val=0.0, hard_val=2.0)
+        yaw_noise_scale = 2.0  # 噪声强度
         max_yaw_rate = 2.5     # 最大角速度
             
         # 1. 获取当前状态
@@ -475,20 +442,19 @@ class QuadcopterEnv(DirectRLEnv):
         n_envs = len(env_ids)
         dt = self.dt  # 使用仿真步长，或者使用独立的轨迹步长 self._langevin_dt
         
-        # ================= [核心修改] 课程学习参数映射 =================
         # 1. 弹簧刚度 (回复力)
         k_pos = torch.tensor([1.0, 1.0, 2.0], device=self.device)  
         # 2. 阻尼系数 (控制目标移动速度，值越大越慢)
-        k_vel = self._get_curriculum_value(easy_val=4.0, hard_val=1.5)   
+        k_vel = 1.5
         # 3. 加速度惯性 (控制轨迹平滑度，值越小越平滑)
-        acc_inertia = self._get_curriculum_value(easy_val=0.02, hard_val=0.1) 
+        acc_inertia = 0.1
         # 4. 随机力强度 (直接决定乱窜程度)
-        noise_scale = self._get_curriculum_value(easy_val=1.5, hard_val=10.0) 
+        noise_scale = 10.0
         # 5. 最大物理限制
-        max_vel = self._get_curriculum_value(easy_val=0.5, hard_val=3.0)
-        max_acc = self._get_curriculum_value(easy_val=2.0, hard_val=15.0)
+        max_vel = 3.0
+        max_acc = 15.0
         # ==============================================================
-        
+
         # 获取当前状态
         pos_current = self.pos_des[env_ids]
         vel_current = self.vel_des[env_ids]
@@ -500,7 +466,6 @@ class QuadcopterEnv(DirectRLEnv):
         vel_next = vel_current + acc_current * dt
         
         # 限制最大速度 (软限制已由阻尼 k_vel 提供，这里做硬截断以防万一)
-        # max_vel = 3.0 # m/s
         vel_norm = torch.norm(vel_next, dim=1, keepdim=True)
         scale = torch.clamp(max_vel / (vel_norm + 1e-6), max=1.0)
         vel_next = vel_next * scale
@@ -526,7 +491,6 @@ class QuadcopterEnv(DirectRLEnv):
         
         # --- 物理限制 (Clipping) ---
         # 限制最大加速度 (基于推重比，假设最大推力约为 2G 到 3G)
-        # max_acc = 15.0 # m/s^2
         acc_next = torch.clamp(acc_next, -max_acc, max_acc)
  
         # --- 保存状态 ---
@@ -608,8 +572,9 @@ class QuadcopterEnv(DirectRLEnv):
         num_groups = self.num_envs // robots_per_env + 1
         grid_rows, grid_cols = self.cfg.grid_rows, self.cfg.grid_cols
         group_origins = torch.zeros(num_groups, 3, device=self.device)
-        offset_x, offset_y = -MAP_SIZE[0]/2.0, -MAP_SIZE[1]/2.0
-
+        map_size_x, map_size_y = self.cfg.map_size
+        offset_x = -map_size_x / 2.0
+        offset_y = -map_size_y / 2.0
         for i in range(num_groups):
             row = (i // grid_cols) % grid_rows
             col = i % grid_cols
@@ -632,35 +597,48 @@ class QuadcopterEnv(DirectRLEnv):
         self.scene.articulations["robot"] = self._robot
 
         robot_prims = find_matching_prim_paths("/World/envs/env_.*/Robot")
-        if not robot_prims: return
+        if len(robot_prims) == 0:
+            print("[ERROR] No robot prims found! Check your prim_path regex in the config.")
+            return
 
-        # ================= [Apply Heterogeneous Physics Properties] =================
-        print(f"\n{'='*20} [OffsetEnv Physics Setup] {'='*20}")
-        has_multi = self.cfg.dynamics.multi_teacher_params is not None
-        
-        if has_multi:
-            params_list = self.cfg.dynamics.multi_teacher_params
-            num_teachers = len(params_list)
+        # ================= [应用多教师动力学参数到 PhysX] =================
+        print(f"\n{'='*20} [Dynamics Setup] {'='*20}")
+        print(f"Num Envs: {self.num_envs}")
+        has_multi_teachers = self.cfg.dynamics.multi_teacher_params is not None
+        if has_multi_teachers:
+            teacher_params = self.cfg.dynamics.multi_teacher_params
+            num_teachers = len(teacher_params)
             envs_per_teacher = self.num_envs // num_teachers
-            print(f"Applying heterogenous properties for {num_teachers} teachers.")
+            print(f"Applying params from {num_teachers} teachers...")
         else:
-            print("Applying default homogeneous properties.")
+            print("Applying single teacher params...")
 
+
+        # 遍历所有环境，修改底层 USD/PhysX 属性
         for i, prim_path in enumerate(robot_prims):
             body_path = f"{prim_path}/body"
             
-            if has_multi:
+            # 确定当前环境使用哪一套参数
+            if has_multi_teachers:
+                # 计算 teacher id
+                # 防止溢出 (e.g., if envs aren't perfectly divisible)
                 t_id = min(i // envs_per_teacher, num_teachers - 1)
-                p = params_list[t_id]
-                mass = p['mass']
-                inertia = p['inertia']
+                params = teacher_params[t_id]
+                
+                mass_val = params['mass']
+                inertia_val = params['inertia']
+                arm_l_val = params['arm_length']
             else:
-                mass = self.cfg.dynamics.mass
-                inertia = self.cfg.dynamics.inertia
-            
-            # Write to USD
-            prims_utils.set_prim_property(body_path, "physics:mass", mass)
-            prims_utils.set_prim_property(body_path, "physics:diagonalInertia", inertia)
+                mass_val = self.cfg.dynamics.mass
+                inertia_val = self.cfg.dynamics.inertia
+                arm_l_val = self.cfg.dynamics.arm_length
+
+            # --- 将配置写入底层 PhysX ---
+            # 1. 修改质量
+            prims_utils.set_prim_property(body_path, "physics:mass", mass_val)
+            # 2. 修改惯性张量 (Isaac Sim 接受 (Ixx, Iyy, Izz) 对角形式)
+            prims_utils.set_prim_property(body_path, "physics:diagonalInertia", inertia_val)
+            # 3. 强制重心
             prims_utils.set_prim_property(body_path, "physics:centerOfMass", (0.0, 0.0, 0.0))
 
             if self.cfg.robot_vis:
@@ -668,95 +646,18 @@ class QuadcopterEnv(DirectRLEnv):
             else:
                 prims_utils.set_prim_property(prim_path, "visibility", "invisible")
 
-            if i == 0 or (has_multi and i % envs_per_teacher == 0 and i < self.num_envs):
+            if i == 0 or (has_multi_teachers and i % envs_per_teacher == 0 and i < self.num_envs):
                 read_mass = prims_utils.get_prim_property(body_path, "physics:mass")
-                print(f"[Env {i}] Config Mass: {mass:.4f} | PhysX Read: {read_mass:.4f}")
-        
+                print(f"[Env {i}] Config Mass: {mass_val:.4f} | PhysX Read: {read_mass:.4f}")
         print(f"{'='*60}\n")
-        
+
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
         self._map_generation_timer = 0
 
-    # def _pre_physics_step(self, actions: torch.Tensor):
-        
-    #     if self.cfg.use_pid:
-    #         # 1. 获取状态
-    #         cur_pos = self._robot.data.root_pos_w
-    #         cur_vel = self._robot.data.root_lin_vel_w
-    #         cur_quat = self._robot.data.root_quat_w
-    #         cur_ang_vel = self._robot.data.root_ang_vel_b
-            
-    #         # 2. 计算期望转速 (Controller)
-    #         action_norm = self._controller.compute_target_speeds(
-    #             cur_pos, cur_vel, cur_quat, cur_ang_vel,
-    #             self.pos_des, self.vel_des, self.acc_des, self.yaw_des,
-    #             self._current_motor_speeds
-    #         )
-    #     else:
-    #         raw_clamped = torch.clamp(actions, -1.0, 1.0)
-    #         action_norm = (raw_clamped + 1.0) * 0.5
-    #         self._actions = raw_clamped.clone()
-
-    #     # 3. 模拟电机响应
-    #     target = action_norm
-    #     current = self._current_motor_speeds
-    #     alpha = torch.where(target > current, self.motor_alpha_up, self.motor_alpha_down)
-    #     self._current_motor_speeds = current + alpha * (target - current)
-    #     self._current_motor_speeds = torch.clamp(self._current_motor_speeds, 0.0, 1.0)
-
-    #     force_b, torque_b = self._controller.motor_speeds_to_wrench(self._current_motor_speeds)
 
     def _pre_physics_step(self, actions: torch.Tensor):
 
-        # ================= [修改] 课程学习因子更新与终端打印 =================
-        if self.cfg.enable_curriculum:
-            self.common_step_counter += 1
-            
-            # 从 QuadcopterDistillationRunnerCfg 读取的值
-            steps_per_epoch = 512
-            
-            # 每当完成一个完整的回合采集（即一个 Iteration）时打印
-            if self.common_step_counter % steps_per_epoch == 0:
-                current_epoch = int(self.common_step_counter / steps_per_epoch)
-                
-                # 计算当前的 factor
-                if current_epoch < 200:
-                    self.curriculum_factor = 0.0
-                elif current_epoch < 400:
-                    self.curriculum_factor = (current_epoch - 200) / 200.0
-                else:
-                    self.curriculum_factor = 1.0
-                
-                # 终端实时打印进度
-                print(f">>> [Curriculum] Epoch: {current_epoch} | Factor: {self.curriculum_factor:.4f} "
-                      f"| Noise: {self._get_curriculum_value(1.5, 10.0):.2f} "
-                      f"| MaxVel: {self._get_curriculum_value(0.5, 3.0):.2f}")
-            else:
-                # 非整除步数时，只计算 factor 不打印
-                current_epoch = self.common_step_counter / steps_per_epoch
-                if current_epoch < 200:
-                    self.curriculum_factor = 0.0
-                elif current_epoch < 400:
-                    self.curriculum_factor = (current_epoch - 200) / 200.0
-                else:
-                    self.curriculum_factor = 1.0
-        # =====================================================================
-        # ... (后续代码保持不变)
-
-        # ================= [新增] 写入 extras 传给 WandB =================
-        if "log" not in self.extras:
-            self.extras["log"] = dict()
-        
-        # 记录课程进度因子 (0.0 到 1.0)
-        self.extras["log"]["Curriculum/Factor"] = self.curriculum_factor
-        
-        # 我强烈建议你也把下面这两个物理参数传上去，这样在 WandB 里看起来更直观！
-        self.extras["log"]["Curriculum/Noise_Scale"] = self._get_curriculum_value(1.5, 10.0)
-        self.extras["log"]["Curriculum/Max_Velocity"] = self._get_curriculum_value(0.5, 3.0)
-        # =================================================================
-
-        # 1. 记录当前时刻网络最新输出 (用于 obs 或 reward)
         raw_actions_clamped = torch.clamp(actions, -1.0, 1.0)
         self._actions = raw_actions_clamped.clone()
 
@@ -768,25 +669,18 @@ class QuadcopterEnv(DirectRLEnv):
         # 取出 N 帧之前的动作作为生效动作
         delayed_actions = self._action_queue[:, -1, :].clone()
 
-        # # ================= [新增排查代码] =================
-        # # 打印当前 Step 计数和环境 0 的整个纯滞后队列
-        # print(f"[Debug] Step: {self.common_step_counter}")
-        # print(f"Env 0 Action Queue (shape: {self._action_queue[0].shape}):\n{self._action_queue[0].detach().cpu().numpy()}\n")
-        # # =================================================
-
-        # 2. 将【延迟后】的动作映射到物理占空比 [0, 1]
+        # 将【延迟后】的动作映射到物理占空比 [0, 1]
         action_setpoint_normalized = (delayed_actions + 1.0) * 0.5
         
-        # 3. 接下来走你原有的电机惯性 (motor_alpha) 和拟合曲线逻辑
+        # 电机惯性 (motor_alpha) 和拟合曲线逻辑
         target = action_setpoint_normalized
         current = self._current_motor_speeds
         alpha = torch.where(target > current, self.motor_alpha_up, self.motor_alpha_down)
         self._current_motor_speeds = current + alpha * (target - current)
-        
-        # 使用你测出来的拟合系数 (0.2466*x^2 + 0.7510*x + 0.0024)
+        self._current_motor_speeds = torch.clamp(self._current_motor_speeds, 0.0, 1.0)
+
         force_b, torque_b = self._controller.motor_speeds_to_wrench(self._current_motor_speeds)
         
-        # ... 后续施加力矩逻辑不变 ...    
         # 随机力扰动
         if self.cfg.dynamics.apply_disturbance:
             base_quat = self._robot.data.root_quat_w
@@ -803,11 +697,7 @@ class QuadcopterEnv(DirectRLEnv):
         self._torques[:, 0, :] = torque_b
 
     def _apply_action(self):
-        self._robot.set_external_force_and_torque(self._forces, self._torques, body_ids=self._body_id)
-            
-    def _get_curriculum_value(self, easy_val, hard_val):
-        """根据当前课程进度进行线性插值"""
-        return easy_val + self.curriculum_factor * (hard_val - easy_val)
+        self._robot.set_external_force_and_torque(self._forces, self._torques, body_ids=self._body_id) 
 
     def _get_observations(self) -> dict:
 
@@ -825,24 +715,12 @@ class QuadcopterEnv(DirectRLEnv):
         rot_matrix_b2w = matrix_from_quat(quat_w)
         rot_matrix_w2b = rot_matrix_b2w.transpose(1, 2) 
 
-        # --- [新增] 获取当前的 Yaw 角 ---
-        # 我们需要从四元数中提取当前的 yaw (Z轴旋转)
-        # 假设 euler_xyz_from_quat 返回的是 (roll, pitch, yaw)
-        _, _, y = euler_xyz_from_quat(quat_w)
-        
-        # --- [新增] 计算 Yaw 误差 ---
-        # error = desired - current
-        # 注意：self.yaw_des 已经在 [-pi, pi] 之间
+        r, p, y = euler_xyz_from_quat(quat_w)
         yaw_error = self.yaw_des - y
-        
-        # 归一化误差到 [-pi, pi] (处理 350度 - 10度 的情况)
         yaw_error = torch.remainder(yaw_error + math.pi, 2 * math.pi) - math.pi
-        
-        # 编码为 Sin/Cos (2维)
         yaw_error_sin = torch.sin(yaw_error).unsqueeze(1) # (N, 1)
         yaw_error_cos = torch.cos(yaw_error).unsqueeze(1) # (N, 1)
 
-        # 2. 计算当前的世界坐标系误差，并转换到 Body Frame
         curr_pos_error_w = pos_w - self.pos_des
         curr_vel_error_w = vel_w - self.vel_des
         
@@ -862,12 +740,11 @@ class QuadcopterEnv(DirectRLEnv):
 
         # 4. 展平数据
         rot_flat = rot_matrix_b2w.reshape(self.num_envs, 9)
-        
         # 5. 处理期望加速度和速度 (转到 Body Frame)
         acc_des_b = torch.bmm(rot_matrix_w2b, self.acc_des.unsqueeze(-1)).squeeze(-1)
         vel_des_b = torch.bmm(rot_matrix_w2b, self.vel_des.unsqueeze(-1)).squeeze(-1)
 
-        # 6. 拼接 Observation (Total: 38 dims)
+        # 教师 58
         obs_teacher = torch.cat([
             pos_error_flat,             # 15
             rot_flat,                   # 9
@@ -881,9 +758,8 @@ class QuadcopterEnv(DirectRLEnv):
             self._current_motor_speeds, # 4
         ], dim=-1)
 
-        obs_teacher = self.CHECK_NAN(obs_teacher, "Observation")
+        obs_teacher = self.CHECK_NAN(obs_teacher, "Teacher Observation")
         return {"policy": obs_teacher, "critic": obs_teacher, "rnd_state": obs_teacher}
-
     def _get_rewards(self) -> torch.Tensor:
         # 1. 位置误差 (保持不变)
         pos_error_norm = torch.norm(self._robot.data.root_pos_w - self.pos_des, dim=1)
@@ -944,42 +820,53 @@ class QuadcopterEnv(DirectRLEnv):
             time_out = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         
         self.CHECK_state()
-        
-        dist_traj = torch.norm(self.pos_des - self._spawn_pos_w, dim=1)
-        pos_exceeded_langevin = dist_traj > self.cfg.position_threshold_langevin
-        
-        died = torch.logical_or(self._numerical_is_unstable, pos_exceeded_langevin)
-        
-        # Logging logic
+        dist_traj_from_spawn = torch.norm(self.pos_des - self._spawn_pos_w, dim=1)
+        position_exceeded_langevin = dist_traj_from_spawn > self.cfg.position_threshold_langevin
+
+        conditions = [
+            self._numerical_is_unstable,  # Numerical instability
+            position_exceeded_langevin,  # Distance from desired trajectory exceeds threshold
+        ]
+
+        # Combine all die conditions
+        died = conditions[0]
+        for condition in conditions[1:]:
+            died = torch.logical_or(died, condition)
+
         if "log" not in self.extras: self.extras["log"] = dict()
-        comp = torch.logical_or(died, time_out)
-        if torch.any(comp):
+        completed_mask = torch.logical_or(died, time_out)
+        completed_episodes = torch.sum(completed_mask == True).item()
+        if completed_episodes > 0:
+            died_episodes = torch.sum(died == True).item()
+            timeout_episodes = torch.sum(time_out == True).item()
             self.extras["log"].update({
-                "Metrics/died_episodes": torch.sum(died).item(),
-                "Metrics/timeout_episodes": torch.sum(time_out).item()
+                    "Metrics/died_episodes_per_step": died_episodes,
+                    "Metrics/completed_episodes_per_step": completed_episodes,
+                    "Metrics/timeout_episodes_per_step": timeout_episodes,
             })
-            
+        else:
+            self.extras["log"].update({
+                "Metrics/died_episodes_per_step": 0,
+                "Metrics/completed_episodes_per_step": 0,
+                "Metrics/timeout_episodes_per_step": 0,
+            })
+
         return died, time_out
 
     def _reset_idx(self, env_ids: torch.Tensor | None):
-        if env_ids is None: env_ids = self._robot._ALL_INDICES
+        if env_ids is None:
+            env_ids = self._robot._ALL_INDICES
+        num_resets = len(env_ids)
         
-        # 1. --- 统计与日志处理 ---
-        if len(env_ids) > 0:
-            # A. 记录给 TensorBoard 的 log (保持不变，RSL-RL 会自动处理平均)
+        # --- 1. 日志记录与基础状态重置 ---
+        if num_resets > 0:
             if "log" not in self.extras: self.extras["log"] = dict()
             for k in self._episode_sums.keys():
                 values = self._episode_sums[k][env_ids]
                 self.extras["log"][f"Episode_Reward/{k}"] = torch.mean(values).item()
 
-            # B. [修改] 专为 CSV 准备的“无偏真值”统计 (700-800轮)
             current_iter = self.common_step_counter // self.steps_per_iteration
-
-            # ================= [新增] 动态确定统计区间 =================
-            if self.cfg.enable_curriculum:
-                eval_start, eval_end = 900, 1000
-            else:
-                eval_start, eval_end = 900, 1000
+            eval_start, eval_end = 900, 1000
             # ==========================================================
 
             # 判断当前迭代是否在这个区间内
@@ -1010,6 +897,12 @@ class QuadcopterEnv(DirectRLEnv):
                     "total": self.eval_total_sum / self.eval_episodes
                 }
                 
+                # ================= [新增] 将评估数据推送至 WandB =================
+                if "log" not in self.extras: 
+                    self.extras["log"] = dict()
+                for key, value in stats.items():
+                    # 添加统一的前缀 Eval_Metrics，方便在 WandB 面板上归类查看
+                    self.extras["log"][f"Eval_Metrics/{key}"] = value
                 if self.reward_report_path:
                     try:
                         import json
@@ -1023,9 +916,11 @@ class QuadcopterEnv(DirectRLEnv):
                 self._episode_sums[k][env_ids] = 0.0
 
         # 2. --- 状态重置与基础清理 ---
-        died = self.reset_terminated[env_ids]
-        tout = self.reset_time_outs[env_ids]
-        self._update_episode_outcomes_and_metrics(env_ids, None, died, tout)
+        died_mask = self.reset_terminated[env_ids]
+        timed_out_mask = self.reset_time_outs[env_ids]
+        if hasattr(self, '_update_episode_outcomes_and_metrics'):
+            self._update_episode_outcomes_and_metrics(env_ids, None, died_mask, timed_out_mask)
+
 
         self._robot.reset(env_ids)
         super()._reset_idx(env_ids)
@@ -1034,18 +929,17 @@ class QuadcopterEnv(DirectRLEnv):
         self._actions[env_ids] = 0.0
         self._last_actions[env_ids] = 0.0
         self._current_motor_speeds[env_ids] = 0.0
+        self._forces[env_ids] = 0.0
+        self._torques[env_ids] = 0.0
         self._numerical_is_unstable[env_ids] = False
         self._died_pos_limit[env_ids] = False
         self._died_lin_vel_limit[env_ids] = False
         self._died_ang_vel_limit[env_ids] = False
         self._died_tilt_limit[env_ids] = False
         self._died_nan[env_ids] = False
-        
         self._figure8_time[env_ids] = 0.0
         self._traj_origin_adjusted[env_ids] = False
-        self._langevin_max_vel[env_ids] = torch.rand(len(env_ids), device=self.device) * 1.0 + 0.5
 
-        # 3. --- 轨迹中心点设定 ---
         spawn_center = self.env_origins[env_ids].clone()
         spawn_center[:, 0] += self.cfg.terrain_length / 2.0
         spawn_center[:, 1] += self.cfg.terrain_width / 2.0
@@ -1056,21 +950,15 @@ class QuadcopterEnv(DirectRLEnv):
         self.acc_des[env_ids] = 0.0
         self._spawn_pos_w[env_ids] = spawn_center
 
-
-        # 4. --- 随机初始状态采样 (RAPTOR style) ---
-        num_resets = len(env_ids)
         l_arm = self.arm_l_tensor[env_ids]
-        
         if self.cfg.train_or_play:
-            # 定义球体内均匀采样函数
-            def sample_in_sphere(r, n):
-                if isinstance(r, torch.Tensor) and r.dim()==1: r = r.unsqueeze(1)
-                d = torch.randn(n, 3, device=self.device)
-                d = F.normalize(d, p=2, dim=1)
-                u = torch.rand(n, 1, device=self.device)
-                return d * (r * torch.pow(u, 1.0/3.0))
-
-            # 采样偏移量
+            # 定义采样函数
+            def sample_in_sphere(radius, n_samples):
+                direction = F.normalize(torch.randn(n_samples, 3, device=self.device), p=2, dim=1)
+                if not isinstance(radius, (float, int)):
+                    radius = radius.view(-1, 1)
+                r = radius * torch.pow(torch.rand(n_samples, 1, device=self.device), 1.0 / 3.0)
+                return direction * r
             pos_offset = sample_in_sphere(10.0 * l_arm, num_resets) # 位置偏移与轴距成正比
             lin_vel = sample_in_sphere(1.0, num_resets)            # 1m/s 内的随机初速度
             ang_vel = sample_in_sphere(1.0, num_resets)            # 1rad/s 内的随机角速度
@@ -1088,45 +976,32 @@ class QuadcopterEnv(DirectRLEnv):
             ang_vel[perfect_mask] = 0.0
             quat[perfect_mask] = torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device)
             self.yaw_des[env_ids] = (torch.rand(len(env_ids), device=self.device) * 2 - 1) * self.yaw_limit / 2.0
-            self.yaw_rate_des[env_ids] = 0.0 # 初始角速度为 0
+            self.yaw_rate_des[env_ids] = 0.0
         else:
-            # Play 模式固定开局
             pos_offset = torch.zeros(num_resets, 3, device=self.device)
             lin_vel = torch.zeros(num_resets, 3, device=self.device)
             ang_vel = torch.zeros(num_resets, 3, device=self.device)
-            quat = torch.zeros(num_resets, 4, device=self.device)
-            quat[:, 0] = 1.0
+            quat = torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device).repeat(num_resets, 1)
             self.yaw_des[env_ids] = 0.0
-            self.yaw_rate_des[env_ids] = 0.0 # 初始角速度为 0
-
-        # 5. --- [核心优化] 初始化历史 Buffer (同步随机状态) ---
-        # 计算重置时刻的 Body-frame 旋转矩阵
-        rot_w2b = matrix_from_quat(quat).transpose(1, 2)
-        
-        # 初始世界误差：机器人位置(spawn+offset) - 目标(spawn) = offset
-        # 初始速度误差：机器人速度(lin_vel) - 目标速度(0) = lin_vel
-        initial_pos_err_b = torch.bmm(rot_w2b, pos_offset.unsqueeze(-1)).squeeze(-1)
-        initial_vel_err_b = torch.bmm(rot_w2b, lin_vel.unsqueeze(-1)).squeeze(-1)
+            self.yaw_rate_des[env_ids] = 0.0
+        rot_w2b_init = matrix_from_quat(quat).transpose(1, 2)
+        initial_pos_err_b = torch.bmm(rot_w2b_init, pos_offset.unsqueeze(-1)).squeeze(-1)
+        initial_vel_err_b = torch.bmm(rot_w2b_init, lin_vel.unsqueeze(-1)).squeeze(-1)
         
         # 用当前的 Body 误差填满 5 帧历史
         self.pos_error_b_history[env_ids] = initial_pos_err_b.unsqueeze(1).repeat(1, self.history_len, 1)
         self.vel_error_b_history[env_ids] = initial_vel_err_b.unsqueeze(1).repeat(1, self.history_len, 1)
 
-        # 6. --- 任务类型分配 ---
-        # 决定该环境运行 Langevin 轨迹还是固定/其他轨迹
+        # --- 4. 写入物理仿真器 ---
         self._is_langevin_task[env_ids] = torch.rand(num_resets, device=self.device) > self.cfg.prob_null_trajectory
-
-        # 7. --- 写入物理仿真器 ---
         root_state = self._robot.data.default_root_state[env_ids].clone()
         root_state[:, :3] = spawn_center + pos_offset # 世界坐标位置
         root_state[:, 3:7] = quat                    # 姿态
         root_state[:, 7:10] = lin_vel                 # 世界线速度
         root_state[:, 10:13] = ang_vel                # 机体角速度
-        
+
         self._robot.write_root_pose_to_sim(root_state[:, :7], env_ids)
         self._robot.write_root_velocity_to_sim(root_state[:, 7:], env_ids)
-        
-        # 重置关节状态（如果模型有螺旋桨旋转等关节）
         self._robot.write_joint_state_to_sim(
             self._robot.data.default_joint_pos[env_ids], 
             self._robot.data.default_joint_vel[env_ids], 
@@ -1148,85 +1023,91 @@ class QuadcopterEnv(DirectRLEnv):
             # 如果开关关闭，风力设为 0
             self.env_wind_force[env_ids] = 0.0
 
-        # === 新增：计算悬停动作并重置延迟队列 ===
-        # 根据物理公式：悬停速度 = sqrt(1.0 / TWR)
-        hover_motor_speed = torch.sqrt(1.0 / self.twr_tensor[env_ids])
-        # 将 [0, 1] 映射到网络动作空间 [-1, 1]
-        hover_action = hover_motor_speed * 2.0 - 1.0 
-        
-        # 填充整个队列，防止起飞瞬间因为执行了“上辈子”的动作而炸机
-        for i in range(self.delay_steps):
-            self._action_queue[env_ids, i, :] = hover_action.unsqueeze(1).expand(-1, 4).clone()
-            
-        # 同时记得重置相关的状态量
-        self._actions[env_ids] = hover_action.unsqueeze(1).expand(-1, 4)
-        self._last_actions[env_ids] = hover_action.unsqueeze(1).expand(-1, 4)
-        self._current_motor_speeds[env_ids] = hover_motor_speed.unsqueeze(1).expand(-1, 4)
-
-    def _set_debug_vis_impl(self, debug_vis: bool):
-        if debug_vis:
-            if not hasattr(self, "goal_pos_visualizer"):
-                m_cfg = CUBOID_MARKER_CFG.copy()
-                m_cfg.markers["cuboid"].size = (self.cfg.marker_size,)*3
-                m_cfg.prim_path = "/Visuals/Command/goal_position"
-                self.goal_pos_visualizer = VisualizationMarkers(m_cfg)
-            self.goal_pos_visualizer.set_visibility(True)
-            
-            if not hasattr(self, "traj_langevin_visualizer"):
-                l_cfg = SPHERE_MARKER_CFG.copy()
-                l_cfg.prim_path = "/Visuals/TrajectoryLangevin"
-                l_cfg.markers["sphere"].scale = (self.cfg.marker_size,)*3
-                l_cfg.markers["sphere"].visual_material.diffuse_color = (0.0, 1.0, 0.0)
-                self.traj_langevin_visualizer = VisualizationMarkers(l_cfg)
-            self.traj_langevin_visualizer.set_visibility(True)
-        else:
-            if hasattr(self, "goal_pos_visualizer"): self.goal_pos_visualizer.set_visibility(False)
-            if hasattr(self, "traj_langevin_visualizer"): self.traj_langevin_visualizer.set_visibility(False)
-
-    def _debug_vis_callback(self, event):
-        fixed_rot = torch.zeros_like(self._robot.data.root_quat_w); fixed_rot[:, 0] = 1.0
-        inv_pos = torch.zeros_like(self.pos_des); inv_pos[:, 2] = -100.0
-        
-        if hasattr(self, "traj_langevin_visualizer"):
-            pos = inv_pos.clone()
-            mask = self._is_langevin_task
-            if mask.any(): pos[mask] = self.pos_des[mask]
-            self.traj_langevin_visualizer.visualize(pos, fixed_rot)
-
     def _update_episode_outcomes_and_metrics(self, env_ids, success_mask, died_mask, timed_out_mask):
-        completed_mask = torch.logical_or(died_mask, timed_out_mask)
-        if not torch.any(completed_mask): return 0, 0
-        
-        comp_ids = env_ids[completed_mask]
-        died_ids = env_ids[died_mask]
-        
-        if len(died_ids) > 0:
-            r_pos = self._died_pos_limit[died_ids].cpu().numpy()
-            r_langevin = (torch.norm(self.pos_des[died_ids]-self._spawn_pos_w[died_ids], dim=1) > self.cfg.position_threshold_langevin).cpu().numpy()
+            """
+            Update episode statistics with detailed failure reasons.
+            """
+            completed_mask = torch.logical_or(died_mask, timed_out_mask)
+            if not torch.any(completed_mask):
+                return 0, 0
+
+            completed_env_ids = env_ids[completed_mask]
+            died_env_ids = env_ids[died_mask]
             
-            for i in range(len(died_ids)):
-                self._termination_reason_history.append({
-                    "died_pos_limit": bool(r_pos[i]),
-                    "position_exceeded_langevin": bool(r_langevin[i])
+            # Process termination reasons for died episodes
+            if len(died_env_ids) > 0:
+                reason_pos_limit = self._died_pos_limit[died_env_ids].cpu().numpy()
+                reason_lin_vel = self._died_lin_vel_limit[died_env_ids].cpu().numpy()
+                reason_ang_vel = self._died_ang_vel_limit[died_env_ids].cpu().numpy()
+                reason_tilt = self._died_tilt_limit[died_env_ids].cpu().numpy()
+                reason_nan = self._died_nan[died_env_ids].cpu().numpy()
+                
+                des_w = self.pos_des[died_env_ids]
+                spawn_w = self._spawn_pos_w[died_env_ids]
+                dist_traj_from_spawn = torch.norm(des_w - spawn_w, dim=1)
+                reason_langevin = (dist_traj_from_spawn > self.cfg.position_threshold_langevin).cpu().numpy()
+                
+                for i in range(len(died_env_ids)):
+                    self._termination_reason_history.append({
+                        "died_pos_limit": bool(reason_pos_limit[i]),
+                        "died_lin_vel": bool(reason_lin_vel[i]),
+                        "died_ang_vel": bool(reason_ang_vel[i]),
+                        "died_tilt": bool(reason_tilt[i]),
+                        "died_nan": bool(reason_nan[i]),
+                        "position_exceeded_langevin": bool(reason_langevin[i])
+                    })
+            
+            # Add empty dictionaries for timeout cases
+            timeout_count_current = len(env_ids[timed_out_mask])
+            self._termination_reason_history.extend([{}] * timeout_count_current)
+            
+            # Track average velocity
+            if len(completed_env_ids) > 0:
+                vel_abs = torch.linalg.norm(
+                    self._robot.data.root_lin_vel_w[completed_env_ids], 
+                    dim=1
+                ).cpu().tolist()
+                self._vel_abs.extend(vel_abs)
+
+            # Calculate statistics
+            num_termination_records = len(self._termination_reason_history)
+            if num_termination_records > 0:
+                reason_keys = [
+                    "died_pos_limit", 
+                    "died_lin_vel", 
+                    "died_ang_vel", 
+                    "died_tilt", 
+                    "died_nan", 
+                    "position_exceeded_langevin"
+                ]
+                reason_counts = {key: 0 for key in reason_keys}
+                
+                if len(self._termination_reason_history) > 0:
+                    for reason in self._termination_reason_history:
+                        for key in reason_keys:
+                            if key in reason and reason[key]:
+                                reason_counts[key] += 1
+                
+                died_count = sum(1 for r in self._termination_reason_history if r)
+                timeout_count = num_termination_records - died_count
+                
+                self._episodes_completed += len(completed_env_ids)
+                avg_velocity = np.mean(list(self._vel_abs)) if self._vel_abs else 0.0
+
+                if "log" not in self.extras:
+                    self.extras["log"] = {}
+                
+                self.extras["log"].update({
+                    "Episode_Termination/died": died_count / num_termination_records * 100.0,
+                    "Episode_Termination/time_out": timeout_count / num_termination_records * 100.0,
+                    "Metrics/average_velocity": avg_velocity,
+                    "Metrics/episodes_completed": self._episodes_completed,
                 })
-        
-        self._termination_reason_history.extend([{}] * len(env_ids[timed_out_mask]))
-        
-        if len(comp_ids) > 0:
-            vel = torch.linalg.norm(self._robot.data.root_lin_vel_w[comp_ids], dim=1).cpu().tolist()
-            self._vel_abs.extend(vel)
-            self._episodes_completed += len(comp_ids)
-        avg_velocity = np.mean(list(self._vel_abs)) if self._vel_abs else 0.0
 
-        if len(self._termination_reason_history) > 0:
-            died_count = sum(1 for r in self._termination_reason_history if r)
-            self.extras["log"].update({
-                "Episode_Termination/died": died_count / len(self._termination_reason_history),
-                "Metrics/episodes_completed": self._episodes_completed,
-                "Metrics/average_velocity": avg_velocity
-            })
-        
-        return len(comp_ids), 0
+                for key in reason_keys:
+                    self.extras["log"][f"Metrics/Died/{key}"] = reason_counts[key] / num_termination_records * 100.0
 
+                return len(completed_env_ids), 0
+    
     def close(self):
         super().close()
