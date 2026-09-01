@@ -10,7 +10,6 @@ from __future__ import annotations
 import omni
 import torch
 import torch.nn.functional as F
-import gymnasium as gym
 import isaaclab.sim as sim_utils
 from isaaclab.sim.utils import find_matching_prim_paths
 from isaaclab.assets import Articulation, ArticulationCfg
@@ -22,29 +21,20 @@ from isaaclab.terrains import TerrainImporterCfg, TerrainGeneratorCfg
 from isaaclab.terrains.height_field.hf_terrains_cfg import HfDiscreteObstaclesTerrainCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.math import euler_xyz_from_quat, matrix_from_quat
-from isaaclab.utils.noise import GaussianNoiseCfg, UniformNoiseCfg
 from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
-from isaaclab.markers import CUBOID_MARKER_CFG, GREEN_ARROW_X_MARKER_CFG, BLUE_ARROW_X_MARKER_CFG
 import isaaclab.sim as sim_utils
 from isaaclab_assets import CRAZYFLIE_CFG
 from isaaclab.assets import ArticulationCfg
 import isaacsim.core.utils.prims as prims_utils
-from pxr import PhysxSchema, Sdf, UsdGeom, UsdPhysics, Gf
 from isaaclab.utils.math import quat_from_euler_xyz
 from collections import deque
 import numpy as np
-import random
 import math
 import time
 import os
-import csv
 import collections
-import itertools
-from dataclasses import dataclass
-
-from foundation.utils.simple_controller import SimpleQuadrotorController
 from foundation.utils.pid_controller import PaperPhysControllerTensor
-
+import json
 MAP_SIZE = (250, 250) 
 
 # 手动定义球体标记配置
@@ -116,8 +106,10 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     observation_space = student_observation_space 
 
     history_len = 5
-    enable_com_offset: bool = False     # 重心偏移开关
     enable_aerodynamics: bool = False   # 混合空气动力学风阻开关
+    print_aerodynamics: bool = False
+    enable_com_offset: bool = False     # 重心偏移开关
+    print_com_offset: bool = False
     add_obs_noise: bool = False     # 训练时是否开启加噪
     noise_std_pos: float = 0.02    # 位置误差噪声 (m)
     noise_std_rot: float = 0.03    # 姿态矩阵噪声
@@ -743,16 +735,15 @@ class QuadcopterEnv(DirectRLEnv):
         if hasattr(self, "_figure8_time"):
             step_count = int(self._figure8_time[0].item() / self.dt)
             
-            # 每 100 步 (即 1.0 秒) 且 至少开启了一个干扰开关时打印
+            # 每 100 步 (即 1.0 秒)
             if step_count % 100 == 0 and (self.cfg.enable_com_offset or self.cfg.enable_aerodynamics):
-                import numpy as np
                 np_set_printoptions = np.get_printoptions()
                 np.set_printoptions(precision=4, suppress=True)
                 
                 print(f"\n{'='*15} [Debug: Env 0 物理状态 @ {self._figure8_time[0].item():.2f}s] {'='*15}")
                 
                 # --- 独立打印 A: 重心位置信息 (受 enable_com_offset 控制) ---
-                if self.cfg.enable_com_offset:
+                if self.cfg.enable_com_offset and self.cfg.print_com_offset:
                     pos_w = self._robot.data.root_pos_w
                     quat_w = self._robot.data.root_quat_w
                     # 重新计算旋转矩阵（因为如果风阻没开，上面就不会算）
@@ -767,21 +758,34 @@ class QuadcopterEnv(DirectRLEnv):
                     print(f"[*] COM World Pos (m)    : {com_world.cpu().numpy()}")
                     
                     # 如果下面还要打印风阻，加个分割线
-                    if self.cfg.enable_aerodynamics:
+                    if self.cfg.enable_aerodynamics and self.cfg.print_aerodynamics:
                         print("-" * 50)
                 
-                # --- 独立打印 B: 风阻加速度信息 (受 enable_aerodynamics 控制) ---
-                if self.cfg.enable_aerodynamics:
-                    # 线加速度 = 力 / 质量
-                    acc_drag_b = force_drag_b[0] / self.mass_tensor[0]
-                    # 角加速度 = 力矩 / 惯性张量
-                    ang_acc_drag_b = torque_drag_b[0] / self.inertia_tensor[0]
+                # --- 独立打印 B: 风阻加速度精细分解信息 (受 enable_aerodynamics 控制) ---
+                if self.cfg.enable_aerodynamics and self.cfg.print_aerodynamics:
+                    mass_0 = self.mass_tensor[0]
+                    inertia_0 = self.inertia_tensor[0]
                     
-                    g_force_eq = torch.norm(acc_drag_b).item() / 9.81
+                    # 1. 获取机体系相对空速与角速度
+                    airspeed = rel_lin_vel_b[0]
+                    ang_vel = ang_vel_b[0]
                     
-                    print(f"[*] Rel Airspeed (m/s)   : {rel_lin_vel_b[0].cpu().numpy()}")
-                    print(f"[*] Drag Linear Acc      : {acc_drag_b.cpu().numpy()} m/s^2  (约 {g_force_eq:.3f} G)")
-                    print(f"[*] Drag Angular Acc     : {ang_acc_drag_b.cpu().numpy()} rad/s^2")
+                    # 2. 分解线阻力与二次方阻力 (为了直观，直接除以质量转化为加速度 m/s^2)
+                    lin_drag_acc = (-self.c_drag_lin[0] * airspeed) / mass_0
+                    quad_drag_acc = (-self.c_drag_quad[0] * torch.abs(airspeed) * airspeed) / mass_0
+                    total_drag_acc = force_drag_b[0] / mass_0
+                    
+                    # 3. 计算角加速度阻尼
+                    ang_acc_drag = torque_drag_b[0] / inertia_0
+                    
+                    g_force_eq = torch.norm(total_drag_acc).item() / 9.81
+                    
+                    print(f"[*] Rel Airspeed (m/s)   : {airspeed.cpu().numpy()}")
+                    print(f"    ├─ Linear Drag Acc   : {lin_drag_acc.cpu().numpy()} m/s^2 (时间常数主导)")
+                    print(f"    ├─ Quad Drag Acc     : {quad_drag_acc.cpu().numpy()} m/s^2 (面积与动压主导)")
+                    print(f"    └─ Total Drag Acc    : {total_drag_acc.cpu().numpy()} m/s^2 (约 {g_force_eq:.3f} G)")
+                    print(f"[*] Angular Vel (rad/s)  : {ang_vel.cpu().numpy()}")
+                    print(f"    └─ Drag Angular Acc  : {ang_acc_drag.cpu().numpy()} rad/s^2")
                 
                 print("="*60)
                 np.set_printoptions(**np_set_printoptions)

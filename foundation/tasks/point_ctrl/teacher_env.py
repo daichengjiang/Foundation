@@ -10,7 +10,6 @@ from __future__ import annotations
 import omni
 import torch
 import torch.nn.functional as F
-import gymnasium as gym
 import isaaclab.sim as sim_utils
 from isaaclab.sim.utils import find_matching_prim_paths
 from isaaclab.assets import Articulation, ArticulationCfg
@@ -22,27 +21,18 @@ from isaaclab.terrains import TerrainImporterCfg, TerrainGeneratorCfg
 from isaaclab.terrains.height_field.hf_terrains_cfg import HfDiscreteObstaclesTerrainCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.math import euler_xyz_from_quat, matrix_from_quat
-from isaaclab.utils.noise import GaussianNoiseCfg, UniformNoiseCfg
 from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
-from isaaclab.markers import CUBOID_MARKER_CFG, GREEN_ARROW_X_MARKER_CFG, BLUE_ARROW_X_MARKER_CFG
 import isaaclab.sim as sim_utils
 from isaaclab_assets import CRAZYFLIE_CFG
 from isaaclab.assets import ArticulationCfg
 import isaacsim.core.utils.prims as prims_utils
-from pxr import PhysxSchema, Sdf, UsdGeom, UsdPhysics, Gf
 from isaaclab.utils.math import quat_from_euler_xyz
 from collections import deque
 import numpy as np
-import random
 import math
 import time
 import os
-import csv
 import collections
-import itertools
-from dataclasses import dataclass
-
-from foundation.utils.simple_controller import SimpleQuadrotorController
 from foundation.utils.pid_controller import PaperPhysControllerTensor
 import json
 MAP_SIZE = (250, 250) 
@@ -115,6 +105,8 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     observation_space = teacher_observation_space
 
     history_len = 5
+    enable_aerodynamics: bool = False   # 混合空气动力学风阻开关
+    print_aerodynamics: bool = False
 
     prob_null_trajectory = 0.5
     trajectory_type = "langevin"
@@ -257,9 +249,36 @@ class QuadcopterEnv(DirectRLEnv):
         self.motor_alpha_up = self.dt / torch.clamp(self.motor_tau_up_tensor, min=1e-6)
         self.motor_alpha_down = self.dt / torch.clamp(self.motor_tau_down_tensor, min=1e-6)
 
+        # ================= [新增] 预计算混合空气动力学参数 =================
+        if self.cfg.enable_aerodynamics:
+            # 1. 线性阻力系数 (Rotor Drag) - 基于时间常数法
+            t_v_xy, t_v_z = 1.5, 1.0
+            self.c_drag_lin = torch.stack([
+                self.mass_tensor / t_v_xy,
+                self.mass_tensor / t_v_xy,
+                self.mass_tensor / t_v_z
+            ], dim=1)
+
+            # 2. 二次方寄生阻力系数 (Parasitic Drag) - 基于质量的近似表面积缩放
+            base_mass = 1.0
+            area_scale = (self.mass_tensor / base_mass) ** (2.0/3.0) 
+            area_xy = 0.02 * area_scale
+            area_z  = 0.08 * area_scale
+            rho_cd_half = 0.5 * 1.225 * 1.1  # 0.5 * rho * Cd
+            
+            self.c_drag_quad = torch.stack([
+                rho_cd_half * area_xy,
+                rho_cd_half * area_xy,
+                rho_cd_half * area_z
+            ], dim=1)
+
+            # 3. 旋转角阻尼系数
+            t_w = 0.1
+            self.c_drag_ang = self.inertia_tensor / t_w
+        # ================================================================
+
         self._current_motor_speeds = torch.zeros(self.num_envs, 4, device=self.device)
 
-        self.env_wind_force = torch.zeros((self.num_envs, 3), device=self.device)
 
         self._controller = PaperPhysControllerTensor(
             num_envs=self.num_envs,
@@ -333,14 +352,13 @@ class QuadcopterEnv(DirectRLEnv):
         self.eval_total_sum = 0.0
         self.reward_report_path = os.environ.get("TEACHER_REWARD_PATH", None)
         # =================================================================
-
+        # [新增] 用于统计平均奖励的变量
+        self.steps_per_iteration = self.cfg.num_steps_per_env
 
         self.set_debug_vis(self.cfg.debug_vis)
         self._traj_origin_adjusted = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
 
         self._calc_env_origins()
-        # [新增] 用于统计平均奖励的变量
-        self.steps_per_iteration = self.cfg.num_steps_per_env
         self.yaw_limit = math.pi / 2
 
         self.delay_steps = 8  
@@ -681,15 +699,68 @@ class QuadcopterEnv(DirectRLEnv):
 
         force_b, torque_b = self._controller.motor_speeds_to_wrench(self._current_motor_speeds)
         
-        # 随机力扰动
-        if self.cfg.dynamics.apply_disturbance:
-            base_quat = self._robot.data.root_quat_w
-            rot_matrix = matrix_from_quat(base_quat) # 世界到机体的正向旋转矩阵 [num_envs, 3, 3]
-            rot_matrix_inv = rot_matrix.transpose(1, 2) # 正交矩阵的转置即为逆矩阵 (世界 -> 机体)
-            # 3.1 外部风扰：世界系 -> 机体系
-            wind_body = torch.bmm(rot_matrix_inv, self.env_wind_force.unsqueeze(-1)).squeeze(-1)
-            # 3.2 叠加机体系下的受力
-            force_b +=  wind_body
+        # ================= 混合风阻 (Hybrid Drag) =================
+        if self.cfg.enable_aerodynamics:
+            # 1. 相对空速转机体系
+            lin_vel_w = self._robot.data.root_lin_vel_w
+            ang_vel_b = self._robot.data.root_ang_vel_b
+            quat_w = self._robot.data.root_quat_w
+            rot_matrix_b2w = matrix_from_quat(quat_w)
+            rot_matrix_w2b = rot_matrix_b2w.transpose(1, 2) 
+            
+            # 默认无静风。如果想加阵风干扰，可以在此处给 wind_vel_w 加上噪声
+            wind_vel_w = torch.zeros_like(lin_vel_w) 
+            rel_lin_vel_w = lin_vel_w - wind_vel_w
+            rel_lin_vel_b = torch.bmm(rot_matrix_w2b, rel_lin_vel_w.unsqueeze(-1)).squeeze(-1)
+
+            # 2. 计算总合力与合力矩
+            force_drag_b = -self.c_drag_lin * rel_lin_vel_b - self.c_drag_quad * torch.abs(rel_lin_vel_b) * rel_lin_vel_b
+            torque_drag_b = -self.c_drag_ang * ang_vel_b
+
+            # 3. 叠加到电机的原始输出上
+            force_b = force_b + force_drag_b
+            torque_b = torque_b + torque_drag_b
+        # ==============================================================================
+        # 打印风阻
+        if hasattr(self, "_figure8_time"):
+            step_count = int(self._figure8_time[0].item() / self.dt)
+            
+            # 每 100 步 (即 1.0 秒)
+            if step_count % 100 == 0 and self.cfg.enable_aerodynamics:
+                np_set_printoptions = np.get_printoptions()
+                np.set_printoptions(precision=4, suppress=True)
+                
+                print(f"\n{'='*15} [Debug: Env 0 物理状态 @ {self._figure8_time[0].item():.2f}s] {'='*15}")
+                
+                
+                # --- 独立打印 B: 风阻加速度精细分解信息 (受 enable_aerodynamics 控制) ---
+                if self.cfg.enable_aerodynamics and self.cfg.print_aerodynamics:
+                    mass_0 = self.mass_tensor[0]
+                    inertia_0 = self.inertia_tensor[0]
+                    
+                    # 1. 获取机体系相对空速与角速度
+                    airspeed = rel_lin_vel_b[0]
+                    ang_vel = ang_vel_b[0]
+                    
+                    # 2. 分解线阻力与二次方阻力 (为了直观，直接除以质量转化为加速度 m/s^2)
+                    lin_drag_acc = (-self.c_drag_lin[0] * airspeed) / mass_0
+                    quad_drag_acc = (-self.c_drag_quad[0] * torch.abs(airspeed) * airspeed) / mass_0
+                    total_drag_acc = force_drag_b[0] / mass_0
+                    
+                    # 3. 计算角加速度阻尼
+                    ang_acc_drag = torque_drag_b[0] / inertia_0
+                    
+                    g_force_eq = torch.norm(total_drag_acc).item() / 9.81
+                    
+                    print(f"[*] Rel Airspeed (m/s)   : {airspeed.cpu().numpy()}")
+                    print(f"    ├─ Linear Drag Acc   : {lin_drag_acc.cpu().numpy()} m/s^2 (时间常数主导)")
+                    print(f"    ├─ Quad Drag Acc     : {quad_drag_acc.cpu().numpy()} m/s^2 (面积与动压主导)")
+                    print(f"    └─ Total Drag Acc    : {total_drag_acc.cpu().numpy()} m/s^2 (约 {g_force_eq:.3f} G)")
+                    print(f"[*] Angular Vel (rad/s)  : {ang_vel.cpu().numpy()}")
+                    print(f"    └─ Drag Angular Acc  : {ang_acc_drag.cpu().numpy()} rad/s^2")
+                
+                print("="*60)
+                np.set_printoptions(**np_set_printoptions)
 
         self._forces.zero_()
         self._torques.zero_()
@@ -1008,20 +1079,6 @@ class QuadcopterEnv(DirectRLEnv):
             None, env_ids
         )
 
-        # [新增] 为重置的环境重新采样外部扰动力
-        if self.cfg.dynamics.apply_disturbance:
-            # 1. 随机生成 3D 方向向量 (使用高斯分布以保证各个方向概率均匀)
-            directions = torch.randn(len(env_ids), 3, device=self.device)
-            directions = F.normalize(directions, dim=-1) # 归一化为单位向量
-            
-            # 2. 随机生成力的标量大小 [0, max_disturbance_force]
-            magnitudes = torch.rand(len(env_ids), 1, device=self.device) * self.cfg.dynamics.max_disturbance_force
-            
-            # 3. 赋值给这些刚刚重置的环境
-            self.env_wind_force[env_ids] = directions * magnitudes
-        else:
-            # 如果开关关闭，风力设为 0
-            self.env_wind_force[env_ids] = 0.0
 
     def _update_episode_outcomes_and_metrics(self, env_ids, success_mask, died_mask, timed_out_mask):
             """
