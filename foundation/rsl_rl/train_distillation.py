@@ -14,10 +14,12 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+# 1. 导入 Isaac Lab 仿真应用启动器
 from isaaclab.app import AppLauncher
 
 import cli_args 
 
+# 2. 定义命令行参数解析器
 parser = argparse.ArgumentParser(description="Train an RL agent with RSL-RL.")
 parser.add_argument("--video", action="store_true", default=False, help="Record videos during training.")
 parser.add_argument("--video_length", type=int, default=200, help="Length of the recorded video (in steps).")
@@ -27,11 +29,12 @@ parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
 parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
 
+# 教师相关的核心控制参数
 parser.add_argument("--teacher_dir", type=str, default=None, required=True, help="Path to the teacher experiment directory.")
 parser.add_argument("--teacher_ids", type=str, default="0", help="Comma-separated list of teacher IDs.")
 parser.add_argument("--exclude_teacher_ids", type=str, default="", help="Comma-separated list of teacher IDs to exclude (e.g., '141,14,78').")
-parser.add_argument("--use_pid", action="store_true", default=False, help="the flag to indicate use pid controller or not")
 
+# 注册 RSL-RL 与 AppLauncher 专属参数
 cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
@@ -41,6 +44,7 @@ if args_cli.video:
 
 sys.argv = [sys.argv[0]] + hydra_args
 
+# 3. 初始化并启动 Isaac Sim 后端引擎（必须在导入 Gym/Torch 仿真模块前执行）
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
@@ -67,52 +71,23 @@ from isaaclab.utils.assets import retrieve_file_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 from foundation import tasks
 
+# 导入多教师策略网络架构
 try:
     from multi_teacher_policy import MultiTeacherPolicy
 except ImportError:
     raise ImportError("Could not import 'MultiTeacherPolicy'. Please create 'multi_teacher_policy.py' first.")
 
+# 4. 开启 PyTorch 性能优化开关（TF32 矩阵乘法加速）
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.benchmark = False
 
-class PIDTeacherWrapper(nn.Module):
-    """
-    将环境内置的 PID 控制器包装成 Policy 的形式。
-    忽略输入的 obs，直接从 env 获取 Ground Truth 计算动作。
-    """
-    def __init__(self, env):
-        super().__init__()
-        self.env = env
-        # 这是一个伪参数，用于通过 PyTorch 的 optimizer 检查（虽然我们不会更新它）
-        self.dummy_param = nn.Parameter(torch.zeros(1))
-
-    def act_inference(self, obs):
-        """
-        模仿 ActorCritic.act_inference 接口
-        """
-        # 这里的 obs 是经过归一化的 teacher_obs，PID 不需要它
-        # PID 需要的是 env 内部的真实状态
-        
-        # 如果 env 被 wrap 过了 (例如 RslRlVecEnvWrapper), 需要解包找到原本的 QuadcopterEnv
-        if hasattr(self.env, "unwrapped"):
-            base_env = self.env.unwrapped
-        else:
-            base_env = self.env
-            
-        # 再次检查，防止多层 wrap
-        while hasattr(base_env, "env"):
-            base_env = base_env.env
-            
-        return base_env.get_pid_actions()
-    
-    def forward(self, obs):
-        return self.act_inference(obs)
 
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg):
     """Train with RSL-RL agent."""
+    # 5. 更新并对齐环境与算法配置
     agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
     agent_cfg.max_iterations = (
@@ -121,21 +96,19 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     env_cfg.seed = agent_cfg.seed
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
-    env_cfg.use_pid = args_cli.use_pid
 
+    # 6. 解析 Teacher IDs（支持范围如 "0-99" 或列表如 "1,2,5"）
     teacher_ids = []
     if '-' in args_cli.teacher_ids:
         start, end = map(int, args_cli.teacher_ids.split('-'))
         teacher_ids = list(range(start, end + 1))
     else:
-        # 加上 if x.strip() 防止末尾多余逗号报错
         teacher_ids = [int(x) for x in args_cli.teacher_ids.split(',') if x.strip()]
     
-    # 👇 新增：劣质 Teacher 剔除逻辑
+    # 7. 剔除指定的劣质 Teacher
     if args_cli.exclude_teacher_ids:
         exclude_ids = [int(x.strip()) for x in args_cli.exclude_teacher_ids.split(',') if x.strip()]
         original_count = len(teacher_ids)
-        # 过滤掉存在于 exclude_ids 中的教师
         teacher_ids = [t_id for t_id in teacher_ids if t_id not in exclude_ids]
         print(f"\n[INFO] 发现过滤指令！已成功剔除 {original_count - len(teacher_ids)} 个劣质 Teacher。")
         print(f"       剔除名单: {exclude_ids}\n")
@@ -146,6 +119,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         
     print(f"Target Teachers ({num_teachers}): {teacher_ids}")
     
+    # 8. 环境数量对齐检查（确保并行环境总数能被教师总数整除）
     if env_cfg.scene.num_envs % num_teachers != 0:
         old_num = env_cfg.scene.num_envs
         new_num = (old_num // num_teachers) * num_teachers
@@ -155,6 +129,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         print(f"          Adjusting num_envs to {new_num}.")
         env_cfg.scene.num_envs = new_num
 
+    # 9. 加载教师的动力学参数 (CSV) 与神经网络模型权重 (.pt)
     teacher_params_list = []
     loaded_teachers_state_dicts = []
     
@@ -163,7 +138,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         raise FileNotFoundError(f"Dynamics CSV not found at: {csv_path}")
         
     df = pd.read_csv(csv_path)
-    
     print(f"Loading dynamics and models from {args_cli.teacher_dir}...")
     
     for t_id in teacher_ids:
@@ -172,53 +146,38 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             raise ValueError(f"Teacher ID {t_id} not found in CSV.")
         row = row.iloc[0]
 
-        if args_cli.use_pid:
-            params = {
-                "id": int(t_id),
-                "mass": float(row['mass']),
-                "arm_length": float(row['arm_length']),
-                "inertia": (float(row['Ixx']), float(row['Iyy']), float(row['Izz'])),
-                "twr": float(row['twr']) if 'twr' in row else float(row['thrust_to_weight']),
-                "motor_tau_up": float(row['motor_tau_up']) if 'motor_tau_up' in row else 0.001,
-                "motor_tau_down": float(row['motor_tau_down']) if 'motor_tau_down' in row else 0.001,
-                "kappa": float(row['kappa']) if 'kappa' in row else 0.016,
-                "wn": float(row['wn']) if 'wn' in row else 2,
-                "zeta": float(row['zeta']) if 'zeta' in row else 0.7,
-                "tc_ang_rp": float(row['tc_ang_rp']) if 'tc_ang_rp' in row else 0.08,
-                "tc_ang_y": float(row['tc_ang_y']) if 'tc_ang_y' in row else 0.4,
-                "tc_rate_rp": float(row['tc_rate_rp']) if 'tc_rate_rp' in row else 0.04,
-                "tc_rate_y": float(row['tc_rate_y']) if 'tc_rate_y' in row else 0.2,
-            }
-            teacher_params_list.append(params)
-        else:
-            params = {
-                "id": int(t_id),
-                "mass": float(row['mass']),
-                "arm_length": float(row['arm_length']),
-                "inertia": (float(row['Ixx']), float(row['Iyy']), float(row['Izz'])),
-                "twr": float(row['twr']) if 'twr' in row else float(row['thrust_to_weight']),
-                "motor_tau_up": float(row['motor_tau_up']) if 'motor_tau_up' in row else 0.05,
-                "motor_tau_down": float(row['motor_tau_down']) if 'motor_tau_down' in row else 0.07,
-                "kappa": float(row['kappa']) if 'kappa' in row else 0.016,
-            }
-            teacher_params_list.append(params)
+        # 提取当前教师专属的异构动力学物理参数
+        params = {
+            "id": int(t_id),
+            "mass": float(row['mass']),
+            "arm_length": float(row['arm_length']),
+            "inertia": (float(row['Ixx']), float(row['Iyy']), float(row['Izz'])),
+            "twr": float(row['twr']) if 'twr' in row else float(row['thrust_to_weight']),
+            "motor_tau_up": float(row['motor_tau_up']) if 'motor_tau_up' in row else 0.05,
+            "motor_tau_down": float(row['motor_tau_down']) if 'motor_tau_down' in row else 0.07,
+            "kappa": float(row['kappa']) if 'kappa' in row else 0.016,
+        }
+        teacher_params_list.append(params)
+        
+        # 寻找对应教师的权重文件路径（优先读取 best_model.pt，其次按创建时间搜寻 model_*.pt）
+        teacher_run_name = f"teacher_{t_id:04d}"
+        folder_path = os.path.join(args_cli.teacher_dir, teacher_run_name)
+        
+        model_path = os.path.join(folder_path, "best_model.pt")
+        if not os.path.exists(model_path):
+            search_pattern = os.path.join(folder_path, "model_*.pt")
+            models = glob.glob(search_pattern)
+            if not models:
+                raise FileNotFoundError(f"No model found for teacher {t_id} in {folder_path}")
+            model_path = max(models, key=os.path.getctime)
             
-            teacher_run_name = f"teacher_{t_id:04d}"
-            folder_path = os.path.join(args_cli.teacher_dir, teacher_run_name)
-            
-            model_path = os.path.join(folder_path, "best_model.pt")
-            if not os.path.exists(model_path):
-                search_pattern = os.path.join(folder_path, "model_*.pt")
-                models = glob.glob(search_pattern)
-                if not models:
-                    raise FileNotFoundError(f"No model found for teacher {t_id} in {folder_path}")
-                model_path = max(models, key=os.path.getctime)
-                
-            print(f"  > [T-{t_id}] Dynamics: Mass={params['mass']:.3f} | Model: {os.path.basename(model_path)}")
-            
-            ckpt = torch.load(model_path, map_location='cpu', weights_only=False)
-            loaded_teachers_state_dicts.append(ckpt)
+        print(f"  > [T-{t_id}] Dynamics: Mass={params['mass']:.3f} | Model: {os.path.basename(model_path)}")
+        
+        # 加载教师模型权重到 CPU 缓存
+        ckpt = torch.load(model_path, map_location='cpu', weights_only=False)
+        loaded_teachers_state_dicts.append(ckpt)
 
+    # 10. 将多教师动力学参数列表注入环境配置中
     try:
         env_cfg.dynamics.multi_teacher_params = teacher_params_list
     except AttributeError:
@@ -227,7 +186,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     print(f"{'='*60}\n")
 
-    # ... 前面的代码保持不变 ...
+    # 11. 构建结构化的实验日志保存目录
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
     log_root_path = os.path.abspath(log_root_path)
     print(f"[INFO] Logging experiment in directory: {log_root_path}")
@@ -236,23 +195,21 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if agent_cfg.run_name:
         log_dir += f"_{agent_cfg.run_name}"
     
-    # --- 新增命名逻辑 ---
-    # 始终显示 ID 范围
+    # 动态拼接日志后缀（包含教师范围和被剔除的 ID）
     log_dir += f"_MultiT_{min(teacher_ids)}-{max(teacher_ids)}"
-    
-    # 如果有剔除，追加标记
     if args_cli.exclude_teacher_ids:
-        # 将逗号替换为连字符，看起来更整洁
         clean_excl = args_cli.exclude_teacher_ids.replace(',', '-')
         log_dir += f"_Excluded{clean_excl}"
         
     log_dir = os.path.join(log_root_path, log_dir)
 
+    # 12. 实例化 Gym 仿真环境
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
 
     if isinstance(env.unwrapped, DirectMARLEnv):
         env = multi_agent_to_single_agent(env)
 
+    # 13. 如果开启了 --video，则包裹视频录制器
     if args_cli.video:
         video_kwargs = {
             "video_folder": os.path.join(log_dir, "videos", "train"),
@@ -264,69 +221,57 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         print_dict(video_kwargs, nesting=4)
         env = gym.wrappers.RecordVideo(env, **video_kwargs)
 
+    # 14. 使用 RSL-RL 向量化环境包装器
     env = RslRlVecEnvWrapper(env)
 
+    # 15. 初始化 RSL-RL 的 OnPolicyRunner 训练运行器
     runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
     runner.add_git_repo_to_log(__file__)
 
     print("\n[Distillation] Constructing Multi-Teacher Policy...")
     
+    # 获取学生观测空间的维度
     obs, extras = env.get_observations() 
     real_student_obs_dim = obs.shape[1] 
     
-    if args_cli.use_pid:
-
-        pid_wrapper = PIDTeacherWrapper(env).to(agent_cfg.device)
-        teacher_modules = [pid_wrapper]
-        teacher_norm_dicts = [None]
-        
-        # 动态检测 Teacher 维度
-        if "teacher" in extras["observations"]:
-            real_teacher_obs_dim = extras["observations"]["teacher"].shape[1]
-            print(f"[INFO] Auto-detected Teacher Obs Dim from env: {real_teacher_obs_dim}")
-        elif hasattr(env.unwrapped, "cfg") and hasattr(env.unwrapped.cfg, "teacher_observation_space"):
-            real_teacher_obs_dim = env.unwrapped.cfg.teacher_observation_space
-            print(f"[WARNING] 'teacher' obs not found in extras. Using config value: {real_teacher_obs_dim}")
-        else:
-            # Fallback
-            print("[WARNING] Could not find teacher dim. Using default 38 (May crash!).")
-            real_teacher_obs_dim = 38
-    else:
-
-        first_ckpt = loaded_teachers_state_dicts[0]
-        teacher_input_weight = None
-        for key in ['actor.0.weight', 'actor.layers.0.weight', 'actor.actor_mlp.0.weight']:
-            if key in first_ckpt['model_state_dict']:
-                teacher_input_weight = first_ckpt['model_state_dict'][key]
-                break
-                
-        if teacher_input_weight is None:
-            raise ValueError("Could not infer Teacher input dimension from checkpoint.")
-        
-        real_teacher_obs_dim = teacher_input_weight.shape[1]
-        
-        teacher_modules = []
-        teacher_norm_dicts = []
-        for i, ckpt in enumerate(loaded_teachers_state_dicts):
-            teacher_p = ActorCritic(
-                num_actor_obs=real_teacher_obs_dim,
-                num_critic_obs=real_teacher_obs_dim,
-                num_actions=env.num_actions,
-                actor_hidden_dims=agent_cfg.policy.teacher_hidden_dims,
-                critic_hidden_dims=agent_cfg.policy.teacher_hidden_dims, 
-                activation="elu", 
-                init_noise_std=1.0,  # Note: 推理时使用 act_inference()，不使用此参数；将被 checkpoint 覆盖
-            ).to(agent_cfg.device)
+    # 从第一个教师权重的输入层自动推断教师观测空间维度 (real_teacher_obs_dim)
+    first_ckpt = loaded_teachers_state_dicts[0]
+    teacher_input_weight = None
+    for key in ['actor.0.weight', 'actor.layers.0.weight', 'actor.actor_mlp.0.weight']:
+        if key in first_ckpt['model_state_dict']:
+            teacher_input_weight = first_ckpt['model_state_dict'][key]
+            break
             
-            teacher_p.load_state_dict(ckpt['model_state_dict'])
-            teacher_p.eval() 
-            teacher_modules.append(teacher_p)
+    if teacher_input_weight is None:
+        raise ValueError("Could not infer Teacher input dimension from checkpoint.")
+    
+    real_teacher_obs_dim = teacher_input_weight.shape[1]
+    
+    # 16. 循环构建每一个神经网络教师模型实例并加载权重
+    teacher_modules = []
+    teacher_norm_dicts = []
+    for i, ckpt in enumerate(loaded_teachers_state_dicts):
+        teacher_p = ActorCritic(
+            num_actor_obs=real_teacher_obs_dim,
+            num_critic_obs=real_teacher_obs_dim,
+            num_actions=env.num_actions,
+            actor_hidden_dims=agent_cfg.policy.teacher_hidden_dims,
+            critic_hidden_dims=agent_cfg.policy.teacher_hidden_dims, 
+            activation="elu", 
+            init_noise_std=1.0,  # 仅占位，推理时使用 act_inference()，会被 checkpoint 覆盖
+        ).to(agent_cfg.device)
+        
+        teacher_p.load_state_dict(ckpt['model_state_dict'])
+        teacher_p.eval()  # 教师模型设为评估模式（不更新梯度）
+        teacher_modules.append(teacher_p)
 
-            if 'obs_norm_state_dict' in ckpt:
-                teacher_norm_dicts.append(ckpt['obs_norm_state_dict'])
-            else:
-                teacher_norm_dicts.append(None) 
+        # 收集教师专属的观测归一化状态字典（如果存在）
+        if 'obs_norm_state_dict' in ckpt:
+            teacher_norm_dicts.append(ckpt['obs_norm_state_dict'])
+        else:
+            teacher_norm_dicts.append(None) 
 
+    # 17. 实例化总的多教师蒸馏策略网络 (MultiTeacherPolicy)
     multi_policy = MultiTeacherPolicy(
         num_student_obs=real_student_obs_dim,
         num_teacher_obs=real_teacher_obs_dim,
@@ -344,6 +289,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         teacher_norm_state_dicts=teacher_norm_dicts,
     ).to(agent_cfg.device)
     
+    # 18. 断点恢复逻辑（如果指定了恢复训练的 checkpoint）
     resume_path = None
     if agent_cfg.resume:
         resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
@@ -355,22 +301,27 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         loaded_dict = torch.load(resume_path, map_location=agent_cfg.device)
         multi_policy.load_state_dict(loaded_dict['model_state_dict'], strict=False)
 
+    # 19. 将多教师策略赋给运行器，并初始化 Adam 优化器
     runner.alg.policy = multi_policy
     runner.alg.optimizer = torch.optim.Adam(runner.alg.policy.parameters(), lr=runner.alg.learning_rate)
     runner.alg.policy.loaded_teacher = True
     
+    # 20. 配置经验归一化（多教师蒸馏中由 MultiTeacherPolicy 内部独立处理归一化）
     if agent_cfg.empirical_normalization:
         print("[INFO] Disabling global privileged_obs_normalizer in Runner.")
         print("       (Normalization is now handled internally by MultiTeacherPolicy per teacher)")
         runner.privileged_obs_normalizer = torch.nn.Identity().to(agent_cfg.device)
 
+    # 21. 持久化备份当前实验的 YAML 和 Pickle 配置文件
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
     dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
     dump_pickle(os.path.join(log_dir, "params", "env.pkl"), env_cfg)
     dump_pickle(os.path.join(log_dir, "params", "agent.pkl"), agent_cfg)
 
+    # 22. 正式启动强化学习蒸馏训练循环
     runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)
 
+    # 23. 训练完成，关闭仿真环境
     env.close()
 
 
