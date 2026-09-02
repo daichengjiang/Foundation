@@ -3,16 +3,20 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
+"""Script to train RL agent with RSL-RL."""
 
+"""Launch Isaac Sim Simulator first."""
 
 import argparse
 import sys
-import os
-import torch
+
 from isaaclab.app import AppLauncher
 
-import cli_args 
+# local imports
+import cli_args  # isort: skip
 
+
+# add argparse arguments
 parser = argparse.ArgumentParser(description="Train an RL agent with RSL-RL.")
 parser.add_argument("--video", action="store_true", default=False, help="Record videos during training.")
 parser.add_argument("--video_length", type=int, default=200, help="Length of the recorded video (in steps).")
@@ -22,22 +26,48 @@ parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
 parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
 parser.add_argument("--log_timestamp", type=str, default=None, help="Fixed timestamp folder name.")
+
+# [NEW] 参数筛选所需的命令行参数
+parser.add_argument("--override_hidden_dims", type=int, nargs="+", default=None, help="Override actor and critic hidden dims (e.g. 128 128 128)")
+parser.add_argument("--override_entropy", type=float, default=None, help="Override entropy coefficient")
+parser.add_argument("--override_schedule", type=str, default=None, help="Override learning rate schedule")
+parser.add_argument("--override_num_learning_epochs", type=int, default=None, help="Override num learning epochs per iteration")
+parser.add_argument("--run_name_suffix", type=str, default=None, help="Suffix for wandb run name")
+parser.add_argument("--wandb_project", type=str, default=None, help="WandB project name")
+
+# [NEW] 奖励系数参数 (默认值为 None，表示使用 Config 中的原始值)
+parser.add_argument("--reward_coef_position_cost", type=float, default=None, help="Override position cost coef")
+parser.add_argument("--reward_coef_orientation_cost", type=float, default=None, help="Override orientation cost coef")
+parser.add_argument("--reward_coef_d_action_cost", type=float, default=None, help="Override action smooth cost coef")
+parser.add_argument("--reward_coef_termination_penalty", type=float, default=None, help="Override termination penalty")
+parser.add_argument("--reward_constant", type=float, default=None, help="Override reward constant")
+# append RSL-RL cli arguments
+cli_args.add_rsl_rl_args(parser)
+# append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
 
+# always enable cameras to record video
 if args_cli.video:
     args_cli.enable_cameras = True
 
+# clear out sys.argv for Hydra
 sys.argv = [sys.argv[0]] + hydra_args
 
+# launch omniverse app
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
+"""Rest everything follows."""
+
 import gymnasium as gym
+import os
+import torch
 from datetime import datetime
 
 from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper
 from rsl_rl.runners import OnPolicyRunner
+# from on_policy_runner import OnPolicyRunner
 
 from isaaclab.envs import (
     DirectMARLEnv,
@@ -49,7 +79,7 @@ from isaaclab.envs import (
 from isaaclab.utils.dict import print_dict
 from isaaclab.utils.io import dump_pickle, dump_yaml
 
-import isaaclab_tasks  
+import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab.utils.assets import retrieve_file_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
@@ -72,9 +102,61 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         args_cli.max_iterations if args_cli.max_iterations is not None else agent_cfg.max_iterations
     )
 
+    # [NEW] 使用命令行参数覆盖默认配置 (参数搜索核心逻辑)
+    if args_cli.override_hidden_dims:
+        print(f"[INFO] Overriding Hidden Dims to: {args_cli.override_hidden_dims}")
+        agent_cfg.policy.actor_hidden_dims = args_cli.override_hidden_dims
+        agent_cfg.policy.critic_hidden_dims = args_cli.override_hidden_dims
+        
+    if args_cli.override_entropy is not None:
+        print(f"[INFO] Overriding Entropy Coef to: {args_cli.override_entropy}")
+        agent_cfg.algorithm.entropy_coef = args_cli.override_entropy
+        
+    if args_cli.override_schedule:
+        print(f"[INFO] Overriding Schedule to: {args_cli.override_schedule}")
+        agent_cfg.algorithm.schedule = args_cli.override_schedule
+
+    if args_cli.override_num_learning_epochs is not None:
+        print(f"[INFO] Overriding Num Learning Epochs to: {args_cli.override_num_learning_epochs}")
+        agent_cfg.algorithm.num_learning_epochs = args_cli.override_num_learning_epochs
+
+    # [NEW] 修改 WandB 的 Run Name 和 Experiment Name
+    if args_cli.run_name_suffix:
+        # 修改 experiment_name，防止污染正常的 single_teacher 文件夹
+        agent_cfg.experiment_name = "param_search"
+        # 修改 run_name，这样 WandB 上能直接看出参数组合
+        agent_cfg.run_name = f"Search_{args_cli.run_name_suffix}"
+        
+
+    # [NEW] 覆盖奖励系数
+    # 请根据你 teacher_env.py 中 QuadcopterEnvCfg 的实际结构调整以下属性名
+    if args_cli.reward_coef_position_cost is not None:
+        print(f"[INFO] Overriding Position Cost to: {args_cli.reward_coef_position_cost}")
+        # 如果你的参数在 env_cfg.rewards 下，请改为 env_cfg.rewards.xxx.weight
+        env_cfg.reward_coef_position_cost = args_cli.reward_coef_position_cost
+        
+    if args_cli.reward_coef_orientation_cost is not None:
+        print(f"[INFO] Overriding Orientation Cost to: {args_cli.reward_coef_orientation_cost}")
+        env_cfg.reward_coef_orientation_cost = args_cli.reward_coef_orientation_cost
+        
+    if args_cli.reward_coef_d_action_cost is not None:
+        print(f"[INFO] Overriding Action Cost to: {args_cli.reward_coef_d_action_cost}")
+        env_cfg.reward_coef_d_action_cost = args_cli.reward_coef_d_action_cost
+
+    if args_cli.reward_coef_termination_penalty is not None:
+        print(f"[INFO] Overriding Termination Penalty to: {args_cli.reward_coef_termination_penalty}")
+        env_cfg.reward_coef_termination_penalty = args_cli.reward_coef_termination_penalty
+        
+    if args_cli.reward_constant is not None:
+        print(f"[INFO] Overriding Reward Constant to: {args_cli.reward_constant}")
+        env_cfg.reward_constant = args_cli.reward_constant
+
+    # set the environment seed
+    # note: certain randomizations occur in the environment initialization so we set the seed here
     env_cfg.seed = agent_cfg.seed
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
 
+    # specify directory for logging experiments
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
     log_root_path = os.path.abspath(log_root_path)
     print(f"[INFO] Logging experiment in directory: {log_root_path}")
@@ -114,12 +196,21 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             log_dir += f"_{agent_cfg.run_name}"
         log_dir = os.path.join(log_root_path, log_dir)
 
+
+    # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
 
+    # convert to single-agent instance if required by the RL algorithm
     if isinstance(env.unwrapped, DirectMARLEnv):
         env = multi_agent_to_single_agent(env)
 
-    # 13. 如果开启了 --video，则包裹视频录制器
+    # save resume path before creating a new log_dir
+    if agent_cfg.resume:
+        resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
+    elif args_cli.checkpoint:
+        resume_path = retrieve_file_path(args_cli.checkpoint)
+
+    # wrap for video recording
     if args_cli.video:
         video_kwargs = {
             "video_folder": os.path.join(log_dir, "videos", "train"),
@@ -131,21 +222,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         print_dict(video_kwargs, nesting=4)
         env = gym.wrappers.RecordVideo(env, **video_kwargs)
 
-    # 14. 使用 RSL-RL 向量化环境包装器
+    # wrap around environment for rsl-rl
     env = RslRlVecEnvWrapper(env)
 
-    # 15. 初始化 RSL-RL 的 OnPolicyRunner 训练运行器
+    # create runner from rsl-rl
     runner = OnPolicyRunner(env, agent_cfg_dict, log_dir=log_dir, device=agent_cfg.device)
-    runner.add_git_repo_to_log(__file__)
-
     
-    # 18. 断点恢复逻辑（如果指定了恢复训练的 checkpoint）
-    resume_path = None
-    if agent_cfg.resume:
-        resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
-    elif args_cli.checkpoint:
-        resume_path = retrieve_file_path(args_cli.checkpoint)
-        # [NEW] 强制覆盖 Runner 内部的 run_name，确保 WandB 记录正确
+    # [NEW] 强制覆盖 Runner 内部的 run_name，确保 WandB 记录正确
     if args_cli.log_timestamp:
         runner.run_name = agent_cfg.run_name
     elif args_cli.run_name_suffix:
@@ -153,7 +236,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         runner.run_name = agent_cfg.run_name
 
     # write git state to logs
-        # load the checkpoint
+    runner.add_git_repo_to_log(__file__)
+    # load the checkpoint
     if agent_cfg.resume or args_cli.checkpoint:
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
         # load previously trained model
@@ -161,19 +245,23 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if args_cli.init_noise_std:
         runner.load_std(args_cli.init_noise_std)
         print(f"[INFO]: Loading init noise std from: {args_cli.init_noise_std}")
-    # 21. 持久化备份当前实验的 YAML 和 Pickle 配置文件
+
+
+    # dump the configuration into log-directory
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
     dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
     dump_pickle(os.path.join(log_dir, "params", "env.pkl"), env_cfg)
     dump_pickle(os.path.join(log_dir, "params", "agent.pkl"), agent_cfg)
 
-    # 22. 正式启动强化学习蒸馏训练循环
+    # run training
     runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)
 
-    # 23. 训练完成，关闭仿真环境
+    # close the simulator
     env.close()
 
 
 if __name__ == "__main__":
+    # run the main function
     main()
+    # close sim app
     simulation_app.close()
