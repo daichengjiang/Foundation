@@ -3,7 +3,7 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Script to train RL agent with RSL-RL (Multi-Teacher Distillation Mode)."""
+
 
 import argparse
 import sys
@@ -13,7 +13,6 @@ import pandas as pd
 import numpy as np
 import torch
 import torch.nn as nn
-
 # 1. 导入 Isaac Lab 仿真应用启动器
 from isaaclab.app import AppLauncher
 
@@ -190,7 +189,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
     log_root_path = os.path.abspath(log_root_path)
     print(f"[INFO] Logging experiment in directory: {log_root_path}")
-    
+
     log_dir = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     if agent_cfg.run_name:
         log_dir += f"_{agent_cfg.run_name}"
