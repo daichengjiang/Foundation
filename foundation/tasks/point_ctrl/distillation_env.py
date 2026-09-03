@@ -27,6 +27,7 @@ from isaaclab_assets import CRAZYFLIE_CFG
 from isaaclab.assets import ArticulationCfg
 import isaacsim.core.utils.prims as prims_utils
 from isaaclab.utils.math import quat_from_euler_xyz
+from isaaclab.utils.noise import NoiseModelCfg, GaussianNoiseCfg, NoiseModel
 from collections import deque
 import numpy as np
 import math
@@ -106,15 +107,16 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     observation_space = student_observation_space 
 
     history_len = 5
-    enable_aerodynamics: bool = False   # 混合空气动力学风阻开关
+    enable_aerodynamics: bool = True   # 混合空气动力学风阻开关
     print_aerodynamics: bool = False
-    enable_com_offset: bool = False     # 重心偏移开关
+    enable_com_offset: bool = True     # 重心偏移开关
     print_com_offset: bool = False
-    add_obs_noise: bool = False     # 训练时是否开启加噪
-    noise_std_pos: float = 0.02    # 位置误差噪声 (m)
+    add_obs_noise: bool = True     # 训练时是否开启加噪
+    noise_std_pos: float = 0.03    # 位置误差噪声 (m)
     noise_std_rot: float = 0.03    # 姿态矩阵噪声
     noise_std_vel: float = 0.04    # 速度误差噪声 (m/s)
     noise_std_ang_vel: float = 0.1 # 角速度噪声 (rad/s)
+    print_torque_breakdown: bool = False
 
     prob_null_trajectory = 0.5
     trajectory_type = "langevin"
@@ -168,6 +170,20 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     reward_coef_termination_penalty = 100.0
     reward_constant = 1.5
 
+    # ================= [配置原生噪声模型] =================
+    # 1. 动作噪声模型配置（使用 NoiseModelCfg 包裹）
+    action_noise_model = NoiseModelCfg(
+        class_type=NoiseModel,
+        noise_cfg=GaussianNoiseCfg(mean=0.0, std=0.01, operation="add"),
+    )
+
+    # 2. 观测噪声模型配置（如果需要对 policy 观测加噪，也可以这样写）
+    # observation_noise_model = NoiseModelCfg(
+    #     class_type=NoiseModel,
+    #     noise_cfg=GaussianNoiseCfg(mean=0.0, std=0.02, operation="add"),
+    # )
+    observation_noise_model = None
+    # =======================================================
 class QuadcopterEnv(DirectRLEnv):
     cfg: QuadcopterEnvCfg
 
@@ -628,7 +644,7 @@ class QuadcopterEnv(DirectRLEnv):
 
         # [新增] 在 _setup_scene 中初始化 com_tensor，保障生命周期安全
         self.com_tensor = torch.zeros(self.num_envs, 3, device=self.device)
-        com_ratios = torch.tensor([0.20, 0.20, 0.20], device=self.device)
+        com_ratios = torch.tensor([0, 0, 0], device=self.device)
 
         # 遍历所有环境，修改底层 USD/PhysX 属性
         for i, prim_path in enumerate(robot_prims):
@@ -707,9 +723,16 @@ class QuadcopterEnv(DirectRLEnv):
         self._current_motor_speeds = current + alpha * (target - current)
         self._current_motor_speeds = torch.clamp(self._current_motor_speeds, 0.0, 1.0)
 
-        force_b, torque_b = self._controller.motor_speeds_to_wrench(self._current_motor_speeds)
+        # 1. 基于几何中心的基准推力与扭矩
+        force_b_motors, torque_b_motors = self._controller.motor_speeds_to_wrench(self._current_motor_speeds)
         
-        # ================= 混合风阻 (Hybrid Drag) =================
+        force_b = force_b_motors.clone()
+        torque_b = torque_b_motors.clone()
+
+        # ================= 2. 混合风阻计算 =================
+        force_drag_b = torch.zeros_like(force_b)
+        torque_drag_b = torch.zeros_like(torque_b)
+        
         if self.cfg.enable_aerodynamics:
             # 1. 相对空速转机体系
             lin_vel_w = self._robot.data.root_lin_vel_w
@@ -731,7 +754,23 @@ class QuadcopterEnv(DirectRLEnv):
             force_b = force_b + force_drag_b
             torque_b = torque_b + torque_drag_b
         # ==============================================================================
-        # 打印重心和风阻
+
+        # ================= 3. 手动施加重心偏载力矩 =================
+        eccentric_torque_thrust = torch.zeros_like(torque_b)
+        eccentric_torque_drag = torch.zeros_like(torque_b)
+        
+        if hasattr(self.cfg, 'enable_com_offset') and self.cfg.enable_com_offset:
+            # A. 电机推力的偏心力矩 = (-com) × 推力
+            eccentric_torque_thrust = torch.cross(-self.com_tensor, force_b_motors, dim=1)
+            
+            # B. 空气阻力的偏心力矩 = (-com) × 阻力
+            eccentric_torque_drag = torch.cross(-self.com_tensor, force_drag_b, dim=1)
+            
+            # 将因重心偏移导致的所有侧翻力矩叠加到总力矩中
+            torque_b = torque_b + eccentric_torque_thrust + eccentric_torque_drag
+        # ==============================================================
+
+        #  打印重心、风阻及拆解后的各项力矩
         if hasattr(self, "_figure8_time"):
             step_count = int(self._figure8_time[0].item() / self.dt)
             
@@ -740,7 +779,7 @@ class QuadcopterEnv(DirectRLEnv):
                 np_set_printoptions = np.get_printoptions()
                 np.set_printoptions(precision=4, suppress=True)
                 
-                print(f"\n{'='*15} [Debug: Env 0 物理状态 @ {self._figure8_time[0].item():.2f}s] {'='*15}")
+                # print(f"\n{'='*15} [Debug: Env 0 物理状态 @ {self._figure8_time[0].item():.2f}s] {'='*15}")
                 
                 # --- 独立打印 A: 重心位置信息 (受 enable_com_offset 控制) ---
                 if self.cfg.enable_com_offset and self.cfg.print_com_offset:
@@ -787,7 +826,17 @@ class QuadcopterEnv(DirectRLEnv):
                     print(f"[*] Angular Vel (rad/s)  : {ang_vel.cpu().numpy()}")
                     print(f"    └─ Drag Angular Acc  : {ang_acc_drag.cpu().numpy()} rad/s^2")
                 
-                print("="*60)
+                if self.cfg.print_torque_breakdown:
+                    # 打印详细的力矩成分拆解
+                    print("-" * 50)
+                    print(f"[*] Torque Breakdown (N·m):")
+                    print(f"    ├─ 1. Motor Wrench   : {torque_b_motors[0].cpu().numpy()} (电机差速产生)")
+                    print(f"    ├─ 2. Drag Angular   : {torque_drag_b[0].cpu().numpy()} (旋转风阻阻尼)")
+                    print(f"    ├─ 3. Eccentric Thrust: {eccentric_torque_thrust[0].cpu().numpy()} (推力偏载)")
+                    print(f"    ├─ 4. Eccentric Drag : {eccentric_torque_drag[0].cpu().numpy()} (风阻偏载 - 风向标效应)")
+                    print(f"    └─ TOTAL Torque      : {torque_b[0].cpu().numpy()}")
+                    
+                # print("="*60)
                 np.set_printoptions(**np_set_printoptions)
 
         self._forces.zero_()
