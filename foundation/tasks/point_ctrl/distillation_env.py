@@ -107,15 +107,31 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     observation_space = student_observation_space 
 
     history_len = 5
-    enable_aerodynamics: bool = True   # 混合空气动力学风阻开关
+    enable_aerodynamics: bool = False   # 混合空气动力学风阻开关
     print_aerodynamics: bool = False
-    enable_com_offset: bool = True     # 重心偏移开关
+    enable_com_offset: bool = False     # 重心偏移开关
     print_com_offset: bool = False
-    add_obs_noise: bool = True     # 训练时是否开启加噪
+    add_obs_noise: bool = False     # 训练时是否开启加噪
     noise_std_pos: float = 0.03    # 位置误差噪声 (m)
     noise_std_rot: float = 0.03    # 姿态矩阵噪声
     noise_std_vel: float = 0.04    # 速度误差噪声 (m/s)
     noise_std_ang_vel: float = 0.1 # 角速度噪声 (rad/s)
+
+    # ================= [配置原生噪声模型] =================
+    # 1. 动作噪声模型配置（使用 NoiseModelCfg 包裹）
+    # action_noise_model = NoiseModelCfg(
+    #     class_type=NoiseModel,
+    #     noise_cfg=GaussianNoiseCfg(mean=0.0, std=0.01, operation="add"),
+    # )
+    # action_noise_model = None
+    # 2. 观测噪声模型配置（如果需要对 policy 观测加噪，也可以这样写）
+    # observation_noise_model = NoiseModelCfg(
+    #     class_type=NoiseModel,
+    #     noise_cfg=GaussianNoiseCfg(mean=0.0, std=0.02, operation="add"),
+    # )
+    observation_noise_model = None
+    # =======================================================
+
     print_torque_breakdown: bool = False
 
     prob_null_trajectory = 0.5
@@ -169,21 +185,6 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     reward_coef_d_action_cost = 0.5
     reward_coef_termination_penalty = 100.0
     reward_constant = 1.5
-
-    # ================= [配置原生噪声模型] =================
-    # 1. 动作噪声模型配置（使用 NoiseModelCfg 包裹）
-    action_noise_model = NoiseModelCfg(
-        class_type=NoiseModel,
-        noise_cfg=GaussianNoiseCfg(mean=0.0, std=0.01, operation="add"),
-    )
-
-    # 2. 观测噪声模型配置（如果需要对 policy 观测加噪，也可以这样写）
-    # observation_noise_model = NoiseModelCfg(
-    #     class_type=NoiseModel,
-    #     noise_cfg=GaussianNoiseCfg(mean=0.0, std=0.02, operation="add"),
-    # )
-    observation_noise_model = None
-    # =======================================================
 class QuadcopterEnv(DirectRLEnv):
     cfg: QuadcopterEnvCfg
 
@@ -644,7 +645,7 @@ class QuadcopterEnv(DirectRLEnv):
 
         # [新增] 在 _setup_scene 中初始化 com_tensor，保障生命周期安全
         self.com_tensor = torch.zeros(self.num_envs, 3, device=self.device)
-        com_ratios = torch.tensor([0, 0, 0], device=self.device)
+        com_ratios = torch.tensor([0.1, 0.05, 0.05], device=self.device)
 
         # 遍历所有环境，修改底层 USD/PhysX 属性
         for i, prim_path in enumerate(robot_prims):

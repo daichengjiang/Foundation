@@ -37,7 +37,9 @@ class ActorCritic(nn.Module):
 
         mlp_input_dim_a = num_actor_obs
         mlp_input_dim_c = num_critic_obs
-        # Policy
+        
+        # Policy: Teacher网络 (纯MLP架构)
+        # 整体结构: Input -> Linear(128) -> ELU -> Linear(128) -> ELU -> Linear(128) -> ELU -> Linear(num_actions) -> Tanh -> Output
         actor_layers = []
         actor_layers.append(nn.Linear(mlp_input_dim_a, actor_hidden_dims[0]))
         actor_layers.append(activation)

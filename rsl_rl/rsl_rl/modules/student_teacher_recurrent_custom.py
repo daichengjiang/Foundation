@@ -64,6 +64,9 @@ class StudentTeacherRecurrentCustom(StudentTeacher):
 
         activation_fn = resolve_nn_activation(activation)
 
+        # Policy: Student网络 (端到端轻量级RNN架构)
+        # 整体结构: Input -> Linear(16) -> ELU -> GRU(16) -> Identity -> Linear(num_actions) -> Identity -> Output
+
         # 1. Pre-RNN Dense layer
         self.pre_rnn_mlp = nn.Sequential(
             nn.Linear(num_student_obs, pre_rnn_dim),

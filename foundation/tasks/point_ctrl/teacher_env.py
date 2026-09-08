@@ -115,6 +115,22 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     noise_std_rot: float = 0.03    # 姿态矩阵噪声
     noise_std_vel: float = 0.04    # 速度误差噪声 (m/s)
     noise_std_ang_vel: float = 0.1 # 角速度噪声 (rad/s)
+
+    # ================= [配置原生噪声模型] =================
+    # 1. 动作噪声模型配置（使用 NoiseModelCfg 包裹）
+    # action_noise_model = NoiseModelCfg(
+    #     class_type=NoiseModel,
+    #     noise_cfg=GaussianNoiseCfg(mean=0.0, std=0.01, operation="add"),
+    # )
+    # action_noise_model = None
+    # 2. 观测噪声模型配置（如果需要对 policy 观测加噪，也可以这样写）
+    # observation_noise_model = NoiseModelCfg(
+    #     class_type=NoiseModel,
+    #     noise_cfg=GaussianNoiseCfg(mean=0.0, std=0.02, operation="add"),
+    # )
+    observation_noise_model = None
+    # =======================================================
+
     print_torque_breakdown: bool = False
 
     prob_null_trajectory = 0.5
@@ -168,21 +184,6 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     reward_coef_d_action_cost = 0.5
     reward_coef_termination_penalty = 100.0
     reward_constant = 1.5
-
-    # ================= [配置原生噪声模型] =================
-    # 1. 动作噪声模型配置（使用 NoiseModelCfg 包裹）
-    # action_noise_model = NoiseModelCfg(
-    #     class_type=NoiseModel,
-    #     noise_cfg=GaussianNoiseCfg(mean=0.0, std=0.01, operation="add"),
-    # )
-
-    # 2. 观测噪声模型配置（如果需要对 policy 观测加噪，也可以这样写）
-    # observation_noise_model = NoiseModelCfg(
-    #     class_type=NoiseModel,
-    #     noise_cfg=GaussianNoiseCfg(mean=0.0, std=0.02, operation="add"),
-    # )
-    observation_noise_model = None
-    # =======================================================
 class QuadcopterEnv(DirectRLEnv):
     cfg: QuadcopterEnvCfg
 
@@ -376,7 +377,7 @@ class QuadcopterEnv(DirectRLEnv):
         self.reward_report_path = os.environ.get("TEACHER_REWARD_PATH", None)
         # =================================================================
         # [新增] 用于统计平均奖励的变量
-        self.steps_per_iteration = self.cfg.num_steps_per_env
+        self.steps_per_iteration = 256
 
         self.set_debug_vis(self.cfg.debug_vis)
         self._traj_origin_adjusted = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
