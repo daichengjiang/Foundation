@@ -1087,9 +1087,20 @@ class QuadcopterEnv(DirectRLEnv):
         super()._reset_idx(env_ids)
 
         # 标志位与动作重置
-        self._actions[env_ids] = 0.0
-        self._last_actions[env_ids] = 0.0
-        self._current_motor_speeds[env_ids] = 0.0
+        # self._actions[env_ids] = 0.0
+        # self._last_actions[env_ids] = 0.0
+        # self._current_motor_speeds[env_ids] = 0.0
+        # for i in range(self.delay_steps):
+        #     self._action_queue[env_ids, i, :] = 0.0     
+
+        hover_motor_speed = torch.sqrt(1.0 / self.twr_tensor[env_ids])
+        hover_action = hover_motor_speed * 2.0 - 1.0 
+        self._actions[env_ids] = hover_action.unsqueeze(1).expand(-1, 4).clone()
+        self._last_actions[env_ids] = hover_action.unsqueeze(1).expand(-1, 4).clone()
+        self._current_motor_speeds[env_ids] = hover_motor_speed.unsqueeze(1).expand(-1, 4).clone()
+        for i in range(self.delay_steps):
+            self._action_queue[env_ids, i, :] = hover_action.unsqueeze(1).expand(-1, 4).clone()
+
         self._forces[env_ids] = 0.0
         self._torques[env_ids] = 0.0
         self._numerical_is_unstable[env_ids] = False
