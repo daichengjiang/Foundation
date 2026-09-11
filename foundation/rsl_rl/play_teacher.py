@@ -3,12 +3,13 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Script to play and evaluate trajectory tracking with the best trained model."""
+"""Script to play and evaluate trajectory tracking with the best trained model (Supports PPO & SAC)."""
 
 """Launch Isaac Sim Simulator first."""
 
 import argparse
 import sys
+import os
 
 from isaaclab.app import AppLauncher
 
@@ -18,6 +19,8 @@ import cli_args  # isort: skip
 
 # add argparse arguments
 parser = argparse.ArgumentParser(description="Play and evaluate trajectory tracking with the best trained model.")
+parser.add_argument("--algorithm", type=str, default="sac", choices=["ppo", "sac"], help="Choose RL algorithm: ppo or sac.")
+
 parser.add_argument("--video", action="store_true", default=False, help="Record videos during playing.")
 parser.add_argument("--video_length", type=int, default=2000, help="Length of the recorded video (in steps).")
 parser.add_argument("--video_interval", type=int, default=10000, help="Interval between video recordings (in steps).")
@@ -30,12 +33,20 @@ parser.add_argument(
     "--disable_fabric", action="store_true", default=False, help="Disable fabric and use USD I/O operations."
 )
 parser.add_argument("--realtime", action="store_true", default=False, help="Run in real-time, if possible.")
-parser.add_argument("--use_pid", action="store_true", default=False, help="the flag to indicate use pid controller or not")
+
 # append RSL-RL cli arguments (this includes --checkpoint)
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
+
+# 【核心新增】根据命令行选择自动配置环境变量
+if args_cli.algorithm.lower() == "sac":
+    os.environ["RSL_RL_SAC"] = "1"
+    print("[INFO] Selected Algorithm: SAC (OffPolicyRunner & TensorDict enabled)")
+else:
+    os.environ["RSL_RL_SAC"] = "0"
+    print("[INFO] Selected Algorithm: PPO (OnPolicyRunner & standard tuple enabled)")
 
 # always enable cameras to record video
 if args_cli.video:
@@ -51,15 +62,23 @@ simulation_app = app_launcher.app
 """Rest everything follows."""
 
 import gymnasium as gym
-import os
 import time
 import torch
 from isaaclab.utils.math import euler_xyz_from_quat
 import numpy as np
 from datetime import datetime
 
-from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper
-from rsl_rl.runners import OnPolicyRunner
+from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
+
+try:
+    from rsl_rl.runners import OffPolicyRunner
+except ImportError:
+    OffPolicyRunner = None
+
+try:
+    from rsl_rl.runners import OnPolicyRunner
+except ImportError:
+    OnPolicyRunner = None
 
 from isaaclab.envs import (
     DirectMARLEnv,
@@ -87,7 +106,7 @@ STATS_START_STEP = 3000
 # ==========================================
 
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
-def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg):
+def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg):
     """Play and evaluate trajectory tracking with best model."""
     # override configurations with non-hydra CLI arguments
     agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
@@ -106,10 +125,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env_cfg.seed = args_cli.seed
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
     env_cfg.sim.use_fabric = not args_cli.disable_fabric if args_cli.disable_fabric is not None else env_cfg.sim.use_fabric
-    env_cfg.use_pid = args_cli.use_pid
+
 
     # Example dynamics (Teacher usually works on specific dynamics)
-    dynamics_dict = [1.045028350660195,0.10973166128291245,0.007480588837278927,0.007480588837278927,0.013704438749894994,2.5097208039981704,0.08375902134261277,0.25579559673830743,0.024000614342738206]
+    dynamics_dict = [1.0949910886736467,0.09616932178821314,0.011388836516885218,0.011388836516885218,0.020864348498933722,2.4249219599992555,0.054206370634219694,0.22190650537008846,0.02565777038847415]
     env_cfg.dynamics.mass = dynamics_dict[0]
     env_cfg.dynamics.arm_length = dynamics_dict[1]
     env_cfg.dynamics.inertia = (dynamics_dict[2], dynamics_dict[3], dynamics_dict[4])
@@ -144,27 +163,44 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         env = gym.wrappers.RecordVideo(env, **video_kwargs)
 
     env = RslRlVecEnvWrapper(env)
-    runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
+
+    # 动态选择实例化 OnPolicyRunner (PPO) 还是 OffPolicyRunner (SAC)
+    if args_cli.algorithm.lower() == "sac":
+        if OffPolicyRunner is None:
+            raise ImportError(
+                "当前环境未安装或未正确加载支持 SAC 的 rsl_rl_sac 库！"
+                "请检查你启动终端时是否使用了正确的 PYTHONPATH 或别名。"
+            )
+        runner = OffPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
+    else:
+        if OnPolicyRunner is None:
+            raise ImportError(
+                "当前环境找不到 OnPolicyRunner，请检查 PPO 的 rsl_rl 库是否正确加载。"
+            )
+        runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
     
-    if not args_cli.use_pid:
-        if not args_cli.checkpoint:
-            raise ValueError("Argument '--checkpoint' is required when NOT using PID controller.")
-            
-        checkpoint_path = retrieve_file_path(args_cli.checkpoint)
-        print(f"[INFO]: Loading model checkpoint from: {checkpoint_path}")
-        runner.load(checkpoint_path, load_optimizer=False)
+
+    if not args_cli.checkpoint:
+        raise ValueError("Argument '--checkpoint' is required when NOT using PID controller.")
         
-        runner.eval_mode()
+    checkpoint_path = retrieve_file_path(args_cli.checkpoint)
+    print(f"[INFO]: Loading model checkpoint from: {checkpoint_path}")
+    runner.load(checkpoint_path)
+    
+    runner.eval_mode()
+    
+    # 【核心适配】针对 SAC 与 PPO 获取推理策略的不同方式进行兼容
+    if args_cli.algorithm.lower() == "sac":
+        # SAC 的 OffPolicyRunner 通过 act 方法或者 actor 模型进行推理
+        policy = lambda obs: runner.alg.act(obs)
+        policy_model = runner.alg.actor
+    else:
+        # PPO 的 OnPolicyRunner 标准获取方式
         policy = runner.get_inference_policy(device=agent_cfg.device)
         policy_model = runner.alg.policy
-    else:
-        print(f"[INFO]: Using PID Controller. SKIPPING model loading.")
-        # 创建一个“哑巴”策略，输入 obs，输出全 0 动作
-        policy = lambda obs: torch.zeros(env.num_envs, 4, device=env.device)
-        policy_model = None
 
     dt = env.unwrapped.step_dt
-    obs, _ = env.get_observations()
+    obs = env.get_observations()
     
     # Data storage
     trajectory_data = {
@@ -179,7 +215,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     }
     
     print(f"\n{'=' * 80}")
-    print(f"Trajectory Tracking Evaluation (Teacher)")
+    print(f"Trajectory Tracking Evaluation (Teacher - {args_cli.algorithm.upper()})")
     print(f"Number of environments: {env.num_envs}")
     print(f"Maximum steps: {args_cli.max_steps}")
     print(f"Statistics start step: {STATS_START_STEP}")

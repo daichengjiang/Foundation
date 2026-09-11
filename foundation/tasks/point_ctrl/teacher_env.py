@@ -102,7 +102,7 @@ class QuadcopterSceneCfg(InteractiveSceneCfg):
 
 @configclass
 class QuadcopterEnvCfg(DirectRLEnvCfg):
-    teacher_observation_space = 58
+    teacher_observation_space = 29
     observation_space = teacher_observation_space
 
     history_len = 5
@@ -111,6 +111,7 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     enable_com_offset: bool = False     # 重心偏移开关
     print_com_offset: bool = False
     add_obs_noise: bool = False     # 训练时是否开启加噪
+    add_disturbance: bool = True
     noise_std_pos: float = 0.03    # 位置误差噪声 (m)
     noise_std_rot: float = 0.03    # 姿态矩阵噪声
     noise_std_vel: float = 0.04    # 速度误差噪声 (m/s)
@@ -138,7 +139,7 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     train_or_play: bool = True
     use_pid = False
     gamma = 0.99
-    episode_length_s = 96
+    episode_length_s = 5
     decimation = 1
     action_space = 4 
     state_space = 0
@@ -377,7 +378,7 @@ class QuadcopterEnv(DirectRLEnv):
         self.reward_report_path = os.environ.get("TEACHER_REWARD_PATH", None)
         # =================================================================
         # [新增] 用于统计平均奖励的变量
-        self.steps_per_iteration = 256
+        self.steps_per_iteration = 8
 
         self.set_debug_vis(self.cfg.debug_vis)
         self._traj_origin_adjusted = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
@@ -385,10 +386,39 @@ class QuadcopterEnv(DirectRLEnv):
         self._calc_env_origins()
         self.yaw_limit = math.pi / 2
 
-        self.delay_steps = 8  
+        self.delay_steps = 1  
         self._action_queue = torch.zeros(
             self.num_envs, self.delay_steps, self.cfg.action_space, device=self.device
         )
+
+        # =================  扰动力标准差 (Init 中一次性计算) =================
+        # 1. 剩余推力比例: r_t2w - 1
+        surplus_ratio = self.twr_tensor - 1.0
+        
+        # 2. 根据模式生成基础扰动系数 (0 到 1 之间)
+        if self.cfg.train_or_play:
+            # 训练模式：0~1 之间均匀随机采样
+            base_coeff = torch.rand(self.num_envs, device=self.device)
+        else:
+            # 评估 (Play) 模式：为每个教师的 N 个环境生成 [0.0, ..., 1.0] 的确定性均匀间隔
+            envs_per_group = self.num_envs if self.cfg.dynamics.multi_teacher_params is None else self.num_envs // len(self.cfg.dynamics.multi_teacher_params)
+            
+            # 生成 0 到 1 的均匀间隔。如果是 10 个环境，则为 [0.0, 0.111, 0.222... 1.0]
+            group_coeff = torch.linspace(0.0, 1.0, envs_per_group, device=self.device)
+            # 复制分发给所有教师
+            base_coeff = group_coeff.repeat(self.num_envs // envs_per_group)
+
+        # 3. 转化为实际力的标准差 (N): std = coefficient * (surplus_ratio * 0.1) * m * g
+        sigma_coeff = base_coeff * (surplus_ratio * 0.1)
+        mg = self.mass_tensor * 9.81
+        sigma_f_ext = sigma_coeff * mg
+        
+        # 4. 扩展为 (N, 3) 形状供每步使用，并保存
+        self.sigma_f_ext_b = sigma_f_ext.unsqueeze(1).expand(-1, 3).clone()
+        
+        # 初始化存储每步实时更新扰动力的张量
+        self.f_ext_b = torch.zeros(self.num_envs, 3, device=self.device)
+        # ==============================================================================
 
     def CHECK_NAN(self, tensor, name):
         if torch.isnan(tensor).any().item():
@@ -540,7 +570,7 @@ class QuadcopterEnv(DirectRLEnv):
         self.vel_des[env_ids] = vel_next
         self.pos_des[env_ids] = pos_next
 
-        self._update_yaw_langevin(env_ids, dt)
+        # self._update_yaw_langevin(env_ids, dt)
 
     def _generate_desired_trajectory_figure8(self, env_ids: torch.Tensor = None):
         if env_ids is None: env_ids = torch.arange(self.num_envs, device=self.device)
@@ -592,13 +622,17 @@ class QuadcopterEnv(DirectRLEnv):
             # 设定 Yaw 的摆动幅度，例如 90 度 (PI/2)
             yaw_amplitude = math.pi / 4   
             
-            # 计算 Yaw (跟随主频率 omega 变化)
-            # yaw = A * sin(omega * t)
-            yaw_new = yaw_amplitude * torch.sin(omega * t_adj)
+            # # 计算 Yaw (跟随主频率 omega 变化)
+            # # yaw = A * sin(omega * t)
+            # yaw_new = yaw_amplitude * torch.sin(omega * t_adj)
             
-            # 计算 Yaw Rate (对时间求导)
-            # d(yaw)/dt = A * omega * cos(omega * t)
-            yaw_rate_new = yaw_amplitude * omega * torch.cos(omega * t_adj)
+            # # 计算 Yaw Rate (对时间求导)
+            # # d(yaw)/dt = A * omega * cos(omega * t)
+            # yaw_rate_new = yaw_amplitude * omega * torch.cos(omega * t_adj)
+
+            # 锁定 Yaw 为 0
+            yaw_new = torch.zeros_like(active_env_ids, dtype=torch.float, device=self.device)
+            yaw_rate_new = torch.zeros_like(active_env_ids, dtype=torch.float, device=self.device)
 
             # --- 赋值 ---
             self.pos_des[active_env_ids] = pos_des_new
@@ -741,6 +775,13 @@ class QuadcopterEnv(DirectRLEnv):
         
         force_b = force_b_motors.clone()
         torque_b = torque_b_motors.clone()
+
+        # --- 扰动力 ---
+        if self.cfg.add_disturbance:
+            # 每步从零均值正态分布采样实时风力
+            self.f_ext_b = torch.randn(self.num_envs, 3, device=self.device) * self.sigma_f_ext_b
+            # 将扰动力叠加到机体合力上
+            force_b = force_b + self.f_ext_b
 
         # ================= 2. 混合风阻计算 =================
         force_drag_b = torch.zeros_like(force_b)
@@ -906,17 +947,28 @@ class QuadcopterEnv(DirectRLEnv):
         vel_des_b = torch.bmm(rot_matrix_w2b, self.vel_des.unsqueeze(-1)).squeeze(-1)
 
         # 教师 58
+        # obs_teacher = torch.cat([
+        #     pos_error_flat,             # 15
+        #     rot_flat,                   # 9
+        #     vel_error_flat,             # 15
+        #     ang_vel_b,                  # 3
+        #     self._last_actions,         # 4
+        #     acc_des_b,                  # 3 
+        #     vel_des_b,                  # 3 
+        #     yaw_error_sin,              # 1
+        #     yaw_error_cos,              # 1 
+        #     self._current_motor_speeds, # 4
+        #     # self.f_ext_b,               # 3
+        # ], dim=-1)
+        # 教师 29
         obs_teacher = torch.cat([
-            pos_error_flat,             # 15
+            curr_pos_error_b,             # 3
             rot_flat,                   # 9
-            vel_error_flat,             # 15
+            curr_vel_error_b,             # 3
             ang_vel_b,                  # 3
             self._last_actions,         # 4
-            acc_des_b,                  # 3 
-            vel_des_b,                  # 3 
-            yaw_error_sin,              # 1
-            yaw_error_cos,              # 1 
             self._current_motor_speeds, # 4
+            self.f_ext_b,               # 3
         ], dim=-1)
 
         obs_teacher = self.CHECK_NAN(obs_teacher, "Teacher Observation")
@@ -1139,6 +1191,9 @@ class QuadcopterEnv(DirectRLEnv):
             r = (torch.rand(num_resets, device=self.device)*2-1) * (math.pi / 3)
             p = (torch.rand(num_resets, device=self.device)*2-1) * (math.pi / 3)
             y = (torch.rand(num_resets, device=self.device)*2-1) * (math.pi / 6)
+            # r = (torch.rand(num_resets, device=self.device)*2-1) * (math.pi / 2)
+            # p = (torch.rand(num_resets, device=self.device)*2-1) * (math.pi / 2)
+            # y = torch.zeros(num_resets, device=self.device) # 训练时不随机偏航，避免过度扰动
             quat = quat_from_euler_xyz(r, p, y)
             
             # 10% 几率完美开局，加速初期收敛
@@ -1147,7 +1202,8 @@ class QuadcopterEnv(DirectRLEnv):
             lin_vel[perfect_mask] = 0.0
             ang_vel[perfect_mask] = 0.0
             quat[perfect_mask] = torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device)
-            self.yaw_des[env_ids] = (torch.rand(len(env_ids), device=self.device) * 2 - 1) * self.yaw_limit / 2.0
+            # self.yaw_des[env_ids] = (torch.rand(len(env_ids), device=self.device) * 2 - 1) * self.yaw_limit / 2.0
+            self.yaw_des[env_ids] = 0.0
             self.yaw_rate_des[env_ids] = 0.0
         else:
             pos_offset = torch.zeros(num_resets, 3, device=self.device)
@@ -1219,13 +1275,34 @@ class QuadcopterEnv(DirectRLEnv):
             timeout_count_current = len(env_ids[timed_out_mask])
             self._termination_reason_history.extend([{}] * timeout_count_current)
             
-            # Track average velocity
+            # # Track average velocity
+            # if len(completed_env_ids) > 0:
+            #     vel_abs = torch.linalg.norm(
+            #         self._robot.data.root_lin_vel_w[completed_env_ids], 
+            #         dim=1
+            #     ).cpu().tolist()
+            #     self._vel_abs.extend(vel_abs)
+
+            # Track average velocity (分开统计悬停与轨迹跟踪)
             if len(completed_env_ids) > 0:
-                vel_abs = torch.linalg.norm(
+                completed_vels = torch.linalg.norm(
                     self._robot.data.root_lin_vel_w[completed_env_ids], 
                     dim=1
-                ).cpu().tolist()
-                self._vel_abs.extend(vel_abs)
+                )
+                completed_is_langevin = self._is_langevin_task[completed_env_ids]
+                
+                # 区分悬停任务和轨迹任务
+                hover_vels = completed_vels[~completed_is_langevin].cpu().tolist()
+                traj_vels = completed_vels[completed_is_langevin].cpu().tolist()
+                
+                if hover_vels:
+                    if not hasattr(self, "_hover_vel_abs"):
+                        self._hover_vel_abs = collections.deque(maxlen=self._history_window)
+                    self._hover_vel_abs.extend(hover_vels)
+                if traj_vels:
+                    if not hasattr(self, "_traj_vel_abs"):
+                        self._traj_vel_abs = collections.deque(maxlen=self._history_window)
+                    self._traj_vel_abs.extend(traj_vels)
 
             # Calculate statistics
             num_termination_records = len(self._termination_reason_history)
@@ -1250,7 +1327,9 @@ class QuadcopterEnv(DirectRLEnv):
                 timeout_count = num_termination_records - died_count
                 
                 self._episodes_completed += len(completed_env_ids)
-                avg_velocity = np.mean(list(self._vel_abs)) if self._vel_abs else 0.0
+                # avg_velocity = np.mean(list(self._vel_abs)) if self._vel_abs else 0.0
+                avg_hover_velocity = np.mean(list(self._hover_vel_abs)) if hasattr(self, "_hover_vel_abs") and self._hover_vel_abs else 0.0
+                avg_traj_velocity = np.mean(list(self._traj_vel_abs)) if hasattr(self, "_traj_vel_abs") and self._traj_vel_abs else 0.0
 
                 if "log" not in self.extras:
                     self.extras["log"] = {}
@@ -1258,7 +1337,9 @@ class QuadcopterEnv(DirectRLEnv):
                 self.extras["log"].update({
                     "Episode_Termination/died": died_count / num_termination_records * 100.0,
                     "Episode_Termination/time_out": timeout_count / num_termination_records * 100.0,
-                    "Metrics/average_velocity": avg_velocity,
+                    # "Metrics/average_velocity": avg_velocity,
+                    "Metrics/average_velocity_hover": avg_hover_velocity,
+                    "Metrics/average_velocity_trajectory": avg_traj_velocity,
                     "Metrics/episodes_completed": self._episodes_completed,
                 })
 

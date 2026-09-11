@@ -9,7 +9,7 @@
 
 import argparse
 import sys
-
+import os
 from isaaclab.app import AppLauncher
 
 # local imports
@@ -18,6 +18,9 @@ import cli_args  # isort: skip
 
 # add argparse arguments
 parser = argparse.ArgumentParser(description="Train an RL agent with RSL-RL.")
+# 通过命令行选择算法类型，默认为 ppo
+parser.add_argument("--algorithm", type=str, default="sac", choices=["ppo", "sac"], help="Choose RL algorithm: ppo or sac.")
+
 parser.add_argument("--video", action="store_true", default=False, help="Record videos during training.")
 parser.add_argument("--video_length", type=int, default=200, help="Length of the recorded video (in steps).")
 parser.add_argument("--video_interval", type=int, default=2000, help="Interval between video recordings (in steps).")
@@ -47,6 +50,14 @@ cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
 
+# 【核心新增】根据命令行选择自动配置环境变量
+if args_cli.algorithm.lower() == "sac":
+    os.environ["RSL_RL_SAC"] = "1"
+    print("[INFO] Selected Algorithm: SAC (OffPolicyRunner & TensorDict enabled)")
+else:
+    os.environ["RSL_RL_SAC"] = "0"
+    print("[INFO] Selected Algorithm: PPO (OnPolicyRunner & standard tuple enabled)")
+
 # always enable cameras to record video
 if args_cli.video:
     args_cli.enable_cameras = True
@@ -61,13 +72,20 @@ simulation_app = app_launcher.app
 """Rest everything follows."""
 
 import gymnasium as gym
-import os
 import torch
 from datetime import datetime
 
 from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper
-from rsl_rl.runners import OnPolicyRunner
-# from on_policy_runner import OnPolicyRunner
+
+try:
+    from rsl_rl.runners import OffPolicyRunner
+except ImportError:
+    OffPolicyRunner = None
+
+try:
+    from rsl_rl.runners import OnPolicyRunner
+except ImportError:
+    OnPolicyRunner = None
 
 from isaaclab.envs import (
     DirectMARLEnv,
@@ -108,31 +126,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         agent_cfg.policy.actor_hidden_dims = args_cli.override_hidden_dims
         agent_cfg.policy.critic_hidden_dims = args_cli.override_hidden_dims
         
-    if args_cli.override_entropy is not None:
-        print(f"[INFO] Overriding Entropy Coef to: {args_cli.override_entropy}")
-        agent_cfg.algorithm.entropy_coef = args_cli.override_entropy
-        
-    if args_cli.override_schedule:
-        print(f"[INFO] Overriding Schedule to: {args_cli.override_schedule}")
-        agent_cfg.algorithm.schedule = args_cli.override_schedule
-
-    if args_cli.override_num_learning_epochs is not None:
-        print(f"[INFO] Overriding Num Learning Epochs to: {args_cli.override_num_learning_epochs}")
-        agent_cfg.algorithm.num_learning_epochs = args_cli.override_num_learning_epochs
 
     # [NEW] 修改 WandB 的 Run Name 和 Experiment Name
     if args_cli.run_name_suffix:
-        # 修改 experiment_name，防止污染正常的 single_teacher 文件夹
         agent_cfg.experiment_name = "param_search"
-        # 修改 run_name，这样 WandB 上能直接看出参数组合
         agent_cfg.run_name = f"Search_{args_cli.run_name_suffix}"
         
-
-    # [NEW] 覆盖奖励系数
-    # 请根据你 teacher_env.py 中 QuadcopterEnvCfg 的实际结构调整以下属性名
     if args_cli.reward_coef_position_cost is not None:
         print(f"[INFO] Overriding Position Cost to: {args_cli.reward_coef_position_cost}")
-        # 如果你的参数在 env_cfg.rewards 下，请改为 env_cfg.rewards.xxx.weight
         env_cfg.reward_coef_position_cost = args_cli.reward_coef_position_cost
         
     if args_cli.reward_coef_orientation_cost is not None:
@@ -151,19 +152,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         print(f"[INFO] Overriding Reward Constant to: {args_cli.reward_constant}")
         env_cfg.reward_constant = args_cli.reward_constant
 
-    # set the environment seed
-    # note: certain randomizations occur in the environment initialization so we set the seed here
     env_cfg.seed = agent_cfg.seed
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
 
-    # specify directory for logging experiments
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
     log_root_path = os.path.abspath(log_root_path)
     print(f"[INFO] Logging experiment in directory: {log_root_path}")
 
     agent_cfg_dict = agent_cfg.to_dict()
 
-    # [修改] WandB 命名逻辑
     if args_cli.log_timestamp:
         # 0. 记录去掉时间戳之前的原始 run_name
         original_run_name = agent_cfg.run_name 
@@ -225,9 +222,20 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # wrap around environment for rsl-rl
     env = RslRlVecEnvWrapper(env)
 
-    # create runner from rsl-rl
-    runner = OnPolicyRunner(env, agent_cfg_dict, log_dir=log_dir, device=agent_cfg.device)
-    
+    # 动态选择实例化 OnPolicyRunner (PPO) 还是 OffPolicyRunner (SAC)
+    if args_cli.algorithm.lower() == "sac":
+        if OffPolicyRunner is None:
+            raise ImportError(
+                "当前环境未安装或未正确加载支持 SAC 的 rsl_rl_sac 库！"
+                "请检查你启动终端时是否使用了正确的 PYTHONPATH 或别名。"
+            )
+        runner = OffPolicyRunner(env, agent_cfg_dict, log_dir=log_dir, device=agent_cfg.device)
+    else:
+        if OnPolicyRunner is None:
+            raise ImportError(
+                "当前环境找不到 OnPolicyRunner，请检查 PPO 的 rsl_rl 2.3.3 库是否正确加载。"
+            )
+        runner = OnPolicyRunner(env, agent_cfg_dict, log_dir=log_dir, device=agent_cfg.device)
     # [NEW] 强制覆盖 Runner 内部的 run_name，确保 WandB 记录正确
     if args_cli.log_timestamp:
         runner.run_name = agent_cfg.run_name
