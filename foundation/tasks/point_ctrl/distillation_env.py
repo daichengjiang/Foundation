@@ -20,13 +20,12 @@ from isaaclab.sim import SimulationCfg, SimulationContext, RenderCfg
 from isaaclab.terrains import TerrainImporterCfg, TerrainGeneratorCfg
 from isaaclab.terrains.height_field.hf_terrains_cfg import HfDiscreteObstaclesTerrainCfg
 from isaaclab.utils import configclass
-from isaaclab.utils.math import euler_xyz_from_quat, matrix_from_quat
+from isaaclab.utils.math import euler_xyz_from_quat, matrix_from_quat, quat_from_euler_xyz, quat_mul, quat_inv
 from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 import isaaclab.sim as sim_utils
 from isaaclab_assets import CRAZYFLIE_CFG
 from isaaclab.assets import ArticulationCfg
 import isaacsim.core.utils.prims as prims_utils
-from isaaclab.utils.math import quat_from_euler_xyz
 from isaaclab.utils.noise import NoiseModelCfg, GaussianNoiseCfg, NoiseModel
 from collections import deque
 import numpy as np
@@ -102,8 +101,8 @@ class QuadcopterSceneCfg(InteractiveSceneCfg):
 
 @configclass
 class QuadcopterEnvCfg(DirectRLEnvCfg):
-    teacher_observation_space = 58
-    student_observation_space = 24
+    teacher_observation_space = 29
+    student_observation_space = 22
     observation_space = student_observation_space 
 
     history_len = 5
@@ -112,6 +111,7 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     enable_com_offset: bool = False     # 重心偏移开关
     print_com_offset: bool = False
     add_obs_noise: bool = False     # 训练时是否开启加噪
+    add_disturbance: bool = True
     noise_std_pos: float = 0.03    # 位置误差噪声 (m)
     noise_std_rot: float = 0.03    # 姿态矩阵噪声
     noise_std_vel: float = 0.04    # 速度误差噪声 (m/s)
@@ -139,7 +139,7 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     train_or_play: bool = True
     use_pid = False
     gamma = 0.99
-    episode_length_s = 96
+    episode_length_s = 5
     decimation = 1
     action_space = 4 
     state_space = 0
@@ -367,16 +367,48 @@ class QuadcopterEnv(DirectRLEnv):
         self._termination_reason_history = collections.deque(maxlen=self._history_window)
         self._vel_abs = collections.deque(maxlen=self._history_window)
 
+
         self.set_debug_vis(self.cfg.debug_vis)
         self._traj_origin_adjusted = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
 
         self._calc_env_origins()
         self.yaw_limit = math.pi / 2
 
-        self.delay_steps = 8  
+        self.delay_steps = 1  
         self._action_queue = torch.zeros(
             self.num_envs, self.delay_steps, self.cfg.action_space, device=self.device
         )
+
+        # =================  扰动力标准差 (Init 中一次性计算) =================
+        # 1. 剩余推力比例: r_t2w - 1
+        surplus_ratio = self.twr_tensor - 1.0
+        
+        # 2. 根据模式生成基础扰动系数 (0 到 1 之间)
+        if self.cfg.train_or_play:
+            # 训练模式：0~1 之间均匀随机采样
+            base_coeff = torch.rand(self.num_envs, device=self.device)
+        else:
+            # 评估 (Play) 模式：为每个教师的 N 个环境生成 [0.0, ..., 1.0] 的确定性均匀间隔
+            envs_per_group = self.num_envs if self.cfg.dynamics.multi_teacher_params is None else self.num_envs // len(self.cfg.dynamics.multi_teacher_params)
+            
+            # 生成 0 到 1 的均匀间隔。如果是 10 个环境，则为 [0.0, 0.111, 0.222... 1.0]
+            group_coeff = torch.linspace(0.0, 1.0, envs_per_group, device=self.device)
+            # 复制分发给所有教师
+            base_coeff = group_coeff.repeat(self.num_envs // envs_per_group)
+
+        # 3. 转化为实际力的标准差 (N): std = coefficient * (surplus_ratio * 0.1) * m * g
+        sigma_coeff = base_coeff * (surplus_ratio * 0.1)
+        mg = self.mass_tensor * 9.81
+        sigma_f_ext = sigma_coeff * mg
+        
+        # 4. 扩展为 (N, 3) 形状供每步使用，并保存
+        self.sigma_f_ext_b = sigma_f_ext.unsqueeze(1).expand(-1, 3).clone()
+        
+        # 初始化存储每步实时更新扰动力的张量
+        self.f_ext_b = torch.zeros(self.num_envs, 3, device=self.device)
+        # ==============================================================================
+
+        self.position_threshold = 20.0 * self.arm_l_tensor
 
     def CHECK_NAN(self, tensor, name):
         if torch.isnan(tensor).any().item():
@@ -528,7 +560,7 @@ class QuadcopterEnv(DirectRLEnv):
         self.vel_des[env_ids] = vel_next
         self.pos_des[env_ids] = pos_next
 
-        self._update_yaw_langevin(env_ids, dt)
+        # self._update_yaw_langevin(env_ids, dt)
 
     def _generate_desired_trajectory_figure8(self, env_ids: torch.Tensor = None):
         if env_ids is None: env_ids = torch.arange(self.num_envs, device=self.device)
@@ -580,13 +612,17 @@ class QuadcopterEnv(DirectRLEnv):
             # 设定 Yaw 的摆动幅度，例如 90 度 (PI/2)
             yaw_amplitude = math.pi / 4   
             
-            # 计算 Yaw (跟随主频率 omega 变化)
-            # yaw = A * sin(omega * t)
-            yaw_new = yaw_amplitude * torch.sin(omega * t_adj)
+            # # 计算 Yaw (跟随主频率 omega 变化)
+            # # yaw = A * sin(omega * t)
+            # yaw_new = yaw_amplitude * torch.sin(omega * t_adj)
             
-            # 计算 Yaw Rate (对时间求导)
-            # d(yaw)/dt = A * omega * cos(omega * t)
-            yaw_rate_new = yaw_amplitude * omega * torch.cos(omega * t_adj)
+            # # 计算 Yaw Rate (对时间求导)
+            # # d(yaw)/dt = A * omega * cos(omega * t)
+            # yaw_rate_new = yaw_amplitude * omega * torch.cos(omega * t_adj)
+
+            # 锁定 Yaw 为 0
+            yaw_new = torch.zeros_like(active_env_ids, dtype=torch.float, device=self.device)
+            yaw_rate_new = torch.zeros_like(active_env_ids, dtype=torch.float, device=self.device)
 
             # --- 赋值 ---
             self.pos_des[active_env_ids] = pos_des_new
@@ -645,7 +681,7 @@ class QuadcopterEnv(DirectRLEnv):
 
         # [新增] 在 _setup_scene 中初始化 com_tensor，保障生命周期安全
         self.com_tensor = torch.zeros(self.num_envs, 3, device=self.device)
-        com_ratios = torch.tensor([0.1, 0.05, 0.05], device=self.device)
+        com_ratios = torch.tensor([0, 0, 0], device=self.device)
 
         # 遍历所有环境，修改底层 USD/PhysX 属性
         for i, prim_path in enumerate(robot_prims):
@@ -730,10 +766,17 @@ class QuadcopterEnv(DirectRLEnv):
         force_b = force_b_motors.clone()
         torque_b = torque_b_motors.clone()
 
+        # --- 扰动力 ---
+        if self.cfg.add_disturbance:
+            # 每步从零均值正态分布采样实时风力
+            self.f_ext_b = torch.randn(self.num_envs, 3, device=self.device) * self.sigma_f_ext_b
+            # 将扰动力叠加到机体合力上
+            force_b = force_b + self.f_ext_b
+
         # ================= 2. 混合风阻计算 =================
         force_drag_b = torch.zeros_like(force_b)
         torque_drag_b = torch.zeros_like(torque_b)
-        
+
         if self.cfg.enable_aerodynamics:
             # 1. 相对空速转机体系
             lin_vel_w = self._robot.data.root_lin_vel_w
@@ -893,49 +936,53 @@ class QuadcopterEnv(DirectRLEnv):
         acc_des_b = torch.bmm(rot_matrix_w2b, self.acc_des.unsqueeze(-1)).squeeze(-1)
         vel_des_b = torch.bmm(rot_matrix_w2b, self.vel_des.unsqueeze(-1)).squeeze(-1)
 
-        # 学生 24
+        # # 学生 24
+        # obs_student = torch.cat([
+        #     curr_pos_error_b,             # 3
+        #     rot_flat,                   # 9
+        #     curr_vel_error_b,             # 3
+        #     ang_vel_b,                  # 3
+        #     self._last_actions,         # 4
+        #     yaw_error_sin,              # 1
+        #     yaw_error_cos,              # 1 
+        # ], dim=-1)
+        # 学生 22
         obs_student = torch.cat([
             curr_pos_error_b,             # 3
             rot_flat,                   # 9
             curr_vel_error_b,             # 3
             ang_vel_b,                  # 3
             self._last_actions,         # 4
-            yaw_error_sin,              # 1
-            yaw_error_cos,              # 1 
         ], dim=-1)
-
-        # 教师 58
+        # 教师 29
         obs_teacher = torch.cat([
-            pos_error_flat,             # 15
+            curr_pos_error_b,             # 3
             rot_flat,                   # 9
-            vel_error_flat,             # 15
+            curr_vel_error_b,             # 3
             ang_vel_b,                  # 3
             self._last_actions,         # 4
-            acc_des_b,                  # 3 
-            vel_des_b,                  # 3 
-            yaw_error_sin,              # 1
-            yaw_error_cos,              # 1 
             self._current_motor_speeds, # 4
+            self.f_ext_b,               # 3
         ], dim=-1)
 
-        if self.cfg.add_obs_noise:
-            # 直接在张量的特定切片上加上高斯噪声
-            obs_student[:, 0:3] += torch.randn_like(obs_student[:, 0:3]) * self.cfg.noise_std_pos
-            obs_student[:, 12:15] += torch.randn_like(obs_student[:, 12:15]) * self.cfg.noise_std_vel
-            obs_student[:, 15:18] += torch.randn_like(obs_student[:, 15:18]) * self.cfg.noise_std_ang_vel
+        # if self.cfg.add_obs_noise:
+        #     # 直接在张量的特定切片上加上高斯噪声
+        #     obs_student[:, 0:3] += torch.randn_like(obs_student[:, 0:3]) * self.cfg.noise_std_pos
+        #     obs_student[:, 12:15] += torch.randn_like(obs_student[:, 12:15]) * self.cfg.noise_std_vel
+        #     obs_student[:, 15:18] += torch.randn_like(obs_student[:, 15:18]) * self.cfg.noise_std_ang_vel
             
-            roll_noisy = r + torch.randn_like(r) * self.cfg.noise_std_rot
-            pitch_noisy = p + torch.randn_like(p) * self.cfg.noise_std_rot
-            yaw_noisy = y + torch.randn_like(y) * self.cfg.noise_std_rot
-            noisy_quat = quat_from_euler_xyz(roll_noisy, pitch_noisy, yaw_noisy)
-            rot_matrix_noisy = matrix_from_quat(noisy_quat)
-            rot_flat_noisy = rot_matrix_noisy.reshape(self.num_envs, 9)
-            obs_student[:, 3:12] = rot_flat_noisy
+        #     roll_noisy = r + torch.randn_like(r) * self.cfg.noise_std_rot
+        #     pitch_noisy = p + torch.randn_like(p) * self.cfg.noise_std_rot
+        #     yaw_noisy = y + torch.randn_like(y) * self.cfg.noise_std_rot
+        #     noisy_quat = quat_from_euler_xyz(roll_noisy, pitch_noisy, yaw_noisy)
+        #     rot_matrix_noisy = matrix_from_quat(noisy_quat)
+        #     rot_flat_noisy = rot_matrix_noisy.reshape(self.num_envs, 9)
+        #     obs_student[:, 3:12] = rot_flat_noisy
 
-            noisy_yaw_error = self.yaw_des - yaw_noisy
-            noisy_yaw_error = torch.remainder(noisy_yaw_error + math.pi, 2 * math.pi) - math.pi
-            obs_student[:, 22] = torch.sin(noisy_yaw_error)
-            obs_student[:, 23] = torch.cos(noisy_yaw_error)
+        #     noisy_yaw_error = self.yaw_des - yaw_noisy
+        #     noisy_yaw_error = torch.remainder(noisy_yaw_error + math.pi, 2 * math.pi) - math.pi
+        #     obs_student[:, 22] = torch.sin(noisy_yaw_error)
+        #     obs_student[:, 23] = torch.cos(noisy_yaw_error)
 
         obs_teacher = self.CHECK_NAN(obs_teacher, "Teacher Observation")
         obs_student = self.CHECK_NAN(obs_student, "Student Observation")
@@ -944,30 +991,56 @@ class QuadcopterEnv(DirectRLEnv):
         # 1. 位置误差 (保持不变)
         pos_error_norm = torch.norm(self._robot.data.root_pos_w - self.pos_des, dim=1)
         
-        # 2. Orientation Cost (仅跟踪 Yaw)
+        # # 2. Orientation Cost (仅跟踪 Yaw)
+        # # 获取当前四元数
+        # quat_w = self._robot.data.root_quat_w
+        
+        # # 将四元数转换为欧拉角 (Roll, Pitch, Yaw)
+        # # 注意：euler_xyz_from_quat 返回的是 (roll, pitch, yaw) 元组
+        # _, _, yaw_curr = euler_xyz_from_quat(quat_w)
+        
+        # # 计算误差：目标 Yaw - 当前 Yaw
+        # yaw_error = self.yaw_des - yaw_curr
+        
+        # # --- 关键步骤：角度归一化 (Wrap to -pi ~ pi) ---
+        # # 这一步是为了解决“350度”和“10度”相差只有20度，而不是340度的问题
+        # # 使用 torch.remainder 确保结果在 [0, 2pi] 之间，然后减去 pi 移到 [-pi, pi]
+        # yaw_error = torch.remainder(yaw_error + torch.pi, 2 * torch.pi) - torch.pi
+        # # B. 【关键修改】将角度误差映射回“四元数 Z 分量”空间
+        # # 原版惩罚的是 q_z，物理上 q_z = sin(yaw/2)。
+        # # 为了复刻原版手感，我们计算“误差角的 sin(x/2)”
+        # yaw_error_mapped = torch.sin(yaw_error / 2.0)
+
+        # # C. 套用原版非线性公式
+        # # 公式：arccos( clamp( 1.0 - abs(x) ) )
+        # # 这一步保留了“接近目标时梯度无穷大”的特性，会促使 Agent 极其精确地对齐
+        # orientation_cost = torch.arccos(torch.clamp(1.0 - torch.abs(yaw_error_mapped), -1.0, 1.0))
+
+        # 2. Orientation Cost 
         # 获取当前四元数
         quat_w = self._robot.data.root_quat_w
         
         # 将四元数转换为欧拉角 (Roll, Pitch, Yaw)
-        # 注意：euler_xyz_from_quat 返回的是 (roll, pitch, yaw) 元组
-        _, _, yaw_curr = euler_xyz_from_quat(quat_w)
+        r, p, yaw_curr = euler_xyz_from_quat(quat_w)
         
         # 计算误差：目标 Yaw - 当前 Yaw
         yaw_error = self.yaw_des - yaw_curr
-        
-        # --- 关键步骤：角度归一化 (Wrap to -pi ~ pi) ---
-        # 这一步是为了解决“350度”和“10度”相差只有20度，而不是340度的问题
-        # 使用 torch.remainder 确保结果在 [0, 2pi] 之间，然后减去 pi 移到 [-pi, pi]
         yaw_error = torch.remainder(yaw_error + torch.pi, 2 * torch.pi) - torch.pi
-        # B. 【关键修改】将角度误差映射回“四元数 Z 分量”空间
-        # 原版惩罚的是 q_z，物理上 q_z = sin(yaw/2)。
-        # 为了复刻原版手感，我们计算“误差角的 sin(x/2)”
-        yaw_error_mapped = torch.sin(yaw_error / 2.0)
         
-        # C. 套用原版非线性公式
-        # 公式：arccos( clamp( 1.0 - abs(x) ) )
-        # 这一步保留了“接近目标时梯度无穷大”的特性，会促使 Agent 极其精确地对齐
-        orientation_cost = torch.arccos(torch.clamp(1.0 - torch.abs(yaw_error_mapped), -1.0, 1.0))
+        # B. 【关键修改】严格按照三轴姿态完整公式提取伪 q_z 分量
+        # 采用公式: q_z = cos(phi/2)cos(theta/2)sin(psi/2) - sin(phi/2)sin(theta/2)cos(psi/2)
+        # 这里 phi = r (滚转), theta = p (俯仰), psi = yaw_error (偏航误差)
+        half_r = r / 2.0
+        half_p = p / 2.0
+        half_y = yaw_error / 2.0
+        
+        q_z_mapped = (
+            torch.cos(half_r) * torch.cos(half_p) * torch.sin(half_y) - 
+            torch.sin(half_r) * torch.sin(half_p) * torch.cos(half_y)
+        )
+        
+        # C. 套用原版非线性公式 (限制在 -1.0 到 1.0 之间以防 arccos 出现 NaN)
+        orientation_cost = torch.arccos(torch.clamp(1.0 - torch.abs(q_z_mapped), -1.0, 1.0))
         # 3. 动作平滑 Cost (保持不变)
         d_action_cost = torch.norm(self._actions - self._last_actions, dim=1)
         
@@ -1117,7 +1190,8 @@ class QuadcopterEnv(DirectRLEnv):
             lin_vel[perfect_mask] = 0.0
             ang_vel[perfect_mask] = 0.0
             quat[perfect_mask] = torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device)
-            self.yaw_des[env_ids] = (torch.rand(len(env_ids), device=self.device) * 2 - 1) * self.yaw_limit / 2.0
+            # self.yaw_des[env_ids] = (torch.rand(len(env_ids), device=self.device) * 2 - 1) * self.yaw_limit / 2.0
+            self.yaw_des[env_ids] = 0.0
             self.yaw_rate_des[env_ids] = 0.0
         else:
             pos_offset = torch.zeros(num_resets, 3, device=self.device)
@@ -1189,13 +1263,34 @@ class QuadcopterEnv(DirectRLEnv):
             timeout_count_current = len(env_ids[timed_out_mask])
             self._termination_reason_history.extend([{}] * timeout_count_current)
             
-            # Track average velocity
+            # # Track average velocity
+            # if len(completed_env_ids) > 0:
+            #     vel_abs = torch.linalg.norm(
+            #         self._robot.data.root_lin_vel_w[completed_env_ids], 
+            #         dim=1
+            #     ).cpu().tolist()
+            #     self._vel_abs.extend(vel_abs)
+
+            # Track average velocity (分开统计悬停与轨迹跟踪)
             if len(completed_env_ids) > 0:
-                vel_abs = torch.linalg.norm(
+                completed_vels = torch.linalg.norm(
                     self._robot.data.root_lin_vel_w[completed_env_ids], 
                     dim=1
-                ).cpu().tolist()
-                self._vel_abs.extend(vel_abs)
+                )
+                completed_is_langevin = self._is_langevin_task[completed_env_ids]
+                
+                # 区分悬停任务和轨迹任务
+                hover_vels = completed_vels[~completed_is_langevin].cpu().tolist()
+                traj_vels = completed_vels[completed_is_langevin].cpu().tolist()
+                
+                if hover_vels:
+                    if not hasattr(self, "_hover_vel_abs"):
+                        self._hover_vel_abs = collections.deque(maxlen=self._history_window)
+                    self._hover_vel_abs.extend(hover_vels)
+                if traj_vels:
+                    if not hasattr(self, "_traj_vel_abs"):
+                        self._traj_vel_abs = collections.deque(maxlen=self._history_window)
+                    self._traj_vel_abs.extend(traj_vels)
 
             # Calculate statistics
             num_termination_records = len(self._termination_reason_history)
@@ -1220,7 +1315,9 @@ class QuadcopterEnv(DirectRLEnv):
                 timeout_count = num_termination_records - died_count
                 
                 self._episodes_completed += len(completed_env_ids)
-                avg_velocity = np.mean(list(self._vel_abs)) if self._vel_abs else 0.0
+                # avg_velocity = np.mean(list(self._vel_abs)) if self._vel_abs else 0.0
+                avg_hover_velocity = np.mean(list(self._hover_vel_abs)) if hasattr(self, "_hover_vel_abs") and self._hover_vel_abs else 0.0
+                avg_traj_velocity = np.mean(list(self._traj_vel_abs)) if hasattr(self, "_traj_vel_abs") and self._traj_vel_abs else 0.0
 
                 if "log" not in self.extras:
                     self.extras["log"] = {}
@@ -1228,7 +1325,9 @@ class QuadcopterEnv(DirectRLEnv):
                 self.extras["log"].update({
                     "Episode_Termination/died": died_count / num_termination_records * 100.0,
                     "Episode_Termination/time_out": timeout_count / num_termination_records * 100.0,
-                    "Metrics/average_velocity": avg_velocity,
+                    # "Metrics/average_velocity": avg_velocity,
+                    "Metrics/average_velocity_hover": avg_hover_velocity,
+                    "Metrics/average_velocity_trajectory": avg_traj_velocity,
                     "Metrics/episodes_completed": self._episodes_completed,
                 })
 

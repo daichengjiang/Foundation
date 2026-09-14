@@ -237,6 +237,9 @@ class StudentTeacherRecurrentCustom(StudentTeacher):
 
         # 获取 Teacher 的原始输出 (Logits)
         raw_actions = super().evaluate(teacher_observations)
+        # [新增] 如果是 SAC，动作已经截断，直接返回；如果是 PPO，手动加 Tanh
+        if getattr(self, "teacher_type", "ppo") == "sac":
+            return raw_actions
         # 加上 Tanh 激活，使其范围限制在 (-1, 1)，与 PPO 训练时保持一致
         return torch.tanh(raw_actions)
     

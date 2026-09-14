@@ -15,6 +15,9 @@ from .rnd import RandomNetworkDistillation
 from .student_teacher import StudentTeacher
 from .student_teacher_recurrent import StudentTeacherRecurrent
 from .student_teacher_recurrent_custom import StudentTeacherRecurrentCustom
+from .mlp import MLP
+from .mlp_model import MLPModel
+from .sac_mlp_model import SACActorModel, SACCriticModel
 
 __all__ = [
     "ActorCritic",
@@ -27,5 +30,9 @@ __all__ = [
     "StudentTeacher",
     "StudentTeacherRecurrent",
     "StudentTeacherRecurrentCustom",
+    "MLP",
+    "MLPModel",
+    "SACActorModel",
+    "SACCriticModel",
 ]
 

@@ -6,6 +6,7 @@
 """Helper functions."""
 
 from .utils import (
+    get_param,
     resolve_nn_activation,
     split_and_pad_trajectories,
     store_code_state,

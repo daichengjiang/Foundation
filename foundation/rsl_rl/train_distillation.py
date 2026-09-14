@@ -32,6 +32,7 @@ parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy 
 parser.add_argument("--teacher_dir", type=str, default=None, required=True, help="Path to the teacher experiment directory.")
 parser.add_argument("--teacher_ids", type=str, default="0", help="Comma-separated list of teacher IDs.")
 parser.add_argument("--exclude_teacher_ids", type=str, default="", help="Comma-separated list of teacher IDs to exclude (e.g., '141,14,78').")
+parser.add_argument("--teacher_type", type=str, default="sac", choices=["ppo", "sac"], help="Teacher model type (ppo or sac).")
 
 # 注册 RSL-RL 与 AppLauncher 专属参数
 cli_args.add_rsl_rl_args(parser)
@@ -69,6 +70,7 @@ from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab.utils.assets import retrieve_file_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 from foundation import tasks
+from tensordict import TensorDict
 
 # 导入多教师策略网络架构
 try:
@@ -76,6 +78,12 @@ try:
 except ImportError:
     raise ImportError("Could not import 'MultiTeacherPolicy'. Please create 'multi_teacher_policy.py' first.")
 
+# 导入移植过来的 SAC 模型（请确保你已将其放在可引用的路径，这里假设放入 rsl_rl.models）
+if args_cli.teacher_type == "sac":
+    try:
+        from rsl_rl.modules.sac_mlp_model import SACActorModel
+    except ImportError:
+        raise ImportError("Could not import 'SACActorModel'. Please ensure sac_mlp_model.py is migrated correctly.")
 # 4. 开启 PyTorch 性能优化开关（TF32 矩阵乘法加速）
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -236,9 +244,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # 从第一个教师权重的输入层自动推断教师观测空间维度 (real_teacher_obs_dim)
     first_ckpt = loaded_teachers_state_dicts[0]
     teacher_input_weight = None
-    for key in ['actor.0.weight', 'actor.layers.0.weight', 'actor.actor_mlp.0.weight']:
-        if key in first_ckpt['model_state_dict']:
-            teacher_input_weight = first_ckpt['model_state_dict'][key]
+    state_dict_to_check = first_ckpt.get('actor_state_dict', first_ckpt.get('model_state_dict', first_ckpt))
+    for key in ['actor.0.weight', 'actor.layers.0.weight', 'actor.actor_mlp.0.weight', 'mlp.0.weight']:
+        if key in state_dict_to_check:
+            teacher_input_weight = state_dict_to_check[key]
             break
             
     if teacher_input_weight is None:
@@ -250,25 +259,44 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     teacher_modules = []
     teacher_norm_dicts = []
     for i, ckpt in enumerate(loaded_teachers_state_dicts):
-        teacher_p = ActorCritic(
-            num_actor_obs=real_teacher_obs_dim,
-            num_critic_obs=real_teacher_obs_dim,
-            num_actions=env.num_actions,
-            actor_hidden_dims=agent_cfg.policy.teacher_hidden_dims,
-            critic_hidden_dims=agent_cfg.policy.teacher_hidden_dims, 
-            activation="elu", 
-            init_noise_std=1.0,  # 仅占位，推理时使用 act_inference()，会被 checkpoint 覆盖
-        ).to(agent_cfg.device)
-        
-        teacher_p.load_state_dict(ckpt['model_state_dict'])
+        if args_cli.teacher_type == "ppo":
+            teacher_p = ActorCritic(
+                num_actor_obs=real_teacher_obs_dim,
+                num_critic_obs=real_teacher_obs_dim,
+                num_actions=env.num_actions,
+                actor_hidden_dims=agent_cfg.policy.teacher_hidden_dims,
+                critic_hidden_dims=agent_cfg.policy.teacher_hidden_dims, 
+                activation="elu", 
+                init_noise_std=1.0,  # 仅占位，推理时使用 act_inference()，会被 checkpoint 覆盖
+            ).to(agent_cfg.device)
+            
+            t_state_dict = ckpt['model_state_dict'] if 'model_state_dict' in ckpt else ckpt
+            teacher_p.load_state_dict(t_state_dict)
+            teacher_norm_dicts.append(ckpt.get('obs_norm_state_dict', None))
+            
+        elif args_cli.teacher_type == "sac":
+            # SACActorModel 必须传入 TensorDict 以及 obs_groups 进行初始化
+            dummy_obs = TensorDict({"teacher_obs": torch.zeros(1, real_teacher_obs_dim, device=agent_cfg.device)}, batch_size=[1])
+            obs_groups = {"teacher": ["teacher_obs"]}
+            
+            teacher_p = SACActorModel(
+                obs=dummy_obs,
+                obs_groups=obs_groups,
+                obs_set="teacher",
+                output_dim=env.num_actions,
+                hidden_dims=agent_cfg.policy.teacher_hidden_dims,
+                activation="elu",
+                obs_normalization=True,
+            ).to(agent_cfg.device)
+            
+            t_state_dict = ckpt.get('actor_state_dict', ckpt.get('model_state_dict'))
+            teacher_p.load_state_dict(t_state_dict)
+            # SAC 将归一化状态打包进了自己的字典中，不再需要外部管理
+            teacher_norm_dicts.append(None)
+            
         teacher_p.eval()  # 教师模型设为评估模式（不更新梯度）
         teacher_modules.append(teacher_p)
 
-        # 收集教师专属的观测归一化状态字典（如果存在）
-        if 'obs_norm_state_dict' in ckpt:
-            teacher_norm_dicts.append(ckpt['obs_norm_state_dict'])
-        else:
-            teacher_norm_dicts.append(None) 
 
     # 17. 实例化总的多教师蒸馏策略网络 (MultiTeacherPolicy)
     multi_policy = MultiTeacherPolicy(
@@ -286,6 +314,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         init_noise_std=agent_cfg.policy.init_noise_std,
         teacher_models=teacher_modules,
         teacher_norm_state_dicts=teacher_norm_dicts,
+        teacher_type=args_cli.teacher_type,  # 将模式传递给多教师容器
     ).to(agent_cfg.device)
     
     # 18. 断点恢复逻辑（如果指定了恢复训练的 checkpoint）
