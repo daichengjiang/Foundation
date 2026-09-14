@@ -167,14 +167,22 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             raise FileNotFoundError(f"Model for teacher {t_id} not found")
             
         model_path = match[0]
+        print(f"[INFO] Loading Model for Teacher ID {t_id} (Env Group {i}): {model_path}")
+        # 缩减 Replay Buffer 内存占用
+        eval_agent_cfg_dict = agent_cfg.to_dict()
+        if "algorithm" in eval_agent_cfg_dict:
+            # 对于 SAC：将 1000000 步的默认缓存砍到 10 步，彻底释放显存
+            eval_agent_cfg_dict["algorithm"]["replay_buffer_size"] = 10
+        # 对于 PPO/SAC：缩减 Rollout 临时缓存
+        eval_agent_cfg_dict["num_steps_per_env"] = 2 
         if args_cli.algorithm.lower() == "sac":
-            runner = OffPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
+            runner = OffPolicyRunner(env, eval_agent_cfg_dict, log_dir=None, device=agent_cfg.device)
             runner.load(model_path)
             runner.eval_mode()
             policies.append(runner.alg.act)
             policy_models.append(runner.alg.actor)
         else:
-            runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
+            runner = OnPolicyRunner(env, eval_agent_cfg_dict, log_dir=None, device=agent_cfg.device)
             runner.load(model_path)
             runner.eval_mode()
             policies.append(runner.get_inference_policy(device=agent_cfg.device))

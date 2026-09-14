@@ -20,13 +20,12 @@ from isaaclab.sim import SimulationCfg, SimulationContext, RenderCfg
 from isaaclab.terrains import TerrainImporterCfg, TerrainGeneratorCfg
 from isaaclab.terrains.height_field.hf_terrains_cfg import HfDiscreteObstaclesTerrainCfg
 from isaaclab.utils import configclass
-from isaaclab.utils.math import euler_xyz_from_quat, matrix_from_quat
+from isaaclab.utils.math import euler_xyz_from_quat, matrix_from_quat, quat_from_euler_xyz, quat_mul, quat_inv
 from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 import isaaclab.sim as sim_utils
 from isaaclab_assets import CRAZYFLIE_CFG
 from isaaclab.assets import ArticulationCfg
 import isaacsim.core.utils.prims as prims_utils
-from isaaclab.utils.math import quat_from_euler_xyz
 from isaaclab.utils.noise import NoiseModelCfg, GaussianNoiseCfg, NoiseModel
 from collections import deque
 import numpy as np
@@ -367,18 +366,18 @@ class QuadcopterEnv(DirectRLEnv):
         self._termination_reason_history = collections.deque(maxlen=self._history_window)
         self._vel_abs = collections.deque(maxlen=self._history_window)
 
-        # ================= 全局累加器 =================
-        self.eval_episodes = 0
-        self.eval_pos_sum = 0.0
-        self.eval_ori_sum = 0.0
-        self.eval_smooth_sum = 0.0
-        self.eval_base_sum = 0.0     # <--- 新增：存活分累加
-        self.eval_term_sum = 0.0     # <--- 新增：死亡惩罚累加
-        self.eval_total_sum = 0.0
-        self.reward_report_path = os.environ.get("TEACHER_REWARD_PATH", None)
-        # =================================================================
-        # [新增] 用于统计平均奖励的变量
-        self.steps_per_iteration = 8
+        # # ================= 全局累加器 =================
+        # self.eval_episodes = 0
+        # self.eval_pos_sum = 0.0
+        # self.eval_ori_sum = 0.0
+        # self.eval_smooth_sum = 0.0
+        # self.eval_base_sum = 0.0     # <--- 新增：存活分累加
+        # self.eval_term_sum = 0.0     # <--- 新增：死亡惩罚累加
+        # self.eval_total_sum = 0.0
+        # self.reward_report_path = os.environ.get("TEACHER_REWARD_PATH", None)
+        # # =================================================================
+        # # [新增] 用于统计平均奖励的变量
+        # self.steps_per_iteration = 8
 
         self.set_debug_vis(self.cfg.debug_vis)
         self._traj_origin_adjusted = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
@@ -419,6 +418,8 @@ class QuadcopterEnv(DirectRLEnv):
         # 初始化存储每步实时更新扰动力的张量
         self.f_ext_b = torch.zeros(self.num_envs, 3, device=self.device)
         # ==============================================================================
+
+        self.position_threshold = 20.0 * self.arm_l_tensor
 
     def CHECK_NAN(self, tensor, name):
         if torch.isnan(tensor).any().item():
@@ -977,30 +978,56 @@ class QuadcopterEnv(DirectRLEnv):
         # 1. 位置误差 (保持不变)
         pos_error_norm = torch.norm(self._robot.data.root_pos_w - self.pos_des, dim=1)
         
-        # 2. Orientation Cost (仅跟踪 Yaw)
+        # # 2. Orientation Cost (仅跟踪 Yaw)
+        # # 获取当前四元数
+        # quat_w = self._robot.data.root_quat_w
+        
+        # # 将四元数转换为欧拉角 (Roll, Pitch, Yaw)
+        # # 注意：euler_xyz_from_quat 返回的是 (roll, pitch, yaw) 元组
+        # _, _, yaw_curr = euler_xyz_from_quat(quat_w)
+        
+        # # 计算误差：目标 Yaw - 当前 Yaw
+        # yaw_error = self.yaw_des - yaw_curr
+        
+        # # --- 关键步骤：角度归一化 (Wrap to -pi ~ pi) ---
+        # # 这一步是为了解决“350度”和“10度”相差只有20度，而不是340度的问题
+        # # 使用 torch.remainder 确保结果在 [0, 2pi] 之间，然后减去 pi 移到 [-pi, pi]
+        # yaw_error = torch.remainder(yaw_error + torch.pi, 2 * torch.pi) - torch.pi
+        # # B. 【关键修改】将角度误差映射回“四元数 Z 分量”空间
+        # # 原版惩罚的是 q_z，物理上 q_z = sin(yaw/2)。
+        # # 为了复刻原版手感，我们计算“误差角的 sin(x/2)”
+        # yaw_error_mapped = torch.sin(yaw_error / 2.0)
+
+        # # C. 套用原版非线性公式
+        # # 公式：arccos( clamp( 1.0 - abs(x) ) )
+        # # 这一步保留了“接近目标时梯度无穷大”的特性，会促使 Agent 极其精确地对齐
+        # orientation_cost = torch.arccos(torch.clamp(1.0 - torch.abs(yaw_error_mapped), -1.0, 1.0))
+
+        # 2. Orientation Cost 
         # 获取当前四元数
         quat_w = self._robot.data.root_quat_w
         
         # 将四元数转换为欧拉角 (Roll, Pitch, Yaw)
-        # 注意：euler_xyz_from_quat 返回的是 (roll, pitch, yaw) 元组
-        _, _, yaw_curr = euler_xyz_from_quat(quat_w)
+        r, p, yaw_curr = euler_xyz_from_quat(quat_w)
         
         # 计算误差：目标 Yaw - 当前 Yaw
         yaw_error = self.yaw_des - yaw_curr
-        
-        # --- 关键步骤：角度归一化 (Wrap to -pi ~ pi) ---
-        # 这一步是为了解决“350度”和“10度”相差只有20度，而不是340度的问题
-        # 使用 torch.remainder 确保结果在 [0, 2pi] 之间，然后减去 pi 移到 [-pi, pi]
         yaw_error = torch.remainder(yaw_error + torch.pi, 2 * torch.pi) - torch.pi
-        # B. 【关键修改】将角度误差映射回“四元数 Z 分量”空间
-        # 原版惩罚的是 q_z，物理上 q_z = sin(yaw/2)。
-        # 为了复刻原版手感，我们计算“误差角的 sin(x/2)”
-        yaw_error_mapped = torch.sin(yaw_error / 2.0)
         
-        # C. 套用原版非线性公式
-        # 公式：arccos( clamp( 1.0 - abs(x) ) )
-        # 这一步保留了“接近目标时梯度无穷大”的特性，会促使 Agent 极其精确地对齐
-        orientation_cost = torch.arccos(torch.clamp(1.0 - torch.abs(yaw_error_mapped), -1.0, 1.0))
+        # B. 【关键修改】严格按照三轴姿态完整公式提取伪 q_z 分量
+        # 采用公式: q_z = cos(phi/2)cos(theta/2)sin(psi/2) - sin(phi/2)sin(theta/2)cos(psi/2)
+        # 这里 phi = r (滚转), theta = p (俯仰), psi = yaw_error (偏航误差)
+        half_r = r / 2.0
+        half_p = p / 2.0
+        half_y = yaw_error / 2.0
+        
+        q_z_mapped = (
+            torch.cos(half_r) * torch.cos(half_p) * torch.sin(half_y) - 
+            torch.sin(half_r) * torch.sin(half_p) * torch.cos(half_y)
+        )
+        
+        # C. 套用原版非线性公式 (限制在 -1.0 到 1.0 之间以防 arccos 出现 NaN)
+        orientation_cost = torch.arccos(torch.clamp(1.0 - torch.abs(q_z_mapped), -1.0, 1.0))
         # 3. 动作平滑 Cost (保持不变)
         d_action_cost = torch.norm(self._actions - self._last_actions, dim=1)
         
@@ -1077,55 +1104,54 @@ class QuadcopterEnv(DirectRLEnv):
             for k in self._episode_sums.keys():
                 values = self._episode_sums[k][env_ids]
                 self.extras["log"][f"Episode_Reward/{k}"] = torch.mean(values).item()
+            # current_iter = self.common_step_counter // self.steps_per_iteration
+            # eval_start, eval_end = 900, 1000
+            # # ==========================================================
 
-            current_iter = self.common_step_counter // self.steps_per_iteration
-            eval_start, eval_end = 900, 1000
-            # ==========================================================
-
-            # 判断当前迭代是否在这个区间内
-            if eval_start <= current_iter <= eval_end:
-                # 严谨累加：不论是 1 架炸机还是 3000 架成功，权重完全按架数计算！
-                batch_count = len(env_ids)
-                self.eval_episodes += batch_count
+            # # 判断当前迭代是否在这个区间内
+            # if eval_start <= current_iter <= eval_end:
+            #     # 严谨累加：不论是 1 架炸机还是 3000 架成功，权重完全按架数计算！
+            #     batch_count = len(env_ids)
+            #     self.eval_episodes += batch_count
                 
-                self.eval_pos_sum += torch.sum(self._episode_sums["position"][env_ids]).item()
-                self.eval_ori_sum += torch.sum(self._episode_sums["orientation"][env_ids]).item()
-                self.eval_smooth_sum += torch.sum(self._episode_sums["action_smooth"][env_ids]).item()
-                self.eval_base_sum += torch.sum(self._episode_sums["base"][env_ids]).item()        # <--- 新增
-                self.eval_term_sum += torch.sum(self._episode_sums["terminal"][env_ids]).item()    # <--- 新增
+            #     self.eval_pos_sum += torch.sum(self._episode_sums["position"][env_ids]).item()
+            #     self.eval_ori_sum += torch.sum(self._episode_sums["orientation"][env_ids]).item()
+            #     self.eval_smooth_sum += torch.sum(self._episode_sums["action_smooth"][env_ids]).item()
+            #     self.eval_base_sum += torch.sum(self._episode_sums["base"][env_ids]).item()        # <--- 新增
+            #     self.eval_term_sum += torch.sum(self._episode_sums["terminal"][env_ids]).item()    # <--- 新增
 
-                # 计算这批环境的 Total 奖励总和
-                batch_total = torch.zeros(batch_count, device=self.device)
-                for k in self._episode_sums.keys():
-                    batch_total += self._episode_sums[k][env_ids]
-                self.eval_total_sum += torch.sum(batch_total).item()
+            #     # 计算这批环境的 Total 奖励总和
+            #     batch_total = torch.zeros(batch_count, device=self.device)
+            #     for k in self._episode_sums.keys():
+            #         batch_total += self._episode_sums[k][env_ids]
+            #     self.eval_total_sum += torch.sum(batch_total).item()
 
-                # 计算绝对的全局大平均，并覆写 JSON 供外部读取
-                stats = {
-                    "position": self.eval_pos_sum / self.eval_episodes,
-                    "orientation": self.eval_ori_sum / self.eval_episodes,
-                    "action_smooth": self.eval_smooth_sum / self.eval_episodes,
-                    "base": self.eval_base_sum / self.eval_episodes,         # <--- 新增写出
-                    "terminal": self.eval_term_sum / self.eval_episodes,
-                    "total": self.eval_total_sum / self.eval_episodes
-                }
+            #     # 计算绝对的全局大平均，并覆写 JSON 供外部读取
+            #     stats = {
+            #         "position": self.eval_pos_sum / self.eval_episodes,
+            #         "orientation": self.eval_ori_sum / self.eval_episodes,
+            #         "action_smooth": self.eval_smooth_sum / self.eval_episodes,
+            #         "base": self.eval_base_sum / self.eval_episodes,         # <--- 新增写出
+            #         "terminal": self.eval_term_sum / self.eval_episodes,
+            #         "total": self.eval_total_sum / self.eval_episodes
+            #     }
                 
-                # ================= [新增] 将评估数据推送至 WandB =================
-                if "log" not in self.extras: 
-                    self.extras["log"] = dict()
-                for key, value in stats.items():
-                    # 添加统一的前缀 Eval_Metrics，方便在 WandB 面板上归类查看
-                    self.extras["log"][f"Eval_Metrics/{key}"] = value
-                if self.reward_report_path:
-                    try:
-                        import json
-                        with open(self.reward_report_path, "w") as f:
-                            json.dump(stats, f)
-                    except Exception as e:
-                        pass
+            #     # ================= [新增] 将评估数据推送至 WandB =================
+            #     if "log" not in self.extras: 
+            #         self.extras["log"] = dict()
+            #     for key, value in stats.items():
+            #         # 添加统一的前缀 Eval_Metrics，方便在 WandB 面板上归类查看
+            #         self.extras["log"][f"Eval_Metrics/{key}"] = value
+            #     if self.reward_report_path:
+            #         try:
+            #             import json
+            #             with open(self.reward_report_path, "w") as f:
+            #                 json.dump(stats, f)
+            #         except Exception as e:
+            #             pass
             
-            # C. 清理本轮奖励累计
-            for k in self._episode_sums.keys():
+            # # C. 清理本轮奖励累计
+            # for k in self._episode_sums.keys():
                 self._episode_sums[k][env_ids] = 0.0
 
         # 2. --- 状态重置与基础清理 ---

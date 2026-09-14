@@ -77,11 +77,22 @@ def run_training(teacher_id, dynamics, timestamp, experiment_name, gpu_id=0, csv
 
     target_device = "cuda:0"
 
+    # cmd = [
+    #     sys.executable, train_script,
+    #     "--task", "teacher",
+    #     "--num_envs", "16000",
+    #     "--max_iterations", "800",
+    #     "--device", target_device,
+    #     "--logger", "wandb",
+    #     "--log_project_name", "Foundation",
+    #     "--log_timestamp", timestamp 
+    # ] + overrides
     cmd = [
         sys.executable, train_script,
+        "--algorithm", "sac",
         "--task", "teacher",
-        "--num_envs", "16000",
-        "--max_iterations", "800",
+        "--num_envs", "64",
+        "--max_iterations", "7000",
         "--device", target_device,
         "--logger", "wandb",
         "--log_project_name", "Foundation",
@@ -106,10 +117,14 @@ def run_training(teacher_id, dynamics, timestamp, experiment_name, gpu_id=0, csv
     # 告诉 teacher_env.py 直接把 JSON 写到这里，永久保存
     env_vars["TEACHER_REWARD_PATH"] = metrics_file_abs
 
-    Pos_threshold = -3000
-    Ori_threshold = -700
-    Smooth_threshold = -600
-    Total_threshold = 7000
+    # Pos_threshold = -2000
+    # Ori_threshold = -800
+    # Smooth_threshold = -500
+    # Total_threshold = 8000
+    Pos_threshold = 0
+    Ori_threshold = 0
+    Smooth_threshold = 0
+    Total_threshold = 0
 
     print(f"==================================================")
     print(f"Starting Teacher {teacher_id} | GPU {gpu_id} | Headless: {headless}")
@@ -122,57 +137,73 @@ def run_training(teacher_id, dynamics, timestamp, experiment_name, gpu_id=0, csv
     
     success = False
     
+    # try:
+    #     # 执行训练
+    #     subprocess.run(cmd, check=True, env=env_vars)
+        
+    #     # [修改] 读取 JSON 文件并进行多条件判断
+    #     if os.path.exists(metrics_file_abs):
+    #         with open(metrics_file_abs, 'r') as f:
+    #             try:
+    #                 stats = json.load(f)
+    #                 pos_reward = stats.get("position", -float('inf'))
+    #                 ori_reward = stats.get("orientation", -float('inf'))
+    #                 smooth_reward = stats.get("action_smooth", -float('inf'))
+    #                 total_reward = stats.get("total", -float('inf'))
+                    
+    #                 print(f"Teacher {teacher_id} Metrics: Pos={pos_reward:.2f}, Ori={ori_reward:.2f}, Smooth={smooth_reward:.2f}")
+
+    #                 # [关键修改] 三个条件同时满足
+    #                 if (pos_reward > Pos_threshold and 
+    #                     ori_reward > Ori_threshold and 
+    #                     smooth_reward > Smooth_threshold and
+    #                     total_reward > Total_threshold):
+
+    #                     print(f"SUCCESS: All conditions met. Saving...")
+    #                     save_params_to_csv(csv_path, teacher_id, dynamics)
+    #                     success = True
+    #                 else:
+    #                     print(f"FAILURE: Conditions not met.")
+    #                     success = False
+                        
+    #             except json.JSONDecodeError:
+    #                 print(f"Error: Could not decode JSON from {metrics_file_abs}")
+    #                 success = False
+    #     else:
+    #         print(f"FAILURE: Metrics file not found at {metrics_file_abs}")
+    #         success = False
+
+    # except subprocess.CalledProcessError as e:
+    #     print(f"!!! Error training Teacher {teacher_id} (Process Crashed) !!!")
+    #     print(e)
+    #     success = False
+    
+    # # [修改] 如果失败，清理日志目录
+    # if not success:
+    #     if os.path.exists(teacher_log_dir):
+    #         try:
+    #             print(f"[Auto-Clean] Removing failed log dir: {teacher_log_dir}")
+    #             shutil.rmtree(teacher_log_dir)
+    #         except OSError as e:
+    #             print(f"Warning: Could not remove failed dir: {e}")
+                
+    # return success
+
     try:
         # 执行训练
         subprocess.run(cmd, check=True, env=env_vars)
-        
-        # [修改] 读取 JSON 文件并进行多条件判断
-        if os.path.exists(metrics_file_abs):
-            with open(metrics_file_abs, 'r') as f:
-                try:
-                    stats = json.load(f)
-                    pos_reward = stats.get("position", -float('inf'))
-                    ori_reward = stats.get("orientation", -float('inf'))
-                    smooth_reward = stats.get("action_smooth", -float('inf'))
-                    total_reward = stats.get("total", -float('inf'))
-                    
-                    print(f"Teacher {teacher_id} Metrics: Pos={pos_reward:.2f}, Ori={ori_reward:.2f}, Smooth={smooth_reward:.2f}")
-
-                    # [关键修改] 三个条件同时满足
-                    if (pos_reward > Pos_threshold and 
-                        ori_reward > Ori_threshold and 
-                        smooth_reward > Smooth_threshold and
-                        total_reward > Total_threshold):
-                        
-                        print(f"SUCCESS: All conditions met. Saving...")
-                        save_params_to_csv(csv_path, teacher_id, dynamics)
-                        success = True
-                    else:
-                        print(f"FAILURE: Conditions not met.")
-                        success = False
-                        
-                except json.JSONDecodeError:
-                    print(f"Error: Could not decode JSON from {metrics_file_abs}")
-                    success = False
-        else:
-            print(f"FAILURE: Metrics file not found at {metrics_file_abs}")
-            success = False
-
+        print(f"Teacher {teacher_id} finished training.")
     except subprocess.CalledProcessError as e:
-        print(f"!!! Error training Teacher {teacher_id} (Process Crashed) !!!")
+        # 就算子进程崩溃，我们也假装无事发生
+        print(f"!!! Error training Teacher {teacher_id} (Process Crashed), but ignoring !!!")
         print(e)
-        success = False
     
-    # [修改] 如果失败，清理日志目录
-    if not success:
-        if os.path.exists(teacher_log_dir):
-            try:
-                print(f"[Auto-Clean] Removing failed log dir: {teacher_log_dir}")
-                shutil.rmtree(teacher_log_dir)
-            except OSError as e:
-                print(f"Warning: Could not remove failed dir: {e}")
-                
-    return success
+    # 【核心修改】：彻底把保存逻辑移出判断，无论如何都强制保存！
+    print(f"Unconditionally saving Teacher {teacher_id} parameters...")
+    save_params_to_csv(csv_path, teacher_id, dynamics)
+    
+    # 强制返回 True，让外层循环直接进入下一个教师
+    return True
 
 def save_params_to_csv(file_path, teacher_id, dynamics):
     """

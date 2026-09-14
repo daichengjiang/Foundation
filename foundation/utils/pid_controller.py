@@ -192,14 +192,14 @@ class PaperPhysControllerTensor:
     def motor_speeds_to_wrench(self, motor_actions: torch.Tensor) -> tuple:
 
         # Calculate Thrust per motor (Newtons)
-        motor_actions = 0.9 * motor_actions + 0.1 
+        # motor_actions = 0.9 * motor_actions + 0.1 
         coeff = (self.thrust_to_weight * self.mass * self.gravity / 4.0).unsqueeze(-1)
-        motor_thrusts = coeff * (motor_actions ** 2)
+        motor_thrusts = coeff * (0.032 + 0.131 * motor_actions + 0.837 * (motor_actions ** 2))
         
         # Mix to Wrench
         # wrench shape: [num_envs, 4]
         wrench = torch.bmm(self.mat, motor_thrusts.unsqueeze(-1)).squeeze(-1)
-        
+
         # Extract Output
         force = torch.zeros(self.num_envs, 3, device=self.device)
         force[:, 2] = wrench[:, 0] # Z-force
