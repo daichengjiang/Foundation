@@ -409,6 +409,10 @@ class QuadcopterEnv(DirectRLEnv):
         # ==============================================================================
 
         self.position_threshold = 20.0 * self.arm_l_tensor
+        # # ================= [新增：EKF 锯齿形漂移模拟缓冲] =================
+        # # 用于记录 100Hz 控制循环下，当前处于 10Hz 雷达更新周期的哪一帧 (0-9)
+        # self._ekf_step_counter = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        # # ==============================================================================
 
     def CHECK_NAN(self, tensor, name):
         if torch.isnan(tensor).any().item():
@@ -920,6 +924,26 @@ class QuadcopterEnv(DirectRLEnv):
         curr_pos_error_b = torch.bmm(rot_matrix_w2b, curr_pos_error_w.unsqueeze(-1)).squeeze(-1)
         curr_vel_error_b = torch.bmm(rot_matrix_w2b, curr_vel_error_w.unsqueeze(-1)).squeeze(-1)
 
+        # # ================= [新增：EKF Z 轴高频锯齿漂移 (仅针对 Student)] =================
+        # ekf_phase = (self._ekf_step_counter % 10).float()
+        # pos_z_drift = (ekf_phase / 10.0) * 0.5
+        # vel_z_drift = (ekf_phase / 10.0) * 0.2
+        
+        # # print("Env 0 - pos_z_drift:", pos_z_drift[0].item(), "vel_z_drift:", vel_z_drift[0].item())
+
+        # # 1. 位置漂移：加在世界坐标系 pos_w 的 Z 轴
+        # perceived_pos_w = pos_w.clone()
+        # perceived_pos_w[:, 2] += pos_z_drift
+        # perceived_pos_error_w = perceived_pos_w - self.pos_des
+        # perceived_pos_error_b = torch.bmm(rot_matrix_w2b, perceived_pos_error_w.unsqueeze(-1)).squeeze(-1)
+        
+        # # 2. 线速度漂移：直接加在机体系 curr_vel_error_b 的 Z 轴
+        # perceived_vel_error_b = curr_vel_error_b.clone()
+        # perceived_vel_error_b[:, 2] += vel_z_drift
+        
+        # self._ekf_step_counter += 1
+        # # ==============================================================================
+
         # 3. 更新历史记录 (已经在 Body Frame 下的数据)
         self.pos_error_b_history = torch.roll(self.pos_error_b_history, shifts=-1, dims=1)
         self.vel_error_b_history = torch.roll(self.vel_error_b_history, shifts=-1, dims=1)
@@ -949,8 +973,10 @@ class QuadcopterEnv(DirectRLEnv):
         # 学生 22
         obs_student = torch.cat([
             curr_pos_error_b,             # 3
+            # perceived_pos_error_b,        # 3 (带漂移)
             rot_flat,                   # 9
             curr_vel_error_b,             # 3
+            # perceived_vel_error_b,        # 3 (带漂移)
             ang_vel_b,                  # 3
             self._last_actions,         # 4
         ], dim=-1)
@@ -1191,6 +1217,10 @@ class QuadcopterEnv(DirectRLEnv):
             ang_vel[perfect_mask] = 0.0
             quat[perfect_mask] = torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device)
             # self.yaw_des[env_ids] = (torch.rand(len(env_ids), device=self.device) * 2 - 1) * self.yaw_limit / 2.0
+            # pos_offset = torch.zeros(num_resets, 3, device=self.device)
+            # lin_vel = torch.zeros(num_resets, 3, device=self.device)
+            # ang_vel = torch.zeros(num_resets, 3, device=self.device)
+            # quat = torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device).repeat(num_resets, 1)
             self.yaw_des[env_ids] = 0.0
             self.yaw_rate_des[env_ids] = 0.0
         else:
@@ -1224,6 +1254,8 @@ class QuadcopterEnv(DirectRLEnv):
             None, env_ids
         )
 
+        # # ================= [新增：重置 EKF 漂移计数器] =================
+        # self._ekf_step_counter[env_ids] = 0
 
     def _update_episode_outcomes_and_metrics(self, env_ids, success_mask, died_mask, timed_out_mask):
             """
